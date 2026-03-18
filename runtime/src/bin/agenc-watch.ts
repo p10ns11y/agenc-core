@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "./node-compat.js";
 import { runAgencWatchCli } from "../watch/entry.mjs";
 
 void (async () => {

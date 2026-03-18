@@ -30,11 +30,9 @@ Current package engine floor from
 Current support statement:
 
 - Node `18+` is the minimum supported runtime floor for local CLI/daemon use
-- the package contract does not currently publish a narrower supported-LTS
-  matrix than that engine floor
-- when release CI pins exact Node versions for the public `agenc` install
-  surface, this document should be updated to list those exact validated
-  versions
+- the public `agenc` install path is currently validated in CI on:
+  - Node `18` as the supported minimum floor
+  - Node `20` as the current mainline release gate
 
 ## Public wrapper install support
 
@@ -45,8 +43,14 @@ tuple:
 - Node `>=18.0.0`
 
 That support is enforced both in the wrapper and in the runtime-artifact build
-pipeline. Other tuples must fail clearly as unsupported until explicit release
-coverage is added.
+pipeline, and the release gate now proves:
+
+- fresh install
+- wrapper-managed upgrade to a newer embedded runtime manifest
+- `~/.agenc/runtime/current` convergence to the upgraded release
+
+Other tuples must fail clearly as unsupported until explicit release coverage is
+added.
 
 ## Operating system support
 

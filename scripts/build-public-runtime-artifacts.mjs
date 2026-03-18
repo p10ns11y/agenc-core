@@ -21,6 +21,7 @@ function parseArgs(argv) {
     keyId: null,
     releaseRepository: "tetsuo-ai/agenc-core",
     releaseTag: null,
+    runtimeVersionOverride: null,
     skipBuild: false,
   };
 
@@ -44,6 +45,9 @@ function parseArgs(argv) {
         break;
       case "--release-tag":
         options.releaseTag = argv[++index];
+        break;
+      case "--runtime-version-override":
+        options.runtimeVersionOverride = argv[++index];
         break;
       case "--skip-build":
         options.skipBuild = true;
@@ -131,6 +135,8 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   const runtimePackage = await readJson(path.join(runtimeDir, "package.json"));
   const wrapperPackage = await readJson(path.join(wrapperDir, "package.json"));
+  const runtimeVersion =
+    options.runtimeVersionOverride ?? runtimePackage.version;
   const platform = process.platform;
   const arch = process.arch;
   const platformArch = `${platform}-${arch}`;
@@ -191,7 +197,7 @@ async function main() {
 
     const metadata = {
       builtAt: new Date().toISOString(),
-      runtimeVersion: runtimePackage.version,
+      runtimeVersion,
       wrapperVersion: wrapperPackage.version,
       platform,
       arch,
@@ -209,7 +215,7 @@ async function main() {
       "utf8",
     );
 
-    const artifactFilename = `agenc-runtime-${runtimePackage.version}-${platform}-${arch}.tar.gz`;
+    const artifactFilename = `agenc-runtime-${runtimeVersion}-${platform}-${arch}.tar.gz`;
     const artifactPath = path.join(options.outDir, artifactFilename);
     run("tar", ["-czf", artifactPath, "-C", installRoot, "."], repoRoot);
     const artifactSha = sha256(await readFile(artifactPath));
@@ -231,7 +237,7 @@ async function main() {
           platform,
           arch,
           nodeRange: runtimePackage.engines?.node ?? ">=18.0.0",
-          runtimeVersion: runtimePackage.version,
+          runtimeVersion,
           url: artifactUrl,
           sha256: artifactSha,
           bins: metadata.bins,
@@ -290,7 +296,7 @@ async function main() {
           releaseTag: manifest.releaseTag,
           platform,
           arch,
-          runtimeVersion: runtimePackage.version,
+          runtimeVersion,
           wrapperVersion: wrapperPackage.version,
           artifactSha256: artifactSha,
           artifactUrl,

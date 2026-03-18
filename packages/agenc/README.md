@@ -20,6 +20,11 @@ Current public support is intentionally narrow:
 - Linux `x64`
 - Node `>=18.0.0`
 
+Current validated release-gate lanes:
+
+- Node `18` minimum floor
+- Node `20` mainline lane
+
 Production release channel:
 
 - npm package: `agenc`

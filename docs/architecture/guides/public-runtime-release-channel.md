@@ -49,6 +49,11 @@ Current public wrapper support is intentionally narrow:
 - arch: `x64`
 - Node: `>=18.0.0`
 
+The current release gate validates that tuple on:
+
+- Node `18` minimum-floor CI
+- Node `20` mainline CI
+
 Anything else must fail clearly as unsupported. Broader platform support should
 only be added once release CI and smoke coverage exist for those tuples.
 
@@ -66,6 +71,12 @@ It also maintains:
 The wrapper always launches the runtime through the stable `current` pointer so
 service templates, TUI handoff, and compatibility bins do not bind to a stale
 versioned path.
+
+Release-gate requirement:
+
+- fresh install must create `~/.agenc/runtime/current`
+- wrapper-managed update must advance `current` to the newer release
+- `install-state.json` must converge to the upgraded runtime version
 
 ## Trust model
 

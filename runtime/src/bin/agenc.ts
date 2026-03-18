@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "./node-compat.js";
 import { runAgencCli } from "../cli/agenc.js";
 
 void (async () => {

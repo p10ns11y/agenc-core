@@ -79,7 +79,8 @@ Phase 2 public wrapper support is intentionally narrow:
 - Node: `>=18.0.0`
 
 That tuple is the only one the public release/install contract should claim
-until release CI validates more.
+until release CI validates more. Current CI validates it on Node `18` as the
+minimum floor and Node `20` as the mainline lane.
 
 ## Public package composition
 
@@ -98,6 +99,12 @@ V1 public package composition:
 
 See [guides/public-runtime-release-channel.md](guides/public-runtime-release-channel.md)
 for the explicit release-channel and trust model.
+
+Release hardening requires proof of:
+
+- fresh install
+- wrapper-package upgrade to a newer embedded runtime manifest
+- stable `~/.agenc/runtime/current` handoff after upgrade
 
 ## Canonical local state
 

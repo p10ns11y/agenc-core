@@ -25,18 +25,8 @@ async function createFixtureContext(t) {
   const packageRoot = path.join(root, "package");
   const generatedDir = path.join(packageRoot, "generated");
   const homeDir = path.join(root, "home");
-  const artifactStageDir = path.join(root, "artifact-stage");
-  const runtimeBinDir = path.join(
-    artifactStageDir,
-    "node_modules",
-    "@tetsuo-ai",
-    "runtime",
-    "dist",
-    "bin",
-  );
   await mkdir(generatedDir, { recursive: true });
   await mkdir(homeDir, { recursive: true });
-  await mkdir(runtimeBinDir, { recursive: true });
 
   await writeFile(
     path.join(packageRoot, "package.json"),
@@ -44,90 +34,109 @@ async function createFixtureContext(t) {
     "utf8",
   );
 
-  const fakeBins = {
-    agenc: `#!/usr/bin/env node\nconsole.log("agenc-bin");\n`,
-    "agenc-runtime": `#!/usr/bin/env node\nconsole.log("agenc-runtime-bin");\n`,
-    daemon: `#!/usr/bin/env node\nconsole.log("daemon-bin");\n`,
-    "agenc-watch": `#!/usr/bin/env node\nconsole.log("agenc-watch-bin");\n`,
-  };
-
-  for (const [name, contents] of Object.entries(fakeBins)) {
-    await writeFile(path.join(runtimeBinDir, `${name}.js`), contents, {
-      encoding: "utf8",
-      mode: 0o755,
-    });
-  }
-
-  const artifactPath = path.join(root, "agenc-runtime-0.1.0-linux-x64.tar.gz");
-  execFileSync("tar", ["-czf", artifactPath, "-C", artifactStageDir, "."], {
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const artifactSha = sha256(await readFile(artifactPath));
-
-  const manifest = {
-    manifestVersion: 1,
-    wrapperVersion: "0.1.0",
-    keyId: "local-dev",
-    artifacts: [
-      {
-        platform: "linux",
-        arch: "x64",
-        nodeRange: ">=18.0.0",
-        runtimeVersion: "0.1.0",
-        url: pathToFileURL(artifactPath).href,
-        sha256: artifactSha,
-        bins: {
-          agenc: "node_modules/@tetsuo-ai/runtime/dist/bin/agenc.js",
-          "agenc-runtime":
-            "node_modules/@tetsuo-ai/runtime/dist/bin/agenc-runtime.js",
-          daemon: "node_modules/@tetsuo-ai/runtime/dist/bin/daemon.js",
-          "agenc-watch":
-            "node_modules/@tetsuo-ai/runtime/dist/bin/agenc-watch.js",
-        },
-      },
-    ],
-  };
-  const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
-  const signature = sign(null, manifestBytes, privateKey).toString("base64");
-
-  await writeFile(
-    path.join(generatedDir, "agenc-runtime-manifest.json"),
-    manifestBytes,
-  );
-  await writeFile(
-    path.join(generatedDir, "agenc-runtime-manifest.json.sig"),
-    `${signature}\n`,
-    "utf8",
-  );
   await writeFile(
     path.join(generatedDir, "agenc-runtime-public-key.pem"),
     publicKey.export({ type: "spki", format: "pem" }),
-    "utf8",
-  );
-  await writeFile(
-    path.join(generatedDir, "agenc-runtime-trust-policy.json"),
-    `${JSON.stringify(
-      {
-        wrapperVersion: "0.1.0",
-        keyId: "local-dev",
-        revokedManifestDigests: [],
-        revokedRuntimeVersions: [],
-      },
-      null,
-      2,
-    )}\n`,
     "utf8",
   );
 
   return {
     packageRoot,
     homeDir,
+    async stageEmbeddedRelease(runtimeVersion) {
+      const artifactStageDir = path.join(root, `artifact-stage-${runtimeVersion}`);
+      const runtimeBinDir = path.join(
+        artifactStageDir,
+        "node_modules",
+        "@tetsuo-ai",
+        "runtime",
+        "dist",
+        "bin",
+      );
+      await mkdir(runtimeBinDir, { recursive: true });
+
+      const fakeBins = {
+        agenc: `#!/usr/bin/env node\nconsole.log("agenc-bin:${runtimeVersion}");\n`,
+        "agenc-runtime": `#!/usr/bin/env node\nconsole.log("agenc-runtime-bin:${runtimeVersion}");\n`,
+        daemon: `#!/usr/bin/env node\nconsole.log("daemon-bin:${runtimeVersion}");\n`,
+        "agenc-watch": `#!/usr/bin/env node\nconsole.log("agenc-watch-bin:${runtimeVersion}");\n`,
+      };
+
+      for (const [name, contents] of Object.entries(fakeBins)) {
+        await writeFile(path.join(runtimeBinDir, `${name}.js`), contents, {
+          encoding: "utf8",
+          mode: 0o755,
+        });
+      }
+
+      const artifactPath = path.join(
+        root,
+        `agenc-runtime-${runtimeVersion}-linux-x64.tar.gz`,
+      );
+      execFileSync("tar", ["-czf", artifactPath, "-C", artifactStageDir, "."], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const artifactSha = sha256(await readFile(artifactPath));
+
+      const manifest = {
+        manifestVersion: 1,
+        wrapperVersion: "0.1.0",
+        keyId: "local-dev",
+        artifacts: [
+          {
+            platform: "linux",
+            arch: "x64",
+            nodeRange: ">=18.0.0",
+            runtimeVersion,
+            url: pathToFileURL(artifactPath).href,
+            sha256: artifactSha,
+            bins: {
+              agenc: "node_modules/@tetsuo-ai/runtime/dist/bin/agenc.js",
+              "agenc-runtime":
+                "node_modules/@tetsuo-ai/runtime/dist/bin/agenc-runtime.js",
+              daemon: "node_modules/@tetsuo-ai/runtime/dist/bin/daemon.js",
+              "agenc-watch":
+                "node_modules/@tetsuo-ai/runtime/dist/bin/agenc-watch.js",
+            },
+          },
+        ],
+      };
+      const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+      const signature = sign(null, manifestBytes, privateKey).toString("base64");
+
+      await writeFile(
+        path.join(generatedDir, "agenc-runtime-manifest.json"),
+        manifestBytes,
+      );
+      await writeFile(
+        path.join(generatedDir, "agenc-runtime-manifest.json.sig"),
+        `${signature}\n`,
+        "utf8",
+      );
+      await writeFile(
+        path.join(generatedDir, "agenc-runtime-trust-policy.json"),
+        `${JSON.stringify(
+          {
+            wrapperVersion: "0.1.0",
+            keyId: "local-dev",
+            revokedManifestDigests: [],
+            revokedRuntimeVersions: [],
+          },
+          null,
+          2,
+        )}\n`,
+        "utf8",
+      );
+
+      return { artifactPath, runtimeVersion };
+    },
   };
 }
 
 test("loadVerifiedManifest accepts embedded signed manifests", async (t) => {
   const fixture = await createFixtureContext(t);
+  await fixture.stageEmbeddedRelease("0.1.0");
 
   const loaded = await loadVerifiedManifest({
     packageRoot: fixture.packageRoot,
@@ -141,6 +150,7 @@ test("loadVerifiedManifest accepts embedded signed manifests", async (t) => {
 
 test("ensureRuntimeInstalled installs the runtime artifact under ~/.agenc/runtime", async (t) => {
   const fixture = await createFixtureContext(t);
+  await fixture.stageEmbeddedRelease("0.1.0");
 
   const installed = await ensureRuntimeInstalled({
     packageRoot: fixture.packageRoot,
@@ -158,10 +168,56 @@ test("ensureRuntimeInstalled installs the runtime artifact under ~/.agenc/runtim
     await readlink(installed.currentDir),
     installed.releaseDir,
   );
+  assert.ok(installed.bins.agenc.startsWith(installed.currentDir));
+});
+
+test("ensureRuntimeInstalled force=true advances the stable current pointer on upgrade", async (t) => {
+  const fixture = await createFixtureContext(t);
+  await fixture.stageEmbeddedRelease("0.1.0");
+
+  const installedV1 = await ensureRuntimeInstalled({
+    packageRoot: fixture.packageRoot,
+    homeDir: fixture.homeDir,
+    platform: "linux",
+    arch: "x64",
+    nodeVersion: "20.0.0",
+  });
+  const currentTargetV1 = await readlink(installedV1.currentDir);
+  const installStatePath = path.join(
+    fixture.homeDir,
+    ".agenc",
+    "runtime",
+    "install-state.json",
+  );
+  const installStateV1 = JSON.parse(await readFile(installStatePath, "utf8"));
+
+  await fixture.stageEmbeddedRelease("0.1.1");
+
+  const installedV2 = await ensureRuntimeInstalled({
+    packageRoot: fixture.packageRoot,
+    homeDir: fixture.homeDir,
+    platform: "linux",
+    arch: "x64",
+    nodeVersion: "20.0.0",
+    force: true,
+  });
+  const currentTargetV2 = await readlink(installedV2.currentDir);
+  const installStateV2 = JSON.parse(await readFile(installStatePath, "utf8"));
+
+  assert.equal(installStateV1.runtimeVersion, "0.1.0");
+  assert.equal(installStateV2.runtimeVersion, "0.1.1");
+  assert.notEqual(currentTargetV1, currentTargetV2);
+  assert.equal(currentTargetV2, installedV2.releaseDir);
+  assert.match(installedV2.releaseDir, /releases\/0\.1\.1\/linux-x64$/u);
+  await stat(installedV1.releaseDir);
+  await stat(installedV2.releaseDir);
+  await stat(installedV2.bins.agenc);
+  assert.ok(installedV2.bins.agenc.startsWith(installedV2.currentDir));
 });
 
 test("uninstallRuntime refuses to remove a live runtime without --force", async (t) => {
   const fixture = await createFixtureContext(t);
+  await fixture.stageEmbeddedRelease("0.1.0");
   const operatorHome = path.join(fixture.homeDir, ".agenc");
   await mkdir(operatorHome, { recursive: true });
   await writeFile(
@@ -188,6 +244,7 @@ test("uninstallRuntime refuses to remove a live runtime without --force", async 
 
 test("uninstallRuntime removes the installed runtime but preserves operator state", async (t) => {
   const fixture = await createFixtureContext(t);
+  await fixture.stageEmbeddedRelease("0.1.0");
 
   const installed = await ensureRuntimeInstalled({
     packageRoot: fixture.packageRoot,
@@ -215,6 +272,7 @@ test("uninstallRuntime removes the installed runtime but preserves operator stat
 
 test("loadVerifiedManifest rejects revoked runtime versions", async (t) => {
   const fixture = await createFixtureContext(t);
+  await fixture.stageEmbeddedRelease("0.1.0");
   const trustPolicyPath = path.join(
     fixture.packageRoot,
     "generated",

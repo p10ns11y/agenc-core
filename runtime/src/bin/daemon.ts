@@ -3,6 +3,7 @@
  * Daemon entry point. Forked by `agenc start` or run directly with `--foreground`.
  */
 
+import "./node-compat.js";
 import { DaemonManager } from '../gateway/daemon.js';
 import { createLogger } from '../utils/logger.js';
 import { toErrorMessage } from '../utils/async.js';

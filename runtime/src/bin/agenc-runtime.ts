@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "./node-compat.js";
 import { runCli } from '../cli/index.js';
 
 void (async () => {
