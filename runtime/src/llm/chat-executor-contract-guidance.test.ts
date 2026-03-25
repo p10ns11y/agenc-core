@@ -487,6 +487,41 @@ describe("chat-executor-contract-guidance", () => {
     });
   });
 
+  it("keeps listDir and readFile together for delegated local exploration phases", () => {
+    const guidance = resolveToolContractGuidance({
+      phase: "initial",
+      messageText: "Explore the repo and summarize its structure.",
+      toolCalls: [],
+      allowedToolNames: [
+        "system.readFile",
+        "system.listDir",
+      ],
+      requiredToolEvidence: {
+        delegationSpec: {
+          task: "explore_repository",
+          objective:
+            "List all files in /workspace/agenc-shell and read key files to summarize project structure and guidance",
+          inputContract: "No input - initial exploration",
+          acceptanceCriteria: [
+            "Full directory listing obtained",
+            "Key file contents read and reported",
+          ],
+        },
+      },
+    });
+
+    expect(guidance).toEqual({
+      source: "delegation-initial",
+      runtimeInstruction:
+        "Start with the smallest grounded step that reduces uncertainty in the delegated contract. " +
+        "Inspect the existing workspace state before mutating files when that will prevent avoidable rework, " +
+        "and use shell verification when build/test/install evidence is part of acceptance.",
+      routedToolNames: ["system.readFile", "system.listDir"],
+      persistRoutedToolNames: false,
+      toolChoice: "required",
+    });
+  });
+
   it("keeps inspect/mutate/verify tools available for delegated implementation phases without explicit build wording", () => {
     const guidance = resolveToolContractGuidance({
       phase: "initial",
@@ -535,7 +570,9 @@ describe("chat-executor-contract-guidance", () => {
           objective:
             "Create /tmp/maze-forge-ts-boot with root package.json and package stubs",
           inputContract: "Empty host dir",
-          contextRequirements: ["cwd=/tmp/maze-forge-ts-boot"],
+          executionContext: {
+            workspaceRoot: "/tmp/maze-forge-ts-boot",
+          },
           acceptanceCriteria: [
             "Root package.json with workspaces",
             "Package stubs exist",
@@ -573,7 +610,9 @@ describe("chat-executor-contract-guidance", () => {
             "package dirs created",
             "npm install runs without error",
           ],
-          contextRequirements: ["cwd=/tmp/maze-forge-ts-boot"],
+          executionContext: {
+            workspaceRoot: "/tmp/maze-forge-ts-boot",
+          },
         },
       },
     });
@@ -607,7 +646,9 @@ describe("chat-executor-contract-guidance", () => {
             "Grid parse and A* work with weights/obstacles",
             "Core builds and has basic tests",
           ],
-          contextRequirements: ["cwd=/tmp/maze-forge-ts-boot"],
+          executionContext: {
+            workspaceRoot: "/tmp/maze-forge-ts-boot",
+          },
         },
       },
     });
@@ -731,6 +772,38 @@ describe("chat-executor-contract-guidance", () => {
     expect(guidance).toEqual({
       source: "delegation-correction",
       routedToolNames: ["system.bash", "system.writeFile"],
+      persistRoutedToolNames: false,
+      toolChoice: "required",
+    });
+  });
+
+  it("routes delegated correction turns to inspection tools after missing source-grounding evidence", () => {
+    const guidance = resolveToolContractGuidance({
+      phase: "correction",
+      messageText: "Inspect the named source artifacts before writing the guide again.",
+      toolCalls: [],
+      allowedToolNames: ["system.listDir", "system.readFile", "system.writeFile"],
+      requiredToolEvidence: {
+        delegationSpec: {
+          task: "generate_agenc_md",
+          objective:
+            "Create /home/tetsuo/git/stream-test/agenc-shell/AGENC.md with repository guidelines sections.",
+          inputContract:
+            "Use PLAN.md and the current workspace state as the source of truth for the guide.",
+          contextRequirements: [
+            "cwd=/home/tetsuo/git/stream-test/agenc-shell",
+          ],
+          acceptanceCriteria: [
+            "AGENC.md written with all required sections",
+          ],
+        },
+      },
+      validationCode: "missing_required_source_evidence",
+    });
+
+    expect(guidance).toEqual({
+      source: "delegation-correction",
+      routedToolNames: ["system.listDir", "system.readFile"],
       persistRoutedToolNames: false,
       toolChoice: "required",
     });

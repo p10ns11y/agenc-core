@@ -290,9 +290,24 @@ export function summarizeRunDetail(detail, watchState) {
     if (value === undefined || value === null || value === "") return;
     lines.push(`${label}: ${String(value)}`);
   };
+  const completionState =
+    typeof detail.completionState === "string" && detail.completionState.trim()
+      ? detail.completionState.trim()
+      : null;
+  const remainingRequirements = Array.isArray(detail.remainingRequirements)
+    ? detail.remainingRequirements
+      .map((entry) => String(entry ?? "").trim())
+      .filter(Boolean)
+    : [];
   add("objective", detail.objective ?? watchState.currentObjective);
   add("phase", detail.currentPhase ?? watchState.runPhase);
-  add("state", detail.state ?? watchState.runState);
+  add("completion state", completionState ?? watchState.runState);
+  if (!completionState || completionState !== detail.state) {
+    add("state", detail.state ?? watchState.runState);
+  }
+  if (remainingRequirements.length > 0) {
+    add("remaining requirements", remainingRequirements.join(", "));
+  }
   add("explanation", detail.explanation);
   add("last update", detail.lastUserUpdate);
   add("verified evidence", detail.lastToolEvidence);

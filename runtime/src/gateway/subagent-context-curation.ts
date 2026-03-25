@@ -11,6 +11,7 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
+import type { ContextArtifactRef } from "../memory/artifact-store.js";
 import type {
   PipelinePlannerContextHistoryEntry,
   PipelinePlannerContextMemoryEntry,
@@ -19,6 +20,8 @@ import type {
 import type { PipelinePlannerSubagentStep } from "../workflow/pipeline.js";
 import type { PromptBudgetConfig } from "../llm/prompt-budget.js";
 import { derivePromptBudgetPlan } from "../llm/prompt-budget.js";
+import { selectRelevantArtifactRefs } from "../llm/context-pruning.js";
+import { sanitizeDelegationContextRequirements } from "../utils/delegation-execution-context.js";
 import {
   type CuratedSection,
   type DependencyArtifactCandidate,
@@ -98,11 +101,14 @@ export function extractTerms(value: string): string[] {
 export function buildRelevanceTerms(
   step: PipelinePlannerSubagentStep,
 ): Set<string> {
+  const sanitizedContextRequirements = sanitizeDelegationContextRequirements(
+    step.contextRequirements,
+  );
   const aggregate = [
     step.objective,
     step.inputContract,
     ...step.acceptanceCriteria,
-    ...step.contextRequirements,
+    ...sanitizedContextRequirements,
     ...step.requiredToolCapabilities,
   ].join(" ");
   return new Set(extractTerms(aggregate));
@@ -576,6 +582,35 @@ export function curateDependencyArtifactSection(
     ...section,
     available: artifacts.length,
     omitted: Math.max(0, artifacts.length - section.selected),
+  };
+}
+
+export function curateArtifactReferenceSection(
+  artifacts: readonly ContextArtifactRef[],
+  query: string,
+  maxChars: number,
+): CuratedSection {
+  if (artifacts.length === 0 || maxChars <= 0) {
+    return {
+      lines: [],
+      selected: 0,
+      available: artifacts.length,
+      omitted: artifacts.length,
+      truncated: false,
+    };
+  }
+  const lines = selectRelevantArtifactRefs({
+    artifacts,
+    query,
+    maxChars,
+  });
+  const truncated = lines.length < artifacts.length;
+  return {
+    lines,
+    selected: lines.length,
+    available: artifacts.length,
+    omitted: Math.max(0, artifacts.length - lines.length),
+    truncated,
   };
 }
 

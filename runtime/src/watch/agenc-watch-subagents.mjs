@@ -138,6 +138,31 @@ export function createWatchSubagentController(dependencies = {}) {
     return text.replace(/_/g, " ");
   }
 
+  function normalizeSubagentCompletionState(value) {
+    const state = sanitizeInlineText(value ?? "");
+    return state === "completed" ||
+        state === "partial" ||
+        state === "blocked" ||
+        state === "needs_verification"
+      ? state
+      : null;
+  }
+
+  function resolveSubagentTerminalStatus(data) {
+    const completionState = normalizeSubagentCompletionState(data.completionState);
+    if (completionState) {
+      return completionState;
+    }
+    const stopReason = sanitizeInlineText(data.stopReason ?? "");
+    if (stopReason === "completed") {
+      return "completed";
+    }
+    if (stopReason === "cancelled") {
+      return "cancelled";
+    }
+    return "failed";
+  }
+
   function describeSubagentStatus(type, payload) {
     const data = subagentPayloadData(payload);
     const probeName = sanitizeInlineText(data.probeName ?? data.category ?? "");
@@ -163,9 +188,11 @@ export function createWatchSubagentController(dependencies = {}) {
       case "subagents.acceptance_probe.failed":
         return `child probe failed: ${truncate(probeName || "acceptance", 40)}`;
       case "subagents.synthesized": {
+        const completionState = normalizeSubagentCompletionState(data.completionState);
         const stopReason = sanitizeInlineText(data.stopReason ?? "");
-        return stopReason
-          ? `child synthesis: ${truncate(stopReason.replace(/_/g, " "), 40)}`
+        const truth = completionState ?? stopReason;
+        return truth
+          ? `child synthesis: ${truncate(truth.replace(/_/g, " "), 40)}`
           : "child synthesis emitted";
       }
       default:
@@ -618,6 +645,7 @@ export function createWatchSubagentController(dependencies = {}) {
         clearSubagentHeartbeatEvents(payload?.subagentSessionId);
         clearSubagentLiveActivity(payload?.subagentSessionId);
         clearSubagentToolArgs(watchState, payload?.subagentSessionId);
+        const completionState = normalizeSubagentCompletionState(data.completionState);
         const stopReason = sanitizeInlineText(data.stopReason ?? "");
         const stopReasonDetail = firstMeaningfulLine(
           typeof data.stopReasonDetail === "string" ? data.stopReasonDetail : "",
@@ -629,12 +657,7 @@ export function createWatchSubagentController(dependencies = {}) {
               ? data.output
               : "",
         );
-        const nextStatus =
-          stopReason === "completed"
-            ? "completed"
-            : stopReason === "cancelled"
-              ? "cancelled"
-              : "failed";
+        const nextStatus = resolveSubagentTerminalStatus(data);
         const synthesizedStep = updateSubagentPlanStep({
           stepName,
           objective,
@@ -660,14 +683,18 @@ export function createWatchSubagentController(dependencies = {}) {
           synthesizedStep.note = synthesisNote;
         }
         const titleSuffix =
-          stopReason && stopReason !== "completed"
-            ? ` · ${stopReason.replace(/_/g, " ")}`
+          completionState && completionState !== "completed"
+            ? ` · ${completionState.replace(/_/g, " ")}`
+            : stopReason && stopReason !== "completed"
+              ? ` · ${stopReason.replace(/_/g, " ")}`
             : "";
         const tone =
           nextStatus === "completed"
             ? "cyan"
             : nextStatus === "cancelled"
               ? "amber"
+              : nextStatus === "partial" || nextStatus === "needs_verification"
+                ? "yellow"
               : "red";
         // Skip synthesized card if a completed card for the same subagent already exists
         const recentEvents = Array.isArray(watchState.events) ? watchState.events : [];
@@ -686,6 +713,7 @@ export function createWatchSubagentController(dependencies = {}) {
             [
               objective ? `objective: ${objective}` : null,
               stepName ? `step: ${stepName}` : null,
+              completionState ? `completion state: ${completionState.replace(/_/g, " ")}` : null,
               stopReason ? `stop: ${stopReason.replace(/_/g, " ")}` : null,
               Number.isFinite(Number(data.toolCalls))
                 ? `tool calls: ${data.toolCalls}`
@@ -699,10 +727,21 @@ export function createWatchSubagentController(dependencies = {}) {
         }
         // If this was the last active subagent and the stop reason is terminal,
         // retire any remaining open DAG nodes so the TUI doesn't stay on "working".
-        if (stopReason === "completed" || stopReason === "failed" || stopReason === "cancelled" || stopReason === "validation_error" || stopReason === "timeout") {
+        if (
+          completionState === "completed" ||
+          completionState === "partial" ||
+          completionState === "blocked" ||
+          completionState === "needs_verification" ||
+          stopReason === "completed" ||
+          stopReason === "failed" ||
+          stopReason === "cancelled" ||
+          stopReason === "validation_error" ||
+          stopReason === "timeout"
+        ) {
           retirePlannerDagOpenNodes(
-            stopReason === "completed" ? "completed" : "cancelled",
-            stopReasonDetail || stopReason.replace(/_/g, " "),
+            nextStatus,
+            stopReasonDetail ||
+              (completionState ?? stopReason).replace(/_/g, " "),
           );
         }
         return;

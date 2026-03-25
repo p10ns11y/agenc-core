@@ -218,6 +218,7 @@ export class SqliteReplayTimelineStore implements ReplayTimelineStore {
     }
 
     return {
+      schemaVersion: 1,
       slot: cursor.slot,
       signature: cursor.signature,
       eventName: cursor.event_name ?? undefined,
@@ -368,6 +369,7 @@ export class SqliteReplayTimelineStore implements ReplayTimelineStore {
 
   private rowToRecord(row: ReplayTimelineRow): ReplayTimelineRecord {
     return {
+      schemaVersion: 1,
       seq: row.seq,
       type: row.source_event_type,
       taskPda: row.task_pda ?? undefined,

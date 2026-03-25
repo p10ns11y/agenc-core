@@ -104,6 +104,28 @@ test("planner controller closes the run on terminal planner completion", () => {
   assert.equal(watchState.runState, "idle");
   assert.equal(watchState.activeRunStartedAtMs, null);
   assert.ok(
-    calls.some((entry) => entry.type === "retire" && entry.status === "cancelled"),
+    calls.some((entry) => entry.type === "retire" && entry.status === "completed"),
+  );
+});
+
+test("planner controller keeps truthful non-complete terminal states visible", () => {
+  const { controller, calls, watchState } = createPlannerHarness();
+
+  controller.handlePlannerTraceEvent("planner_path_finished", {
+    sessionId: "sess-1",
+    completionState: "needs_verification",
+    stopReason: "completed",
+    stopReasonDetail: "verification still required",
+  });
+
+  assert.equal(watchState.plannerDagStatus, "needs_verification");
+  assert.equal(watchState.runPhase, null);
+  assert.equal(watchState.runState, "needs_verification");
+  assert.equal(watchState.activeRunStartedAtMs, null);
+  assert.ok(
+    calls.some(
+      (entry) =>
+        entry.type === "retire" && entry.status === "needs_verification",
+    ),
   );
 });

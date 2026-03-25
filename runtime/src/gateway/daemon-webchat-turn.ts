@@ -106,6 +106,7 @@ function maybeBroadcastExecutionTraceEventToWebChat(params: {
     case "planner_pipeline_started":
     case "planner_plan_parsed":
     case "planner_refinement_requested":
+    case "planner_step_state_changed":
     case "planner_verifier_retry_scheduled":
     case "planner_verifier_round_finished":
       webChat.broadcastEvent(event.type, basePayload);
@@ -319,12 +320,14 @@ export async function executeWebChatConversationTurn(
         callUsage: summarizeCallUsageForTrace(result.callUsage),
         statefulSummary: result.statefulSummary,
         plannerSummary: result.plannerSummary,
+        economicsSummary: result.economicsSummary,
         toolRoutingDecision:
           summarizeToolRoutingDecisionForTrace(toolRoutingDecision),
         toolRoutingSummary: summarizeToolRoutingSummaryForTrace(
           result.toolRoutingSummary,
         ),
         stopReason: result.stopReason,
+        completionState: result.completionState,
         stopReasonDetail: result.stopReasonDetail,
         response: truncateToolLogText(result.content, traceConfig.maxChars),
         toolCalls: result.toolCalls.map((toolCall) => ({
@@ -367,9 +370,11 @@ export async function executeWebChatConversationTurn(
             callUsage: result.callUsage,
             statefulSummary: result.statefulSummary,
             plannerSummary: result.plannerSummary,
+            economicsSummary: result.economicsSummary,
             toolRoutingDecision,
             toolRoutingSummary: result.toolRoutingSummary,
             stopReason: result.stopReason,
+            completionState: result.completionState,
             stopReasonDetail: result.stopReasonDetail,
             response: result.content,
             toolCalls: result.toolCalls.map((toolCall) => ({
@@ -425,12 +430,18 @@ export async function executeWebChatConversationTurn(
         usedFallback: result.usedFallback,
         contextWindowTokens,
         callUsage: result.callUsage,
+        economicsSummary: result.economicsSummary,
       }),
     });
 
     onSubagentSynthesis?.(result);
 
-    webChat.broadcastEvent("chat.response", { sessionId: msg.sessionId });
+    webChat.broadcastEvent("chat.response", {
+      sessionId: msg.sessionId,
+      completionState: result.completionState,
+      stopReason: result.stopReason,
+      stopReasonDetail: result.stopReasonDetail,
+    });
 
     await hooks.dispatch("message:outbound", {
       sessionId: msg.sessionId,

@@ -1,4 +1,9 @@
 import type { WorkflowGraphEdge } from "../workflow/types.js";
+import type { DelegationExecutionContext } from "../utils/delegation-execution-context.js";
+import type { DelegationBudgetSnapshot } from "./run-budget.js";
+import {
+  assessDelegationAdmission,
+} from "../gateway/delegation-admission.js";
 
 export type DelegationDecisionReason =
   | "delegation_disabled"
@@ -6,11 +11,21 @@ export type DelegationDecisionReason =
   | "hard_blocked_task_class"
   | "trivial_request"
   | "single_hop_request"
+  | "shared_context_review"
+  | "shared_artifact_writer_inline"
   | "fanout_exceeded"
   | "depth_exceeded"
   | "handoff_confidence_below_threshold"
   | "safety_risk_high"
   | "score_below_threshold"
+  | "missing_execution_envelope"
+  | "parallel_gain_insufficient"
+  | "dependency_coupling_high"
+  | "tool_overlap_high"
+  | "verifier_cost_high"
+  | "retry_cost_high"
+  | "negative_economics"
+  | "no_safe_delegation_shape"
   | "approved";
 
 export type DelegationHardBlockedTaskClass =
@@ -44,16 +59,20 @@ export interface ResolvedDelegationDecisionConfig {
 
 export interface DelegationSubagentStepProfile {
   readonly name: string;
+  readonly objective?: string;
+  readonly inputContract?: string;
   readonly dependsOn?: readonly string[];
   readonly acceptanceCriteria: readonly string[];
   readonly requiredToolCapabilities: readonly string[];
   readonly contextRequirements: readonly string[];
+  readonly executionContext?: DelegationExecutionContext;
   readonly maxBudgetHint: string;
   readonly canRunParallel: boolean;
 }
 
 export interface DelegationDecisionInput {
   readonly messageText: string;
+  readonly explicitDelegationRequested?: boolean;
   readonly plannerConfidence?: number;
   readonly complexityScore: number;
   readonly totalSteps: number;
@@ -61,6 +80,7 @@ export interface DelegationDecisionInput {
   readonly edges: readonly WorkflowGraphEdge[];
   readonly subagentSteps: readonly DelegationSubagentStepProfile[];
   readonly config?: DelegationDecisionConfig;
+  readonly budgetSnapshot?: DelegationBudgetSnapshot;
 }
 
 export interface DelegationDecision {
@@ -76,18 +96,16 @@ export interface DelegationDecision {
   readonly hardBlockedTaskClass: DelegationHardBlockedTaskClass | null;
   readonly hardBlockedTaskClassSource: DelegationHardBlockedMatchSource | null;
   readonly hardBlockedTaskClassSignal: string | null;
-  readonly diagnostics: Readonly<Record<string, number | boolean>>;
+  readonly diagnostics: Readonly<Record<string, number | boolean | string>>;
 }
 
-// Calibrated against current utility-score ranges for viable coding/research fanout.
 const DEFAULT_SCORE_THRESHOLD = 0.2;
 const DEFAULT_MAX_FANOUT_PER_TURN = 8;
 const DEFAULT_MAX_DEPTH = 4;
 const DEFAULT_HANDOFF_MIN_PLANNER_CONFIDENCE = 0.82;
 const DEFAULT_SUBAGENT_MODE = "manager_tools" as const;
-const TRIVIAL_MAX_WORDS = 28;
-const SINGLE_HOP_MAX_WORDS = 72;
 const SAFETY_RISK_HARD_BLOCK_THRESHOLD = 0.9;
+
 const DEFAULT_HARD_BLOCKED_TASK_CLASSES: readonly DelegationHardBlockedTaskClass[] = [
   "wallet_signing",
   "wallet_transfer",
@@ -108,6 +126,7 @@ const MODERATE_RISK_CAPABILITY_PATTERNS: readonly RegExp[] = [
   /^system\.http$/i,
   /^playwright\./i,
 ];
+
 const WALLET_SIGNING_CAPABILITY_RE =
   /^(?:wallet|solana|agenc)\.(?:sign|approve|authorize)(?:\.|$)/i;
 const WALLET_TRANSFER_CAPABILITY_RE =
@@ -137,19 +156,11 @@ interface HardBlockedTaskClassMatch {
   readonly signal: string;
 }
 
-interface DecisionMetrics {
-  readonly utilityScore: number;
-  readonly decompositionBenefit: number;
-  readonly coordinationOverhead: number;
-  readonly latencyCostRisk: number;
-  readonly safetyRisk: number;
-  readonly confidence: number;
-  readonly dependencyDepth: number;
-  readonly wordCount: number;
-  readonly subagentCount: number;
-  readonly edgeCount: number;
-  readonly parallelizableSubagentCount: number;
-  readonly uniqueCapabilityCount: number;
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  if (value <= 0) return 0;
+  if (value >= 1) return 1;
+  return value;
 }
 
 export function resolveDelegationDecisionConfig(
@@ -198,40 +209,47 @@ export function assessDelegationDecision(
   input: DelegationDecisionInput,
 ): DelegationDecision {
   const resolvedConfig = resolveDelegationDecisionConfig(input.config);
-  const metrics = computeDecisionMetrics(input);
   const hardBlockedMatch = detectHardBlockedTaskClass(input, resolvedConfig);
   const hardBlockedTaskClass = hardBlockedMatch?.taskClass ?? null;
-  const plannerConfidence = clamp01(
-    input.plannerConfidence ?? metrics.confidence,
-  );
-  const diagnostics = buildDiagnostics(
-    metrics,
-    input,
-    resolvedConfig,
-    plannerConfidence,
-    hardBlockedTaskClass,
-    hardBlockedMatch,
-  );
+
+  const safetyRisk = computeSafetyRisk(input.subagentSteps);
+  const plannerConfidence = clamp01(input.plannerConfidence ?? 0);
 
   if (!resolvedConfig.enabled) {
     return buildDecision({
       shouldDelegate: false,
       reason: "delegation_disabled",
       threshold: resolvedConfig.scoreThreshold,
-      metrics,
+      utilityScore: 0,
+      decompositionBenefit: 0,
+      coordinationOverhead: 0,
+      latencyCostRisk: 0,
+      safetyRisk,
+      confidence: plannerConfidence,
       hardBlockedMatch,
-      diagnostics,
+      diagnostics: {
+        threshold: resolvedConfig.scoreThreshold,
+        enabled: false,
+      },
     });
   }
 
-  if (metrics.subagentCount === 0) {
+  if (input.subagentSteps.length === 0) {
     return buildDecision({
       shouldDelegate: false,
       reason: "no_subagent_steps",
       threshold: resolvedConfig.scoreThreshold,
-      metrics,
+      utilityScore: 0,
+      decompositionBenefit: 0,
+      coordinationOverhead: 0,
+      latencyCostRisk: 0,
+      safetyRisk,
+      confidence: plannerConfidence,
       hardBlockedMatch,
-      diagnostics,
+      diagnostics: {
+        threshold: resolvedConfig.scoreThreshold,
+        enabled: true,
+      },
     });
   }
 
@@ -240,20 +258,17 @@ export function assessDelegationDecision(
       shouldDelegate: false,
       reason: "hard_blocked_task_class",
       threshold: resolvedConfig.scoreThreshold,
-      metrics,
+      utilityScore: 0,
+      decompositionBenefit: 0,
+      coordinationOverhead: 0,
+      latencyCostRisk: 0,
+      safetyRisk,
+      confidence: plannerConfidence,
       hardBlockedMatch,
-      diagnostics,
-    });
-  }
-
-  if (metrics.subagentCount > resolvedConfig.maxFanoutPerTurn) {
-    return buildDecision({
-      shouldDelegate: false,
-      reason: "fanout_exceeded",
-      threshold: resolvedConfig.scoreThreshold,
-      metrics,
-      hardBlockedMatch,
-      diagnostics,
+      diagnostics: {
+        threshold: resolvedConfig.scoreThreshold,
+        hasHardBlockedTaskClass: true,
+      },
     });
   }
 
@@ -265,141 +280,168 @@ export function assessDelegationDecision(
       shouldDelegate: false,
       reason: "handoff_confidence_below_threshold",
       threshold: resolvedConfig.scoreThreshold,
-      metrics,
+      utilityScore: 0,
+      decompositionBenefit: 0,
+      coordinationOverhead: 0,
+      latencyCostRisk: 0,
+      safetyRisk,
+      confidence: plannerConfidence,
       hardBlockedMatch,
-      diagnostics,
+      diagnostics: {
+        threshold: resolvedConfig.scoreThreshold,
+        handoffMinPlannerConfidence: resolvedConfig.handoffMinPlannerConfidence,
+      },
     });
   }
 
-  const trivialRequest =
-    metrics.wordCount <= TRIVIAL_MAX_WORDS &&
-    metrics.subagentCount <= 1 &&
-    input.totalSteps <= 2 &&
-    input.complexityScore <= 4;
-  if (trivialRequest) {
-    return buildDecision({
-      shouldDelegate: false,
-      reason: "trivial_request",
-      threshold: resolvedConfig.scoreThreshold,
-      metrics,
-      hardBlockedMatch,
-      diagnostics,
-    });
-  }
-
-  const singleHopRequest =
-    metrics.subagentCount <= 1 &&
-    metrics.dependencyDepth <= 1 &&
-    metrics.parallelizableSubagentCount === 0 &&
-    metrics.wordCount <= SINGLE_HOP_MAX_WORDS &&
-    input.complexityScore <= 6;
-  if (singleHopRequest) {
-    return buildDecision({
-      shouldDelegate: false,
-      reason: "single_hop_request",
-      threshold: resolvedConfig.scoreThreshold,
-      metrics,
-      hardBlockedMatch,
-      diagnostics,
-    });
-  }
-
-  if (metrics.safetyRisk >= SAFETY_RISK_HARD_BLOCK_THRESHOLD) {
+  if (safetyRisk >= SAFETY_RISK_HARD_BLOCK_THRESHOLD) {
     return buildDecision({
       shouldDelegate: false,
       reason: "safety_risk_high",
       threshold: resolvedConfig.scoreThreshold,
-      metrics,
+      utilityScore: 0,
+      decompositionBenefit: 0,
+      coordinationOverhead: 0,
+      latencyCostRisk: 0,
+      safetyRisk,
+      confidence: plannerConfidence,
       hardBlockedMatch,
-      diagnostics,
+      diagnostics: {
+        threshold: resolvedConfig.scoreThreshold,
+        safetyRisk: Number(safetyRisk.toFixed(4)),
+      },
     });
   }
 
-  if (metrics.utilityScore < resolvedConfig.scoreThreshold) {
-    return buildDecision({
-      shouldDelegate: false,
-      reason: "score_below_threshold",
-      threshold: resolvedConfig.scoreThreshold,
-      metrics,
-      hardBlockedMatch,
-      diagnostics,
-    });
-  }
+  const admission = assessDelegationAdmission({
+    messageText: input.messageText,
+    explicitDelegationRequested: input.explicitDelegationRequested,
+    totalSteps: input.totalSteps,
+    synthesisSteps: input.synthesisSteps,
+    steps: input.subagentSteps,
+    edges: input.edges,
+    threshold: resolvedConfig.scoreThreshold,
+    maxFanoutPerTurn: resolvedConfig.maxFanoutPerTurn,
+    maxDepth: resolvedConfig.maxDepth,
+    budgetSnapshot: input.budgetSnapshot,
+  });
+
+  const reason = admission.reason as DelegationDecisionReason;
+  const economics = admission.economics;
+  const confidence = clamp01(
+    0.25 +
+      economics.explicitOwnershipCoverage * 0.35 +
+      (admission.shape ? 0.2 : 0) +
+      plannerConfidence * 0.2,
+  );
+  const latencyCostRisk = clamp01(
+    economics.verifierCost * 0.45 +
+      economics.retryCost * 0.45 +
+      economics.contextFootprint * 0.1,
+  );
 
   return buildDecision({
-    shouldDelegate: true,
-    reason: "approved",
+    shouldDelegate: admission.allowed,
+    reason: admission.allowed ? "approved" : reason,
     threshold: resolvedConfig.scoreThreshold,
-    metrics,
+    utilityScore: economics.utilityScore,
+    decompositionBenefit: economics.parallelGain,
+    coordinationOverhead: economics.dependencyCoupling,
+    latencyCostRisk,
+    safetyRisk,
+    confidence,
     hardBlockedMatch,
-    diagnostics,
+    diagnostics: {
+      ...admission.diagnostics,
+      plannerConfidence: Number(plannerConfidence.toFixed(4)),
+      threshold: resolvedConfig.scoreThreshold,
+      modeHandoff: resolvedConfig.mode === "handoff",
+      maxFanoutPerTurn: resolvedConfig.maxFanoutPerTurn,
+      maxDepth: resolvedConfig.maxDepth,
+    },
   });
 }
 
 function buildDecision(input: {
-  shouldDelegate: boolean;
-  reason: DelegationDecisionReason;
-  threshold: number;
-  metrics: DecisionMetrics;
-  hardBlockedMatch: HardBlockedTaskClassMatch | null;
-  diagnostics: Readonly<Record<string, number | boolean>>;
+  readonly shouldDelegate: boolean;
+  readonly reason: DelegationDecisionReason;
+  readonly threshold: number;
+  readonly utilityScore: number;
+  readonly decompositionBenefit: number;
+  readonly coordinationOverhead: number;
+  readonly latencyCostRisk: number;
+  readonly safetyRisk: number;
+  readonly confidence: number;
+  readonly hardBlockedMatch: HardBlockedTaskClassMatch | null;
+  readonly diagnostics: Readonly<Record<string, number | boolean | string>>;
 }): DelegationDecision {
+  const hardBlockedDiagnostics: Record<string, boolean> = {
+    hasHardBlockedTaskClass: input.hardBlockedMatch !== null,
+    hardBlockedTaskClassMatchedByText:
+      input.hardBlockedMatch?.source === "text",
+    hardBlockedTaskClassMatchedByCapability:
+      input.hardBlockedMatch?.source === "capability",
+  };
   return {
     shouldDelegate: input.shouldDelegate,
     reason: input.reason,
     threshold: input.threshold,
-    utilityScore: input.metrics.utilityScore,
-    decompositionBenefit: input.metrics.decompositionBenefit,
-    coordinationOverhead: input.metrics.coordinationOverhead,
-    latencyCostRisk: input.metrics.latencyCostRisk,
-    safetyRisk: input.metrics.safetyRisk,
-    confidence: input.metrics.confidence,
+    utilityScore: input.utilityScore,
+    decompositionBenefit: input.decompositionBenefit,
+    coordinationOverhead: input.coordinationOverhead,
+    latencyCostRisk: input.latencyCostRisk,
+    safetyRisk: input.safetyRisk,
+    confidence: input.confidence,
     hardBlockedTaskClass: input.hardBlockedMatch?.taskClass ?? null,
     hardBlockedTaskClassSource: input.hardBlockedMatch?.source ?? null,
     hardBlockedTaskClassSignal: input.hardBlockedMatch?.signal ?? null,
-    diagnostics: input.diagnostics,
+    diagnostics: {
+      ...hardBlockedDiagnostics,
+      ...input.diagnostics,
+    },
   };
 }
 
-function buildDiagnostics(
-  metrics: DecisionMetrics,
-  input: DelegationDecisionInput,
-  config: ResolvedDelegationDecisionConfig,
-  plannerConfidence: number,
-  hardBlockedTaskClass: DelegationHardBlockedTaskClass | null,
-  hardBlockedMatch?: HardBlockedTaskClassMatch | null,
-): Readonly<Record<string, number | boolean>> {
-  return {
-    complexityScore: input.complexityScore,
-    plannerConfidence,
-    totalSteps: input.totalSteps,
-    synthesisSteps: input.synthesisSteps,
-    subagentSteps: metrics.subagentCount,
-    edgeCount: metrics.edgeCount,
-    dependencyDepth: metrics.dependencyDepth,
-    parallelizableSubagentSteps: metrics.parallelizableSubagentCount,
-    uniqueCapabilityCount: metrics.uniqueCapabilityCount,
-    wordCount: metrics.wordCount,
-    maxFanoutPerTurn: config.maxFanoutPerTurn,
-    maxDepth: config.maxDepth,
-    modeHandoff: config.mode === "handoff",
-    handoffMinPlannerConfidence: config.handoffMinPlannerConfidence,
-    hasHardBlockedTaskClass: hardBlockedTaskClass !== null,
-    hardBlockedTaskClassMatchedByCapability:
-      hardBlockedMatch?.source === "capability",
-    hardBlockedTaskClassMatchedByText: hardBlockedMatch?.source === "text",
-    hardBlockedTaskClassWalletSigning:
-      hardBlockedTaskClass === "wallet_signing",
-    hardBlockedTaskClassWalletTransfer:
-      hardBlockedTaskClass === "wallet_transfer",
-    hardBlockedTaskClassStakeOrRewards:
-      hardBlockedTaskClass === "stake_or_rewards",
-    hardBlockedTaskClassDestructiveHostMutation:
-      hardBlockedTaskClass === "destructive_host_mutation",
-    hardBlockedTaskClassCredentialExfiltration:
-      hardBlockedTaskClass === "credential_exfiltration",
-    threshold: config.scoreThreshold,
-  };
+function computeSafetyRisk(
+  steps: readonly DelegationSubagentStepProfile[],
+): number {
+  const normalizedCapabilities = new Set<string>();
+  let parallelMutableSteps = 0;
+
+  for (const step of steps) {
+    if (
+      step.canRunParallel &&
+      step.executionContext &&
+      step.executionContext.effectClass !== "read_only"
+    ) {
+      parallelMutableSteps += 1;
+    }
+    for (const capability of step.requiredToolCapabilities) {
+      normalizedCapabilities.add(capability.trim().toLowerCase());
+    }
+  }
+
+  let highRiskCount = 0;
+  let moderateRiskCount = 0;
+  for (const capability of normalizedCapabilities) {
+    if (HIGH_RISK_CAPABILITY_PATTERNS.some((pattern) => pattern.test(capability))) {
+      highRiskCount += 1;
+      continue;
+    }
+    if (MODERATE_RISK_CAPABILITY_PATTERNS.some((pattern) => pattern.test(capability))) {
+      moderateRiskCount += 1;
+    }
+  }
+
+  const parallelExposure = clamp01(
+    steps.length > 0 ? parallelMutableSteps / steps.length : 0,
+  );
+  return clamp01(
+    0.05 +
+      highRiskCount * 0.22 +
+      moderateRiskCount * 0.08 +
+      parallelExposure * 0.18,
+  );
 }
 
 function detectHardBlockedTaskClass(
@@ -414,7 +456,8 @@ function detectHardBlockedTaskClass(
   const textBlob = [
     input.messageText,
     ...input.subagentSteps.map((step) => step.name),
-    ...input.subagentSteps.map((step) => step.maxBudgetHint),
+    ...input.subagentSteps.map((step) => step.objective ?? ""),
+    ...input.subagentSteps.map((step) => step.inputContract ?? ""),
     ...input.subagentSteps.flatMap((step) => step.acceptanceCriteria),
     ...input.subagentSteps.flatMap((step) => step.contextRequirements),
   ].join("\n");
@@ -550,250 +593,4 @@ function summarizeHardBlockedSignal(signal: string): string {
     return normalized;
   }
   return `${normalized.slice(0, 93)}...`;
-}
-
-function computeDecisionMetrics(input: DelegationDecisionInput): DecisionMetrics {
-  const wordCount = countWords(input.messageText);
-  const subagentCount = input.subagentSteps.length;
-  const subagentStepNames = input.subagentSteps.map((step) => step.name);
-  const relevantEdges = filterRelevantSubagentEdges(subagentStepNames, input.edges);
-  const edgeCount = relevantEdges.length;
-  const dependencyDepth = estimateDependencyDepth(
-    subagentStepNames,
-    relevantEdges,
-  );
-  const parallelizableSubagentCount = input.subagentSteps.filter((step) =>
-    step.canRunParallel
-  ).length;
-
-  const capabilities = input.subagentSteps.flatMap((step) =>
-    step.requiredToolCapabilities
-  );
-  const uniqueCapabilityCount = new Set(capabilities).size;
-
-  const avgAcceptanceCount = average(
-    input.subagentSteps.map((step) => step.acceptanceCriteria.length),
-  );
-  const avgContextRequirementCount = average(
-    input.subagentSteps.map((step) => step.contextRequirements.length),
-  );
-  const avgBudgetMinutes = average(
-    input.subagentSteps.map((step) => parseBudgetHintMinutes(step.maxBudgetHint)),
-  );
-  const budgetRisk = clamp01(avgBudgetMinutes / 30);
-
-  const {
-    highRiskCount,
-    moderateRiskCount,
-    riskySubagentCount,
-    parallelRiskySubagentCount,
-  } = countRiskyCapabilities(input.subagentSteps);
-
-  const decompositionBenefit = clamp01(
-    0.08 +
-      Math.min(0.4, subagentCount * 0.18) +
-      Math.min(0.2, parallelizableSubagentCount * 0.08) +
-      Math.min(0.18, uniqueCapabilityCount * 0.035) +
-      Math.min(0.14, input.complexityScore * 0.02),
-  );
-
-  const sequentialPhaseCount = Math.max(0, subagentCount - parallelizableSubagentCount);
-  const dependencyDepthPenalty = Math.max(0, dependencyDepth - 2);
-  const coordinationOverhead = clamp01(
-    0.05 +
-      Math.max(0, sequentialPhaseCount - 2) * 0.06 +
-      parallelizableSubagentCount * 0.11 +
-      edgeCount * 0.025 +
-      dependencyDepthPenalty * 0.03,
-  );
-
-  const latencyCostRisk = clamp01(
-    0.05 +
-      subagentCount * 0.065 +
-      dependencyDepthPenalty * 0.035 +
-      budgetRisk * 0.18 -
-      parallelizableSubagentCount * 0.03,
-  );
-
-  const safetyRisk = clamp01(
-    0.05 +
-      highRiskCount * 0.22 +
-      moderateRiskCount * 0.08 +
-      Math.max(0, riskySubagentCount - 2) * 0.03 +
-      parallelRiskySubagentCount * 0.04 +
-      Math.max(0, uniqueCapabilityCount - 6) * 0.02,
-  );
-
-  const confidence = clamp01(
-    0.34 +
-      Math.min(0.2, avgAcceptanceCount * 0.05) +
-      Math.min(0.16, avgContextRequirementCount * 0.05) +
-      Math.min(0.14, uniqueCapabilityCount * 0.02) +
-      Math.min(0.16, input.complexityScore * 0.025) -
-      Math.max(0, dependencyDepth - 3) * 0.05,
-  );
-
-  const utilityScore = clamp01(
-    decompositionBenefit * confidence -
-      (coordinationOverhead * 0.4 +
-        latencyCostRisk * 0.35 +
-        safetyRisk * 0.25) +
-      0.5,
-  );
-
-  return {
-    utilityScore,
-    decompositionBenefit,
-    coordinationOverhead,
-    latencyCostRisk,
-    safetyRisk,
-    confidence,
-    dependencyDepth,
-    wordCount,
-    subagentCount,
-    edgeCount,
-    parallelizableSubagentCount,
-    uniqueCapabilityCount,
-  };
-}
-
-function filterRelevantSubagentEdges(
-  stepNames: readonly string[],
-  edges: readonly WorkflowGraphEdge[],
-): WorkflowGraphEdge[] {
-  if (stepNames.length === 0 || edges.length === 0) return [];
-  const stepSet = new Set(stepNames);
-  return edges.filter((edge) => stepSet.has(edge.from) && stepSet.has(edge.to));
-}
-
-function estimateDependencyDepth(
-  stepNames: readonly string[],
-  edges: readonly WorkflowGraphEdge[],
-): number {
-  if (stepNames.length === 0) return 0;
-  const stepSet = new Set(stepNames);
-  const incoming = new Map<string, number>();
-  const outgoing = new Map<string, string[]>();
-  const depth = new Map<string, number>();
-
-  for (const stepName of stepNames) {
-    incoming.set(stepName, 0);
-    outgoing.set(stepName, []);
-    depth.set(stepName, 1);
-  }
-
-  for (const edge of edges) {
-    if (!stepSet.has(edge.from) || !stepSet.has(edge.to)) continue;
-    outgoing.get(edge.from)!.push(edge.to);
-    incoming.set(edge.to, (incoming.get(edge.to) ?? 0) + 1);
-  }
-
-  const queue: string[] = [];
-  for (const [stepName, incomingCount] of incoming.entries()) {
-    if (incomingCount === 0) queue.push(stepName);
-  }
-
-  let visited = 0;
-  let maxDepth = 1;
-  while (queue.length > 0) {
-    const stepName = queue.shift()!;
-    visited++;
-    const currentDepth = depth.get(stepName) ?? 1;
-    maxDepth = Math.max(maxDepth, currentDepth);
-    for (const next of outgoing.get(stepName) ?? []) {
-      const nextDepth = Math.max(depth.get(next) ?? 1, currentDepth + 1);
-      depth.set(next, nextDepth);
-      const nextIncoming = (incoming.get(next) ?? 0) - 1;
-      incoming.set(next, nextIncoming);
-      if (nextIncoming === 0) queue.push(next);
-    }
-  }
-
-  // Guard against cyclic graphs in planner output.
-  if (visited !== stepNames.length) {
-    return stepNames.length + 1;
-  }
-  return maxDepth;
-}
-
-function countRiskyCapabilities(
-  subagentSteps: readonly DelegationSubagentStepProfile[],
-): {
-  highRiskCount: number;
-  moderateRiskCount: number;
-  riskySubagentCount: number;
-  parallelRiskySubagentCount: number;
-} {
-  const highRiskCapabilities = new Set<string>();
-  const moderateRiskCapabilities = new Set<string>();
-  let riskySubagentCount = 0;
-  let parallelRiskySubagentCount = 0;
-
-  for (const step of subagentSteps) {
-    let stepHasRiskyCapability = false;
-    for (const rawCapability of step.requiredToolCapabilities) {
-      const capability = rawCapability.trim();
-      if (
-        HIGH_RISK_CAPABILITY_PATTERNS.some((pattern) => pattern.test(capability))
-      ) {
-        highRiskCapabilities.add(capability);
-        stepHasRiskyCapability = true;
-        continue;
-      }
-      if (
-        MODERATE_RISK_CAPABILITY_PATTERNS.some((pattern) =>
-          pattern.test(capability)
-        )
-      ) {
-        moderateRiskCapabilities.add(capability);
-        stepHasRiskyCapability = true;
-      }
-    }
-
-    if (stepHasRiskyCapability) {
-      riskySubagentCount++;
-      if (step.canRunParallel) {
-        parallelRiskySubagentCount++;
-      }
-    }
-  }
-
-  return {
-    highRiskCount: highRiskCapabilities.size,
-    moderateRiskCount: moderateRiskCapabilities.size,
-    riskySubagentCount,
-    parallelRiskySubagentCount,
-  };
-}
-
-function parseBudgetHintMinutes(hint: string): number {
-  const normalized = hint.trim().toLowerCase();
-  const match = normalized.match(/(\d+(?:\.\d+)?)\s*(ms|s|sec|m|min|h|hr)?/);
-  if (!match) return 5;
-  const value = Number.parseFloat(match[1] ?? "0");
-  if (!Number.isFinite(value) || value <= 0) return 5;
-  const unit = match[2] ?? "m";
-  if (unit === "ms") return value / 60_000;
-  if (unit === "s" || unit === "sec") return value / 60;
-  if (unit === "h" || unit === "hr") return value * 60;
-  return value;
-}
-
-function countWords(text: string): number {
-  const trimmed = text.trim();
-  if (trimmed.length === 0) return 0;
-  return trimmed.split(/\s+/).length;
-}
-
-function average(values: readonly number[]): number {
-  if (values.length === 0) return 0;
-  const total = values.reduce((sum, value) => sum + value, 0);
-  return total / values.length;
-}
-
-function clamp01(value: number): number {
-  if (!Number.isFinite(value)) return 0;
-  if (value <= 0) return 0;
-  if (value >= 1) return 1;
-  return value;
 }

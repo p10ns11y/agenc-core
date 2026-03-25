@@ -1,12 +1,9 @@
 /**
- * Meta-planner — self-directed goal generation.
+ * Meta-planner — durable strategic goal generation.
  *
- * Uses the memory graph and recent activity to understand current state,
- * feeds a state summary to the LLM with a meta-planning prompt, and
- * generates structured goals with priority and rationale.
- *
- * Goals pass through the PolicyEngine before execution and can
- * optionally feed into GoalCompiler → on-chain workflow.
+ * Reads a structured strategic-memory snapshot instead of raw recent chat
+ * slices, then proposes bounded goals that are written into the shared goal
+ * store.
  *
  * @module
  */
@@ -19,27 +16,16 @@ import type {
 import type { LLMProvider } from "../llm/types.js";
 import { createProviderTraceEventLogger } from "../llm/provider-trace-logger.js";
 import type { MemoryBackend } from "../memory/types.js";
-import { entryToMessage } from "../memory/types.js";
-
-// ============================================================================
-// Types
-// ============================================================================
+import { StrategicMemory } from "./strategic-memory.js";
 
 export interface MetaPlannerConfig {
-  /** LLM provider for goal generation. */
-  llm: LLMProvider;
-  /** Memory backend for reading state and storing goals. */
-  memory: MemoryBackend;
-  /** Agent's stated purpose/mission (used in planning prompt). */
-  agentMission?: string;
-  /** Max goals to generate per cycle (default: 3). */
-  maxGoals?: number;
-  /** Lookback window for state summary (default: 86_400_000 = 24h). */
-  lookbackMs?: number;
-  /** KV key prefix for stored goals (default: "goal:"). */
-  keyPrefix?: string;
-  /** Emit raw provider payload traces when daemon trace logging enables it. */
-  traceProviderPayloads?: boolean;
+  readonly llm: LLMProvider;
+  readonly memory: MemoryBackend;
+  readonly strategicMemory?: StrategicMemory;
+  readonly agentMission?: string;
+  readonly maxGoals?: number;
+  readonly keyPrefix?: string;
+  readonly traceProviderPayloads?: boolean;
 }
 
 export interface GeneratedGoal {
@@ -54,25 +40,23 @@ export interface GeneratedGoal {
   status: "proposed" | "approved" | "in-progress" | "completed" | "rejected";
 }
 
-// ============================================================================
-// Constants
-// ============================================================================
-
 const DEFAULT_MAX_GOALS = 3;
-const DEFAULT_LOOKBACK_MS = 86_400_000;
 const DEFAULT_KEY_PREFIX = "goal:";
 
 const META_PLANNING_PROMPT = `You are an autonomous AI agent's strategic planning module.
 
 Your mission: {MISSION}
 
-Based on recent activity and current state, generate strategic goals that would advance your mission.
+You are given a structured strategic-memory snapshot. Use it instead of raw
+chat history. Prefer goals that:
+- build on durable recent outcomes
+- resolve repeated failures or stale work
+- avoid duplicating active or recently completed goals
 
 Rules:
 - Goals should be specific, measurable, and actionable
-- Prioritize goals that build on recent successes or address recent failures
-- Include both short-term tactical and longer-term strategic goals
-- Each goal should have a clear rationale explaining WHY it matters
+- Include a concise rationale explaining why the goal matters now
+- Suggested actions should be short, concrete next moves
 
 Return a JSON array of goals:
 [
@@ -88,10 +72,6 @@ Return a JSON array of goals:
 
 Return ONLY valid JSON. No markdown code blocks.`;
 
-// ============================================================================
-// Action
-// ============================================================================
-
 export function createMetaPlannerAction(
   config: MetaPlannerConfig,
 ): HeartbeatAction {
@@ -100,117 +80,53 @@ export function createMetaPlannerAction(
     config.agentMission ??
     "Coordinate tasks, assist users, and continuously improve capabilities";
   const maxGoals = config.maxGoals ?? DEFAULT_MAX_GOALS;
-  const lookbackMs = config.lookbackMs ?? DEFAULT_LOOKBACK_MS;
   const keyPrefix = config.keyPrefix ?? DEFAULT_KEY_PREFIX;
+  const strategicMemory =
+    config.strategicMemory ?? StrategicMemory.fromMemoryBackend(memory);
 
   return {
     name: "meta-planner",
     enabled: true,
     async execute(context: HeartbeatContext): Promise<HeartbeatResult> {
       try {
-        // Build state summary from recent activity
-        const entries = await memory.query({
-          after: Date.now() - lookbackMs,
-          limit: 50,
-          order: "desc",
-        });
-
-        // Load recent learnings if available
-        let learnings = "";
-        try {
-          const recentLearning = await memory.get<{
-            patterns: Array<{ lesson: string }>;
-            strategies: Array<{ name: string; description: string }>;
-          }>("learning:latest");
-          if (recentLearning) {
-            const lessons = recentLearning.patterns
-              ?.map((p) => `- ${p.lesson}`)
-              .join("\n");
-            const strategies = recentLearning.strategies
-              ?.map((s) => `- ${s.name}: ${s.description}`)
-              .join("\n");
-            learnings = `\n\nRecent Learnings:\n${lessons}\n\nKnown Strategies:\n${strategies}`;
-          }
-        } catch {
-          // no learnings available
-        }
-
-        // Load existing active goals (meta-planner's own proposals)
-        let activeGoals = "";
-        try {
-          const goals = await memory.get<GeneratedGoal[]>(`${keyPrefix}active`);
-          if (goals && goals.length > 0) {
-            activeGoals =
-              "\n\nActive Goals:\n" +
-              goals
-                .map(
-                  (g) =>
-                    `- [${g.priority}] ${g.title} (${g.status}): ${g.description}`,
-                )
-                .join("\n");
-          }
-        } catch {
-          // no active goals
-        }
-
-        // Load GoalManager's execution queue to avoid re-proposing in-flight work
-        try {
-          const managedGoals = await memory.get<Array<{
-            title: string; description: string; priority: string;
-            status: string; source: string;
-          }>>("goal:managed-active");
-          if (managedGoals && managedGoals.length > 0) {
-            activeGoals +=
-              "\n\nManaged Goal Queue:\n" +
-              managedGoals
-                .map((g) => `- [${g.priority}/${g.status}] ${g.title}: ${g.description}`)
-                .join("\n");
-          }
-        } catch {
-          // no managed goals
-        }
-
-        const messages = entries.map(entryToMessage);
-        const activitySummary = messages
-          .slice(0, 30)
-          .map((m) => `[${m.role}]: ${m.content.slice(0, 200)}`)
-          .join("\n");
-
+        const now = Date.now();
+        const planningSnapshot = await strategicMemory.buildPlanningSnapshot();
         const prompt = META_PLANNING_PROMPT.replace("{MISSION}", agentMission);
-
-        const response = await llm.chat([
-          { role: "system", content: prompt },
-          {
-            role: "user",
-            content:
-              `Current state:\n` +
-              `- ${entries.length} interactions in the last ${Math.round(lookbackMs / 3600000)}h\n` +
-              `${activeGoals}${learnings}\n\n` +
-              `Recent Activity:\n${activitySummary}\n\n` +
-              `Generate up to ${maxGoals} new strategic goals.`,
-          },
-        ], config.traceProviderPayloads === true
-          ? {
-            trace: {
-              includeProviderPayloads: true,
-              onProviderTraceEvent: createProviderTraceEventLogger({
-                logger: context.logger,
-                traceLabel: "meta_planner.provider",
-                traceId: `meta-planner:${Date.now()}`,
-                staticFields: {
-                  phase: "planning",
-                  entryCount: entries.length,
-                },
-              }),
+        const response = await llm.chat(
+          [
+            { role: "system", content: prompt },
+            {
+              role: "user",
+              content:
+                `Current state:\n` +
+                `- strategic snapshot generated at ${new Date(now).toISOString()}\n\n` +
+                `${planningSnapshot.digest || "No durable strategic context recorded yet."}\n\n` +
+                `Generate up to ${maxGoals} new strategic goals.`,
             },
-          }
-          : undefined);
+          ],
+          config.traceProviderPayloads === true
+            ? {
+                trace: {
+                  includeProviderPayloads: true,
+                  onProviderTraceEvent: createProviderTraceEventLogger({
+                    logger: context.logger,
+                    traceLabel: "meta_planner.provider",
+                    traceId: `meta-planner:${Date.now()}`,
+                    staticFields: {
+                      phase: "planning",
+                      activeGoalCount: planningSnapshot.activeGoals.length,
+                      recentOutcomeCount: planningSnapshot.recentOutcomes.length,
+                    },
+                  }),
+                },
+              }
+            : undefined,
+        );
 
         if (!response.content) {
           return { hasOutput: false, quiet: true };
         }
 
-        // Parse goals
         let rawGoals: Array<{
           title: string;
           description: string;
@@ -229,11 +145,10 @@ export function createMetaPlannerAction(
           return { hasOutput: false, quiet: true };
         }
 
-        // Structure and store goals
         const goals: GeneratedGoal[] = rawGoals
           .slice(0, maxGoals)
-          .map((raw, i) => ({
-            id: `${Date.now()}-${i}`,
+          .map((raw, index) => ({
+            id: `${now}-${index}`,
             title: raw.title ?? "Untitled",
             description: raw.description ?? "",
             priority: (["critical", "high", "medium", "low"].includes(raw.priority)
@@ -246,53 +161,64 @@ export function createMetaPlannerAction(
                 ? raw.estimatedComplexity
                 : "moderate"
             ) as GeneratedGoal["estimatedComplexity"],
-            createdAt: Date.now(),
-            status: "proposed" as const,
+            createdAt: now,
+            status: "proposed",
           }));
 
         if (goals.length === 0) {
           return { hasOutput: false, quiet: true };
         }
 
-        // Store generated goals
-        await memory.set(`${keyPrefix}batch:${Date.now()}`, goals);
+        await memory.set(`${keyPrefix}batch:${now}`, goals);
 
-        // Merge into active goals list
-        try {
-          const existing =
-            (await memory.get<GeneratedGoal[]>(`${keyPrefix}active`)) ?? [];
-          const merged = [...existing, ...goals].slice(-20); // keep last 20
-          await memory.set(`${keyPrefix}active`, merged);
-        } catch {
-          await memory.set(`${keyPrefix}active`, goals);
+        const acceptedGoals: GeneratedGoal[] = [];
+        for (const goal of goals) {
+          const mutation = await strategicMemory.addGoal({
+            title: goal.title,
+            description: goal.description,
+            priority: goal.priority,
+            source: "meta-planner",
+            maxAttempts: 2,
+            rationale: goal.rationale,
+            suggestedActions: goal.suggestedActions,
+            estimatedComplexity: goal.estimatedComplexity,
+            status: "pending",
+          });
+          if (mutation.accepted || mutation.created) {
+            acceptedGoals.push(goal);
+          }
         }
 
-        // Store in memory thread for audit trail
+        if (acceptedGoals.length === 0) {
+          return { hasOutput: false, quiet: true };
+        }
+
+        await strategicMemory.syncLegacyMirrors();
+
         await memory.addEntry({
           sessionId: "meta-planner:goals",
           role: "assistant",
           content:
-            `[META-PLANNER] Generated ${goals.length} goal(s):\n` +
-            goals
+            `[META-PLANNER] Generated ${acceptedGoals.length} goal(s):\n` +
+            acceptedGoals
               .map(
-                (g) =>
-                  `- [${g.priority}] ${g.title}: ${g.description}\n  Rationale: ${g.rationale}`,
+                (goal) =>
+                  `- [${goal.priority}] ${goal.title}: ${goal.description}\n  Rationale: ${goal.rationale}`,
               )
               .join("\n"),
           metadata: {
             type: "meta-planner",
-            goalCount: goals.length,
-            timestamp: Date.now(),
+            goalCount: acceptedGoals.length,
+            timestamp: now,
           },
         });
 
-        const summary = goals
-          .map((g) => `[${g.priority}] ${g.title}`)
+        const summary = acceptedGoals
+          .map((goal) => `[${goal.priority}] ${goal.title}`)
           .join(", ");
-
         return {
           hasOutput: true,
-          output: `MetaPlanner: generated ${goals.length} goal(s): ${summary}`,
+          output: `MetaPlanner: generated ${acceptedGoals.length} goal(s): ${summary}`,
           quiet: false,
         };
       } catch (err) {

@@ -25,45 +25,43 @@ Complete all items before proceeding with mainnet deployment:
    ```bash
    ./scripts/check-deployment-readiness.sh --network mainnet
    ```
-2. Run LiteSVM integration suite:
+2. Run the default required runtime validation lane from the `agenc-core` root:
    ```bash
-   npm run test:fast
+   npm run validate:runtime
    ```
-3. Run runtime unit tests:
-   ```bash
-   cd runtime && npm run test
-   ```
-4. Run mutation regression gates:
-   ```bash
-   cd runtime && npm run mutation:ci && npm run mutation:gates
-   ```
-5. Run runtime pipeline quality suite + gates:
-   ```bash
-   cd runtime && npm run benchmark:pipeline:ci && npm run benchmark:pipeline:gates
-   ```
-6. Build verifiable program and record executable hash:
+3. Build verifiable program and record executable hash:
    ```bash
    anchor build --verifiable
    solana-verify get-executable-hash target/deploy/agenc_coordination.so
    ```
 
+**Runtime gates included in `npm run validate:runtime`**
+- Runtime unit/regression suite
+- Runtime mutation artifact + gate evaluation
+- Runtime pipeline quality artifact + gate evaluation
+- Runtime delegation quality artifact + gate evaluation
+- Runtime background-run quality artifact + gate evaluation
+- Runtime autonomy rollout gates
+
+**Optional deeper local checks**
+- LiteSVM integration suite:
+  ```bash
+  npm run test:fast
+  ```
+
 **Expected Output**
 ```
 # 1) readiness check exits 0 with PASS for all checks
-# 2) npm run test:fast: 160+ tests passing (~5s)
-# 3) runtime tests: ~1800+ tests passing
-# 4) mutation gates: exit code 0
-# 5) pipeline quality gates: PASS
-# 6) solana-verify prints an executable hash (record it)
+# 2) npm run validate:runtime: exit code 0
+# 3) solana-verify prints an executable hash (record it)
 ```
 
 **Troubleshooting**
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | readiness check fails | missing env/toolchain/config | follow the printed remediation and rerun |
+| `npm run validate:runtime` fails | runtime unit, mutation, quality, delegation, background-run, or rollout gate regression | inspect the failing lane summary, fix the underlying runtime regression, and rerun the wrapper lane from the `agenc-core` root |
 | `npm run test:fast` fails | regression in on-chain/LiteSVM flows | fix failing test before deploy |
-| mutation gate fails | behavior drift or insufficient coverage | investigate mutation report; fix or update gates intentionally |
-| pipeline quality gate fails | context growth/tool-turn/desktop/token-efficiency regression | inspect `runtime/benchmarks/artifacts/pipeline-quality.ci.json`, fix runtime pipeline, rerun gates |
 | `solana-verify` missing | solana-verify not installed | install solana-verify and rerun |
 
 ### Security Requirements

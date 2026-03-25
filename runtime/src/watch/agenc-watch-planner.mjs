@@ -126,6 +126,7 @@ export function createWatchPlannerController(dependencies = {}) {
         return true;
       case "planner_pipeline_finished":
       case "planner_path_finished": {
+        const completionState = sanitizeInlineText(payload?.completionState ?? "");
         const stopReason = sanitizeInlineText(
           payload?.stopReason ?? payload?.stopReasonHint ?? "",
         );
@@ -136,14 +137,34 @@ export function createWatchPlannerController(dependencies = {}) {
             payload?.reason ??
             "",
         );
+        const terminalPlannerStatus =
+          completionState === "completed"
+            ? "completed"
+            : completionState === "partial"
+              ? "partial"
+              : completionState === "needs_verification"
+                ? "needs_verification"
+                : completionState === "blocked"
+                  ? "blocked"
+                  : stopReason === "completed"
+                    ? "completed"
+                    : stopReason === "cancelled"
+                      ? "cancelled"
+                      : "failed";
         retirePlannerDagOpenNodes(
-          stopReason === "completed" || stopReason === "cancelled"
-            ? "cancelled"
-            : "failed",
+          terminalPlannerStatus,
           stopReasonDetail ||
-            (stopReason ? stopReason.replace(/_/g, " ") : "planner path finished"),
+            (
+              completionState
+                ? completionState.replace(/_/g, " ")
+                : stopReason
+                  ? stopReason.replace(/_/g, " ")
+                  : "planner path finished"
+            ),
         );
-        if (stopReason) {
+        if (completionState) {
+          watchState.plannerDagStatus = terminalPlannerStatus;
+        } else if (stopReason) {
           watchState.plannerDagStatus =
             stopReason === "completed"
               ? "completed"
@@ -151,17 +172,18 @@ export function createWatchPlannerController(dependencies = {}) {
                 ? "cancelled"
                 : "failed";
         }
-        const terminalStopReason = new Set([
-          "",
+        const terminalStopReason = new Set(["", "completed", "cancelled", "failed", "validation_error", "timeout"]);
+        const terminalCompletionState = new Set([
           "completed",
-          "cancelled",
-          "failed",
-          "validation_error",
-          "timeout",
+          "partial",
+          "blocked",
+          "needs_verification",
         ]);
         watchState.runPhase = null;
-        watchState.runState = terminalStopReason.has(stopReason) ? "idle" : stopReason;
-        if (terminalStopReason.has(stopReason)) {
+        watchState.runState =
+          completionState ||
+          (terminalStopReason.has(stopReason) ? "idle" : stopReason);
+        if (terminalCompletionState.has(completionState) || terminalStopReason.has(stopReason)) {
           watchState.activeRunStartedAtMs = null;
         }
         watchState.plannerDagNote = stopReasonDetail || watchState.plannerDagNote;

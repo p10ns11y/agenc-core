@@ -443,6 +443,14 @@ export interface CommandRegistryDaemonContext {
       Array<{ priority: string; status: string; title: string }>
     >;
   } | null;
+  startSlashInit(params: {
+    workspaceRoot: string;
+    force?: boolean;
+    sessionId: string;
+    senderId: string;
+    channel: string;
+    reply: (content: string) => Promise<void>;
+  }): Promise<{ filePath: string; started: boolean }>;
 }
 
 // ============================================================================
@@ -519,21 +527,19 @@ export function createDaemonCommandRegistry(
         return;
       }
 
-      const initPrompt =
-        `List the files in ${workspaceRoot}, read the important ones (package.json, README, Makefile, config files, etc), ` +
-        `then write ${filePath} with these sections: ` +
-        `"# Repository Guidelines", "## Project Structure & Module Organization", ` +
-        `"## Build, Test, and Development Commands", "## Coding Style & Naming Conventions", ` +
-        `"## Testing Guidelines", "## Commit & Pull Request Guidelines". ` +
-        `Base it on what you find. Do NOT build, compile, or run anything — just read and write the guide.`;
-
-      const webChat = ctx.getWebChatChannel();
-      if (!webChat) {
-        await cmdCtx.reply("Init unavailable: webchat pipeline is not initialized.");
+      const started = await ctx.startSlashInit({
+        workspaceRoot,
+        force,
+        sessionId: cmdCtx.sessionId,
+        senderId: cmdCtx.senderId,
+        channel: cmdCtx.channel,
+        reply: cmdCtx.reply,
+      });
+      if (!started.started) {
+        await cmdCtx.reply(`Init already running for ${started.filePath}.`);
         return;
       }
-      // Inject as a synthetic user message — bypasses planner since it's simple
-      webChat.injectSyntheticUserMessage(cmdCtx.sessionId, cmdCtx.senderId, initPrompt);
+      await cmdCtx.reply(`Starting /init for ${started.filePath}. I'll reply when it finishes.`);
     },
   });
   commandRegistry.register({

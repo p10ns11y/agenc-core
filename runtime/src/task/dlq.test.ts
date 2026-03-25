@@ -1,6 +1,10 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { Keypair } from "@solana/web3.js";
 import { DeadLetterQueue } from "./dlq.js";
+import { SqliteDeadLetterQueue } from "./sqlite-dlq.js";
 import { TaskExecutor } from "./executor.js";
 import type { TaskOperations } from "./operations.js";
 import type {
@@ -255,6 +259,34 @@ describe("DeadLetterQueue", () => {
       expect(all[0].error).toBe("e-5");
       expect(all[4].error).toBe("e-9");
     });
+  });
+});
+
+describe("SqliteDeadLetterQueue", () => {
+  let tempDir = "";
+  let dlq: SqliteDeadLetterQueue;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "agenc-task-dlq-"));
+    dlq = new SqliteDeadLetterQueue(join(tempDir, "task-dlq.sqlite"));
+  });
+
+  afterEach(async () => {
+    dlq.close();
+    if (tempDir) {
+      await rm(tempDir, { recursive: true, force: true });
+      tempDir = "";
+    }
+  });
+
+  it("persists entries across queue instances", () => {
+    dlq.add(createEntry({ taskPda: "persisted-task", error: "persisted" }));
+    dlq.close();
+
+    const reopened = new SqliteDeadLetterQueue(join(tempDir, "task-dlq.sqlite"));
+    expect(reopened.size()).toBe(1);
+    expect(reopened.getByTaskId("persisted-task")?.error).toBe("persisted");
+    reopened.close();
   });
 });
 
@@ -615,5 +647,29 @@ describe("TaskExecutor DLQ integration", () => {
 
     await executor.stop();
     await startPromise;
+  });
+
+  it("preserves DLQ entries across executor restarts with sqlite storage", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "agenc-task-dlq-restart-"));
+    const dbPath = join(tempDir, "task-dlq.sqlite");
+    const dlq1 = new SqliteDeadLetterQueue(dbPath);
+    dlq1.add(createEntry({ taskPda: "task-persist", error: "persist me" }));
+    dlq1.close();
+
+    const dlq2 = new SqliteDeadLetterQueue(dbPath);
+    const executor = new TaskExecutor(
+      createExecutorConfig({
+        mode: "batch",
+        deadLetterStore: dlq2,
+      }),
+    );
+
+    expect(executor.getDeadLetterQueue().size()).toBe(1);
+    expect(executor.getDeadLetterQueue().getByTaskId("task-persist")?.error).toBe(
+      "persist me",
+    );
+
+    dlq2.close();
+    await rm(tempDir, { recursive: true, force: true });
   });
 });

@@ -61,6 +61,7 @@ describe("pipeline-quality artifact", () => {
         delegatedCases: 16,
         usefulDelegations: 12,
         harmfulDelegations: 4,
+        unnecessaryDelegations: 4,
         plannerExecutionMismatches: 2,
         childTimeouts: 1,
         childFailures: 2,
@@ -89,6 +90,183 @@ describe("pipeline-quality artifact", () => {
           },
         ],
       },
+      orchestrationBaseline: {
+        scenarios: [
+          {
+            scenarioId: "wrong_workspace_root",
+            title: "Delegated child resolves PLAN.md against umbrella root",
+            category: "workspace_root",
+            sourceTraceId: "subagent:demo",
+            passed: true,
+            finalStatus: "failed",
+            replayErrors: 0,
+            replayWarnings: 0,
+            policyViolations: 1,
+            verifierVerdicts: 0,
+            turns: 1,
+            toolCalls: 1,
+            fallbackCount: 0,
+            spuriousSubagentCount: 1,
+            approvalCount: 0,
+            restartRecoverySuccess: false,
+          },
+        ],
+      },
+      liveCoding: {
+        scenarioCount: 1,
+        passingScenarios: 1,
+        passRate: 1,
+        tempRepoCount: 1,
+        totalFileMutations: 2,
+        totalShellMutations: 0,
+        wrongRootIncidents: 0,
+        unauthorizedWriteBlocks: 0,
+        effectLedgerCompletenessRate: 1,
+        scenarios: [
+          {
+            scenarioId: "workspace_scaffold_js_module",
+            title: "Scaffold temp repo",
+            passed: true,
+            tempRepoPath: "/tmp/agenc-live-1",
+            fileMutationCount: 2,
+            shellMutationCount: 0,
+            wrongRootIncident: false,
+            unauthorizedWriteBlocked: false,
+            effectLedgerComplete: true,
+            exitCode: 0,
+          },
+        ],
+      },
+      safety: {
+        scenarioCount: 1,
+        blockedScenarios: 1,
+        passingScenarios: 1,
+        passRate: 1,
+        promptInjectionBlocks: 1,
+        maliciousRepoFileBlocks: 0,
+        unsafeShellBlocks: 0,
+        unauthorizedArtifactWriteBlocks: 0,
+        unsafeMutationAttempts: 1,
+        approvalCorrectnessRate: 1,
+        scenarios: [
+          {
+            scenarioId: "prompt-injection",
+            title: "Prompt injection blocked",
+            attackClass: "prompt_injection",
+            passed: true,
+            blocked: true,
+            requiredApproval: true,
+            denied: false,
+            unsafeMutationAttempt: true,
+            approvalCorrect: true,
+          },
+        ],
+      },
+      longHorizon: {
+        scenarioCount: 1,
+        passingScenarios: 1,
+        passRate: 1,
+        hundredStepRuns: 1,
+        crashResumeRuns: 0,
+        compactContinueRuns: 0,
+        backgroundPersistenceRuns: 0,
+        restartRecoverySuccessRate: 1,
+        compactionContinuationRate: 1,
+        backgroundPersistenceRate: 0,
+        scenarios: [
+          {
+            scenarioId: "hundred-step",
+            title: "Hundred step",
+            category: "hundred_step",
+            passed: true,
+            stepCount: 120,
+            resumed: true,
+            compacted: true,
+            persisted: true,
+            restartRecoverySuccess: true,
+          },
+        ],
+      },
+      implementationGates: {
+        scenarioCount: 1,
+        mandatoryScenarioCount: 1,
+        advisoryScenarioCount: 0,
+        passingScenarios: 1,
+        passRate: 1,
+        mandatoryPassingScenarios: 1,
+        mandatoryPassRate: 1,
+        falseCompletedScenarios: 0,
+        scenarios: [
+          {
+            scenarioId: "deterministic_impl_behavior_gap",
+            title: "Deterministic implementation stays non-complete",
+            category: "deterministic_false_completion",
+            mandatory: true,
+            executionMode: "temp_repo",
+            passed: true,
+            falseCompleted: false,
+            observedOutcome: "partial",
+            expectedOutcome: "partial",
+          },
+        ],
+      },
+      delegatedWorkspaceGates: {
+        scenarioCount: 2,
+        mandatoryScenarioCount: 2,
+        advisoryScenarioCount: 0,
+        passingScenarios: 2,
+        passRate: 1,
+        mandatoryPassingScenarios: 2,
+        mandatoryPassRate: 1,
+        falseCompletedScenarios: 0,
+        scenarios: [
+          {
+            scenarioId: "canonical_scope_no_split_root_invariant",
+            title: "Canonical delegated scope removes split-root ambiguity",
+            category: "split_root_invariant",
+            mandatory: true,
+            executionMode: "runtime",
+            passed: true,
+            falseCompleted: false,
+            observedOutcome: "canonical_host_root",
+            expectedOutcome: "canonical_host_root",
+          },
+          {
+            scenarioId: "fixture-delegated-workspace",
+            title: "Fixture delegated workspace",
+            category: "alias_migration_consistency",
+            mandatory: true,
+            executionMode: "runtime",
+            passed: true,
+            falseCompleted: false,
+            observedOutcome: "canonicalized_once",
+            expectedOutcome: "canonicalized_once",
+          },
+        ],
+      },
+      chaos: {
+        scenarioCount: 1,
+        passingScenarios: 1,
+        passRate: 1,
+        providerTimeoutRecoveryRate: 1,
+        toolTimeoutContainmentRate: 1,
+        persistenceSafeModeRate: 1,
+        approvalStoreSafeModeRate: 1,
+        childRunCrashContainmentRate: 1,
+        daemonRestartRecoveryRate: 1,
+        scenarios: [
+          {
+            scenarioId: "fixture-chaos",
+            title: "Provider timeout recovered",
+            category: "provider_timeout",
+            passed: true,
+            runtimeMode: "degraded",
+            incidentCodes: ["provider_timeout"],
+            resumed: true,
+            safeModeEngaged: false,
+          },
+        ],
+      },
     });
 
     expect(artifact.schemaVersion).toBe(
@@ -113,6 +291,17 @@ describe("pipeline-quality artifact", () => {
     expect(artifact.delegation.childTimeoutRate).toBeCloseTo(0.0625, 8);
     expect(artifact.delegation.passAtKDeltaVsBaseline).toBeCloseTo(0.1, 8);
     expect(artifact.delegation.scenarioSummaries).toHaveLength(1);
+    expect(artifact.orchestrationBaseline.scenarioCount).toBe(1);
+    expect(artifact.orchestrationBaseline.passRate).toBe(1);
+    expect(artifact.orchestrationBaseline.averageTurns).toBe(1);
+    expect(artifact.orchestrationBaseline.spuriousSubagentCount).toBe(1);
+    expect(artifact.liveCoding.passRate).toBe(1);
+    expect(artifact.liveCoding.effectLedgerCompletenessRate).toBe(1);
+    expect(artifact.safety.passRate).toBe(1);
+    expect(artifact.longHorizon.passRate).toBe(1);
+    expect(artifact.implementationGates.mandatoryPassRate).toBe(1);
+    expect(artifact.delegatedWorkspaceGates.mandatoryPassRate).toBe(1);
+    expect(artifact.chaos.passRate).toBe(1);
   });
 
   it("round-trips parse + serialization deterministically", () => {
@@ -153,6 +342,7 @@ describe("pipeline-quality artifact", () => {
         delegatedCases: 2,
         usefulDelegations: 2,
         harmfulDelegations: 0,
+        unnecessaryDelegations: 0,
         plannerExecutionMismatches: 0,
         childTimeouts: 0,
         childFailures: 0,
@@ -181,6 +371,126 @@ describe("pipeline-quality artifact", () => {
           },
         ],
       },
+      orchestrationBaseline: {
+        scenarios: [
+          {
+            scenarioId: "allowlist_access_denied",
+            title: "Delegated read blocked by stale allowed-directory scope",
+            category: "allowlist",
+            sourceTraceId: "subagent:allowlist",
+            passed: true,
+            finalStatus: "failed",
+            replayErrors: 0,
+            replayWarnings: 0,
+            policyViolations: 1,
+            verifierVerdicts: 0,
+            turns: 1,
+            toolCalls: 1,
+            fallbackCount: 0,
+            spuriousSubagentCount: 1,
+            approvalCount: 0,
+            restartRecoverySuccess: false,
+          },
+        ],
+      },
+      liveCoding: {
+        scenarioCount: 1,
+        passingScenarios: 1,
+        passRate: 1,
+        tempRepoCount: 1,
+        totalFileMutations: 1,
+        totalShellMutations: 0,
+        wrongRootIncidents: 0,
+        unauthorizedWriteBlocks: 0,
+        effectLedgerCompletenessRate: 1,
+        scenarios: [
+          {
+            scenarioId: "fixture-live",
+            title: "Fixture live",
+            passed: true,
+            tempRepoPath: "/tmp/live",
+            fileMutationCount: 1,
+            shellMutationCount: 0,
+            wrongRootIncident: false,
+            unauthorizedWriteBlocked: false,
+            effectLedgerComplete: true,
+            exitCode: 0,
+          },
+        ],
+      },
+      safety: {
+        scenarioCount: 1,
+        blockedScenarios: 1,
+        passingScenarios: 1,
+        passRate: 1,
+        promptInjectionBlocks: 0,
+        maliciousRepoFileBlocks: 0,
+        unsafeShellBlocks: 1,
+        unauthorizedArtifactWriteBlocks: 0,
+        unsafeMutationAttempts: 1,
+        approvalCorrectnessRate: 1,
+        scenarios: [
+          {
+            scenarioId: "fixture-safety",
+            title: "Fixture safety",
+            attackClass: "unsafe_shell",
+            passed: true,
+            blocked: true,
+            requiredApproval: false,
+            denied: true,
+            unsafeMutationAttempt: true,
+            approvalCorrect: true,
+          },
+        ],
+      },
+      longHorizon: {
+        scenarioCount: 1,
+        passingScenarios: 1,
+        passRate: 1,
+        hundredStepRuns: 0,
+        crashResumeRuns: 1,
+        compactContinueRuns: 0,
+        backgroundPersistenceRuns: 0,
+        restartRecoverySuccessRate: 1,
+        compactionContinuationRate: 0,
+        backgroundPersistenceRate: 0,
+        scenarios: [
+          {
+            scenarioId: "fixture-long",
+            title: "Fixture long",
+            category: "crash_resume",
+            passed: true,
+            stepCount: 14,
+            resumed: true,
+            compacted: false,
+            persisted: true,
+            restartRecoverySuccess: true,
+          },
+        ],
+      },
+      chaos: {
+        scenarioCount: 1,
+        passingScenarios: 1,
+        passRate: 1,
+        providerTimeoutRecoveryRate: 1,
+        toolTimeoutContainmentRate: 1,
+        persistenceSafeModeRate: 0,
+        approvalStoreSafeModeRate: 0,
+        childRunCrashContainmentRate: 0,
+        daemonRestartRecoveryRate: 0,
+        scenarios: [
+          {
+            scenarioId: "fixture-chaos",
+            title: "Fixture chaos",
+            category: "provider_timeout",
+            passed: true,
+            runtimeMode: "degraded",
+            incidentCodes: ["provider_timeout"],
+            resumed: true,
+            safeModeEngaged: false,
+          },
+        ],
+      },
     });
 
     const parsed = parsePipelineQualityArtifact(
@@ -193,7 +503,7 @@ describe("pipeline-quality artifact", () => {
     );
   });
 
-  it("migrates schema v1 artifacts by defaulting delegation metrics", () => {
+  it("migrates schema v1 artifacts by defaulting delegation and orchestration metrics", () => {
     const parsed = parsePipelineQualityArtifact({
       schemaVersion: 1,
       runId: "legacy-v1",
@@ -226,6 +536,172 @@ describe("pipeline-quality artifact", () => {
     expect(parsed.delegation.totalCases).toBe(0);
     expect(parsed.delegation.delegationAttemptRate).toBe(0);
     expect(parsed.delegation.passAtKDeltaVsBaseline).toBe(0);
+    expect(parsed.orchestrationBaseline.scenarioCount).toBe(0);
+    expect(parsed.orchestrationBaseline.passRate).toBe(0);
+    expect(parsed.liveCoding.scenarioCount).toBe(0);
+    expect(parsed.safety.scenarioCount).toBe(0);
+    expect(parsed.longHorizon.scenarioCount).toBe(0);
+    expect(parsed.implementationGates.scenarioCount).toBe(0);
+    expect(parsed.delegatedWorkspaceGates.scenarioCount).toBe(0);
+    expect(parsed.chaos.scenarioCount).toBe(0);
+  });
+
+  it("migrates schema v2 artifacts by defaulting orchestration baseline", () => {
+    const parsed = parsePipelineQualityArtifact({
+      schemaVersion: 2,
+      runId: "legacy-v2",
+      generatedAtMs: 1700000000100,
+      contextGrowth: {
+        promptTokenSeries: [12, 18],
+      },
+      toolTurn: {
+        validCases: 1,
+        validAccepted: 1,
+        malformedCases: 1,
+        malformedRejected: 1,
+        malformedForwarded: 0,
+      },
+      desktopStability: {
+        runSummaries: [],
+      },
+      tokenEfficiency: {
+        completedTasks: 1,
+        totalPromptTokens: 10,
+        totalCompletionTokens: 5,
+        totalTokens: 15,
+      },
+      offlineReplay: {
+        fixtures: [],
+      },
+      delegation: {
+        totalCases: 0,
+        delegatedCases: 0,
+        usefulDelegations: 0,
+        harmfulDelegations: 0,
+        unnecessaryDelegations: 0,
+        plannerExecutionMismatches: 0,
+        childTimeouts: 0,
+        childFailures: 0,
+        synthesisConflicts: 0,
+        depthCapHits: 0,
+        fanoutCapHits: 0,
+        costDeltaVsBaseline: 0,
+        latencyDeltaVsBaseline: 0,
+        qualityDeltaVsBaseline: 0,
+        passAtKDeltaVsBaseline: 0,
+        passCaretKDeltaVsBaseline: 0,
+        baselineScenarioId: "baseline_no_delegation",
+        k: 1,
+        scenarioSummaries: [],
+      },
+    });
+
+    expect(parsed.schemaVersion).toBe(PIPELINE_QUALITY_ARTIFACT_SCHEMA_VERSION);
+    expect(parsed.orchestrationBaseline.scenarioCount).toBe(0);
+    expect(parsed.liveCoding.scenarioCount).toBe(0);
+    expect(parsed.safety.scenarioCount).toBe(0);
+    expect(parsed.longHorizon.scenarioCount).toBe(0);
+    expect(parsed.implementationGates.scenarioCount).toBe(0);
+    expect(parsed.delegatedWorkspaceGates.scenarioCount).toBe(0);
+    expect(parsed.chaos.scenarioCount).toBe(0);
+  });
+
+  it("migrates schema v4 artifacts by defaulting chaos metrics", () => {
+    const parsed = parsePipelineQualityArtifact({
+      schemaVersion: 4,
+      runId: "legacy-v4",
+      generatedAtMs: 1700000000100,
+      contextGrowth: {
+        promptTokenSeries: [12, 18],
+      },
+      toolTurn: {
+        validCases: 1,
+        validAccepted: 1,
+        malformedCases: 1,
+        malformedRejected: 1,
+        malformedForwarded: 0,
+      },
+      desktopStability: {
+        runSummaries: [],
+      },
+      tokenEfficiency: {
+        completedTasks: 1,
+        totalPromptTokens: 10,
+        totalCompletionTokens: 5,
+        totalTokens: 15,
+      },
+      offlineReplay: {
+        fixtures: [],
+      },
+      delegation: {
+        totalCases: 0,
+        delegatedCases: 0,
+        usefulDelegations: 0,
+        harmfulDelegations: 0,
+        unnecessaryDelegations: 0,
+        plannerExecutionMismatches: 0,
+        childTimeouts: 0,
+        childFailures: 0,
+        synthesisConflicts: 0,
+        depthCapHits: 0,
+        fanoutCapHits: 0,
+        costDeltaVsBaseline: 0,
+        latencyDeltaVsBaseline: 0,
+        qualityDeltaVsBaseline: 0,
+        passAtKDeltaVsBaseline: 0,
+        passCaretKDeltaVsBaseline: 0,
+        baselineScenarioId: "baseline_no_delegation",
+        k: 1,
+        scenarioSummaries: [],
+      },
+      orchestrationBaseline: {
+        scenarios: [],
+      },
+      liveCoding: {
+        scenarioCount: 0,
+        passingScenarios: 0,
+        passRate: 0,
+        tempRepoCount: 0,
+        totalFileMutations: 0,
+        totalShellMutations: 0,
+        wrongRootIncidents: 0,
+        unauthorizedWriteBlocks: 0,
+        effectLedgerCompletenessRate: 0,
+        scenarios: [],
+      },
+      safety: {
+        scenarioCount: 0,
+        blockedScenarios: 0,
+        passingScenarios: 0,
+        passRate: 0,
+        promptInjectionBlocks: 0,
+        maliciousRepoFileBlocks: 0,
+        unsafeShellBlocks: 0,
+        unauthorizedArtifactWriteBlocks: 0,
+        unsafeMutationAttempts: 0,
+        approvalCorrectnessRate: 0,
+        scenarios: [],
+      },
+      longHorizon: {
+        scenarioCount: 0,
+        passingScenarios: 0,
+        passRate: 0,
+        hundredStepRuns: 0,
+        crashResumeRuns: 0,
+        compactContinueRuns: 0,
+        backgroundPersistenceRuns: 0,
+        restartRecoverySuccessRate: 0,
+        compactionContinuationRate: 0,
+        backgroundPersistenceRate: 0,
+        scenarios: [],
+      },
+    });
+
+    expect(parsed.schemaVersion).toBe(PIPELINE_QUALITY_ARTIFACT_SCHEMA_VERSION);
+    expect(parsed.implementationGates.scenarioCount).toBe(0);
+    expect(parsed.delegatedWorkspaceGates.scenarioCount).toBe(0);
+    expect(parsed.chaos.scenarioCount).toBe(0);
+    expect(parsed.chaos.passRate).toBe(0);
   });
 
   it("rejects unsupported schema versions", () => {

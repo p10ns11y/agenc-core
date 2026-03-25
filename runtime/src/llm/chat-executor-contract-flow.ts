@@ -13,7 +13,9 @@ import {
   getMissingSuccessfulToolEvidenceMessage,
   specRequiresFileMutationEvidence,
   specRequiresMeaningfulBrowserEvidence,
+  validateDelegatedOutputContract,
 } from "../utils/delegation-validation.js";
+import { validateRuntimeVerificationContract } from "../workflow/index.js";
 import { buildBrowserEvidenceRetryGuidance } from "../utils/browser-tool-taxonomy.js";
 import type { ExecutionContext, ToolCallRecord } from "./chat-executor-types.js";
 import type { LLMProviderEvidence } from "./types.js";
@@ -26,6 +28,8 @@ import {
   getAllowedToolNamesForContractGuidance,
   getAllowedToolNamesForEvidence,
 } from "./chat-executor-routing-state.js";
+import { didToolCallFail } from "./chat-executor-tool-utils.js";
+import { requestRequiresToolGroundedExecution } from "./chat-executor-planner.js";
 
 type ToolNameCollection = Iterable<string> | readonly string[];
 
@@ -39,7 +43,53 @@ type ContractFlowContext = Pick<
   | "requiredToolEvidence"
   | "providerEvidence"
   | "response"
+  | "plannerSummaryState"
 >;
+
+export type LegacyCompletionCompatibilityClass =
+  | "docs"
+  | "research"
+  | "plan_only"
+  | "implementation";
+
+export interface LegacyCompletionCompatibilityDecision {
+  readonly allowed: boolean;
+  readonly compatibilityClass: LegacyCompletionCompatibilityClass;
+  readonly reason: string;
+}
+
+const DIRECT_MUTATION_TOOL_NAMES = new Set([
+  "desktop.text_editor",
+  "system.appendFile",
+  "system.delete",
+  "system.mkdir",
+  "system.move",
+  "system.writeFile",
+]);
+const BROWSER_TOOL_PREFIX = "mcp.browser.";
+const RESEARCH_TOOL_NAMES = new Set(["web_search"]);
+const DOC_ONLY_PATH_RE = /\.(?:md|mdx|txt|rst|adoc)$/i;
+const DOC_BASENAME_RE =
+  /(?:^|\/)(?:README|CHANGELOG|CONTRIBUTING|LICENSE|COPYING|NOTES|AGENTS|AGENC)(?:\.[^/]+)?$/i;
+const SOURCE_LIKE_PATH_RE =
+  /(?:^|\/)(?:src|lib|app|server|client|cmd|pkg|include|internal|tests?|spec)(?:\/|$)|\.(?:c|cc|cpp|cxx|h|hpp|m|mm|rs|go|py|rb|php|java|kt|swift|cs|js|jsx|ts|tsx|json|toml|yaml|yml|xml|sh|zsh|bash)$/i;
+const BUILD_OR_BEHAVIOR_COMMAND_RE =
+  /\b(?:build|compile|typecheck|lint|test|tests|testing|vitest|jest|pytest|playwright|ctest|cargo test|go test|smoke|scenario|e2e|end-to-end)\b/i;
+const LIKELY_IMPLEMENTATION_REQUEST_RE =
+  /\b(?:implement|implementation|fix|repair|refactor|build|compile|typecheck|lint|test|write|edit|update|create)\b/i;
+
+interface EncodedEffectTarget {
+  readonly path?: string;
+}
+
+interface EncodedEffectMetadata {
+  readonly targets?: readonly EncodedEffectTarget[];
+}
+
+interface EncodedVerificationMetadata {
+  readonly category?: "build" | "behavior" | "review";
+  readonly command?: string;
+}
 
 export function resolveExecutionToolContractGuidance(input: {
   readonly ctx: ContractFlowContext;
@@ -64,6 +114,108 @@ export function resolveExecutionToolContractGuidance(input: {
   });
 }
 
+export function resolveLegacyCompletionCompatibility(input: {
+  readonly ctx: ContractFlowContext;
+}): LegacyCompletionCompatibilityDecision {
+  const successfulToolCalls = input.ctx.allToolCalls.filter(
+    (toolCall) => !didToolCallFail(toolCall.isError, toolCall.result),
+  );
+  const plannerRouteReason = input.ctx.plannerSummaryState.routeReason;
+  if (
+    plannerRouteReason === "exact_response_turn" ||
+    plannerRouteReason === "dialogue_memory_turn"
+  ) {
+    return {
+      allowed: true,
+      compatibilityClass: "plan_only",
+      reason:
+        "Legacy completion remains allowed for exact-response and dialogue-memory turns.",
+    };
+  }
+
+  const mutatedArtifacts = collectLegacyMutatedArtifacts(successfulToolCalls);
+  const hasMutationProgress = mutatedArtifacts.length > 0;
+  const hasResearchEvidence =
+    (input.ctx.providerEvidence?.citations?.length ?? 0) > 0 ||
+    successfulToolCalls.some((toolCall) =>
+      toolCall.name.startsWith(BROWSER_TOOL_PREFIX) ||
+      RESEARCH_TOOL_NAMES.has(toolCall.name),
+    );
+  const hasBuildOrBehaviorEvidence = successfulToolCalls.some((toolCall) => {
+    const verification = parseEncodedVerificationMetadata(toolCall.result);
+    if (
+      verification?.category === "build" ||
+      verification?.category === "behavior"
+    ) {
+      return true;
+    }
+    const command =
+      verification?.command ??
+      resolveCommandText(toolCall);
+    return BUILD_OR_BEHAVIOR_COMMAND_RE.test(command);
+  });
+  const mutatesSourceLikeArtifacts = mutatedArtifacts.some((artifact) =>
+    SOURCE_LIKE_PATH_RE.test(artifact),
+  );
+  const likelyImplementationRequest =
+    LIKELY_IMPLEMENTATION_REQUEST_RE.test(input.ctx.messageText) &&
+    requestRequiresToolGroundedExecution(input.ctx.messageText);
+  const implementationLikeTurn =
+    mutatesSourceLikeArtifacts ||
+    hasBuildOrBehaviorEvidence ||
+    (successfulToolCalls.length === 0 && likelyImplementationRequest);
+
+  if (
+    hasMutationProgress &&
+    mutatedArtifacts.every((artifact) => isDocOnlyArtifactPath(artifact))
+  ) {
+    return {
+      allowed: true,
+      compatibilityClass: "docs",
+      reason:
+        "Legacy completion remains allowed for documentation-only artifact updates.",
+    };
+  }
+
+  if (!hasMutationProgress && hasResearchEvidence && !hasBuildOrBehaviorEvidence) {
+    return {
+      allowed: true,
+      compatibilityClass: "research",
+      reason:
+        "Legacy completion remains allowed for grounded research-only turns without implementation mutations.",
+    };
+  }
+
+  if (
+    !hasMutationProgress &&
+    !requestRequiresToolGroundedExecution(input.ctx.messageText)
+  ) {
+    return {
+      allowed: true,
+      compatibilityClass: "plan_only",
+      reason:
+        "Legacy completion remains allowed for non-execution turns that do not request environment changes.",
+    };
+  }
+
+  if (!implementationLikeTurn) {
+    return {
+      allowed: true,
+      compatibilityClass: "plan_only",
+      reason:
+        "Legacy completion remains allowed for non-implementation turns outside the implementation verifier scope.",
+    };
+  }
+
+  return {
+    allowed: false,
+    compatibilityClass: "implementation",
+    reason:
+      "Implementation-class completion now requires the workflow verification contract. " +
+      "Only docs, research, and plan-only turns may use the legacy completion path.",
+  };
+}
+
 export function validateRequiredToolEvidence(input: {
   readonly ctx: ContractFlowContext;
 }): {
@@ -74,13 +226,30 @@ export function validateRequiredToolEvidence(input: {
   if (!requiredToolEvidence) {
     return {};
   }
-
-  // Delegation output contract validation disabled — it scans tool result
-  // content (file reads, command output) for words like "placeholder", "stub",
-  // etc. and rejects successful completions when those words appear in existing
-  // source code. The model's own response should be trusted.
+  const workflowVerificationContract = resolveWorkflowVerificationContract(
+    requiredToolEvidence,
+  );
   const contractValidation: DelegationOutputValidationResult | undefined =
-    undefined;
+    typeof input.ctx.response?.content === "string"
+      ? requiredToolEvidence.delegationSpec
+        ? validateDelegatedOutputContract({
+          spec: requiredToolEvidence.delegationSpec,
+          output: input.ctx.response.content,
+          toolCalls: input.ctx.allToolCalls,
+          providerEvidence: input.ctx.providerEvidence,
+          unsafeBenchmarkMode: requiredToolEvidence.unsafeBenchmarkMode,
+        })
+        : workflowVerificationContract
+          ? workflowDecisionToValidationResult(
+            validateRuntimeVerificationContract({
+              verificationContract: workflowVerificationContract,
+              output: input.ctx.response.content,
+              toolCalls: input.ctx.allToolCalls,
+              providerEvidence: input.ctx.providerEvidence,
+            }),
+          )
+          : undefined
+      : undefined;
   const missingEvidenceMessage = getMissingSuccessfulToolEvidenceMessage(
     input.ctx.allToolCalls,
     requiredToolEvidence.delegationSpec,
@@ -88,7 +257,38 @@ export function validateRequiredToolEvidence(input: {
   );
   return {
     contractValidation,
-    missingEvidenceMessage: missingEvidenceMessage ?? undefined,
+    missingEvidenceMessage:
+      contractValidation?.error ?? missingEvidenceMessage ?? undefined,
+  };
+}
+
+function resolveWorkflowVerificationContract(
+  requiredToolEvidence: NonNullable<ContractFlowContext["requiredToolEvidence"]>,
+) {
+  if (
+    !requiredToolEvidence.verificationContract &&
+    !requiredToolEvidence.completionContract
+  ) {
+    return undefined;
+  }
+  return {
+    ...(requiredToolEvidence.verificationContract ?? {}),
+    ...(requiredToolEvidence.completionContract
+      ? { completionContract: requiredToolEvidence.completionContract }
+      : {}),
+  };
+}
+
+function workflowDecisionToValidationResult(
+  decision: ReturnType<typeof validateRuntimeVerificationContract>,
+): DelegationOutputValidationResult | undefined {
+  if (!decision?.diagnostic) {
+    return undefined;
+  }
+  return {
+    ok: false,
+    code: decision.diagnostic.code,
+    error: decision.diagnostic.message,
   };
 }
 
@@ -154,6 +354,28 @@ export function buildRequiredToolEvidenceRetryInstruction(input: {
       "Create or edit the required files with the allowed file-mutation tools before answering, and name those files in the final output.",
     );
   }
+  if (input.validationCode === "missing_behavior_harness") {
+    correctionLines.push(
+      "Behavior verification is required for this task, and no runnable behavior harness was executed.",
+    );
+    correctionLines.push(
+      "First prefer existing repo-local test, smoke, scenario, or validation commands before inventing a new harness.",
+    );
+    correctionLines.push(
+      "If you add a new test or scenario harness, run it before the implementation to capture failure and again after the change when feasible.",
+    );
+    correctionLines.push(
+      "If no runnable harness exists in this environment, do not claim completion; report that behavior verification still needs to run.",
+    );
+  }
+  if (input.validationCode === "missing_required_source_evidence") {
+    correctionLines.push(
+      "Inspect the named source files from the delegated input contract or context requirements before writing again.",
+    );
+    correctionLines.push(
+      "If those sources describe intended or planned structure, keep that distinction explicit instead of presenting planned files as already present.",
+    );
+  }
   if (input.validationCode === "forbidden_phase_action") {
     correctionLines.push(
       "This phase explicitly forbids one or more actions such as install/build/test/typecheck/lint execution or banned dependency specifiers. Do not repeat them.",
@@ -187,6 +409,119 @@ export function buildRequiredToolEvidenceRetryInstruction(input: {
     correctionLines.join(" ") +
     allowedToolSummary
   );
+}
+
+function collectLegacyMutatedArtifacts(
+  toolCalls: ExecutionContext["allToolCalls"],
+): readonly string[] {
+  const artifacts = new Set<string>();
+  for (const toolCall of toolCalls) {
+    const normalizedName = toolCall.name.trim();
+    if (DIRECT_MUTATION_TOOL_NAMES.has(normalizedName)) {
+      for (const path of extractDirectMutationPaths(toolCall)) {
+        artifacts.add(path);
+      }
+    }
+    if (normalizedName === "system.bash" || normalizedName === "desktop.bash") {
+      const effect = parseEncodedEffectMetadata(toolCall.result);
+      for (const target of effect?.targets ?? []) {
+        if (typeof target.path === "string" && target.path.trim().length > 0) {
+          artifacts.add(target.path.trim());
+        }
+      }
+    }
+  }
+  return [...artifacts];
+}
+
+function extractDirectMutationPaths(
+  toolCall: ExecutionContext["allToolCalls"][number],
+): readonly string[] {
+  if (!toolCall.args || typeof toolCall.args !== "object" || Array.isArray(toolCall.args)) {
+    return [];
+  }
+  const args = toolCall.args as Record<string, unknown>;
+  switch (toolCall.name.trim()) {
+    case "desktop.text_editor":
+    case "system.appendFile":
+    case "system.delete":
+    case "system.mkdir":
+    case "system.writeFile":
+      return normalizeStringPaths(args.path);
+    case "system.move":
+      return [
+        ...normalizeStringPaths(args.source),
+        ...normalizeStringPaths(args.destination),
+      ];
+    default:
+      return [];
+  }
+}
+
+function normalizeStringPaths(value: unknown): readonly string[] {
+  if (typeof value === "string" && value.trim().length > 0) {
+    return [value.trim()];
+  }
+  if (Array.isArray(value)) {
+    return value
+      .filter((entry): entry is string => typeof entry === "string")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+  }
+  return [];
+}
+
+function isDocOnlyArtifactPath(value: string): boolean {
+  return DOC_ONLY_PATH_RE.test(value) || DOC_BASENAME_RE.test(value);
+}
+
+function parseEncodedEffectMetadata(
+  result: string | undefined,
+): EncodedEffectMetadata | undefined {
+  const parsed = parseResultObject(result);
+  const raw = parsed?.__agencEffect;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+  return raw as EncodedEffectMetadata;
+}
+
+function parseEncodedVerificationMetadata(
+  result: string | undefined,
+): EncodedVerificationMetadata | undefined {
+  const parsed = parseResultObject(result);
+  const raw = parsed?.__agencVerification;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+  return raw as EncodedVerificationMetadata;
+}
+
+function parseResultObject(
+  result: string | undefined,
+): Record<string, unknown> | undefined {
+  if (typeof result !== "string") {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(result) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return undefined;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveCommandText(
+  toolCall: ExecutionContext["allToolCalls"][number],
+): string {
+  if (!toolCall.args || typeof toolCall.args !== "object" || Array.isArray(toolCall.args)) {
+    return "";
+  }
+  const command = (toolCall.args as Record<string, unknown>).command;
+  return typeof command === "string" ? command : "";
 }
 
 export function canRetryDelegatedOutputWithoutAdditionalToolCalls(input: {

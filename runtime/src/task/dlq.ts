@@ -8,7 +8,11 @@
  * @module
  */
 
-import type { DeadLetterEntry, DeadLetterQueueConfig } from "./types.js";
+import type {
+  DeadLetterEntry,
+  DeadLetterQueueConfig,
+  DeadLetterQueueStore,
+} from "./types.js";
 
 // ============================================================================
 // Defaults
@@ -43,7 +47,7 @@ const DEFAULT_DLQ_CONFIG: DeadLetterQueueConfig = {
  * const entries = dlq.getAll();
  * ```
  */
-export class DeadLetterQueue {
+export class DeadLetterQueue implements DeadLetterQueueStore {
   private readonly maxSize: number;
   private readonly entries: DeadLetterEntry[] = [];
 

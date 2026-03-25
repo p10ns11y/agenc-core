@@ -543,6 +543,12 @@ export interface GatewayPolicyConfig {
 export interface GatewayApprovalConfig {
   /** Opt-in approval engine for gated tool calls. */
   enabled?: boolean;
+  /** Approval operating mode. */
+  mode?:
+    | "safe_local_dev"
+    | "trusted_operator"
+    | "unattended_background"
+    | "benchmark";
   /** Require approval for desktop click/type/scroll automation tools. */
   gateDesktopAutomation?: boolean;
   timeoutMs?: number;
@@ -716,6 +722,34 @@ export interface GatewayBackgroundRunAlert {
   readonly runId?: string;
 }
 
+export type GatewayRuntimeMode = "healthy" | "degraded" | "safe_mode";
+
+export interface GatewayBackgroundRunDependencyStatus {
+  readonly domain:
+    | "provider"
+    | "tool"
+    | "persistence"
+    | "approval_store"
+    | "child_run"
+    | "daemon";
+  readonly mode: "degraded" | "safe_mode";
+  readonly since: number;
+  readonly code: string;
+  readonly message: string;
+  readonly incidentId: string;
+  readonly count: number;
+  readonly sessionId?: string;
+  readonly runId?: string;
+}
+
+export interface GatewayBackgroundRunSloStatus {
+  readonly runCompletionRate?: number;
+  readonly checkpointResumeSuccessRate?: number;
+  readonly approvalResponseLatencyMs?: number;
+  readonly effectLedgerCompletenessRate?: number;
+  readonly safetyRegressionRate?: number;
+}
+
 export interface GatewayBackgroundRunMetrics {
   readonly startedTotal: number;
   readonly completedTotal: number;
@@ -742,6 +776,8 @@ export interface GatewayBackgroundRunStatus {
   readonly multiAgentEnabled: boolean;
   readonly activeTotal: number;
   readonly queuedSignalsTotal: number;
+  readonly runtimeMode?: GatewayRuntimeMode;
+  readonly degradedDependencies?: readonly GatewayBackgroundRunDependencyStatus[];
   readonly stateCounts: Record<
     | "pending"
     | "running"
@@ -756,6 +792,7 @@ export interface GatewayBackgroundRunStatus {
   >;
   readonly recentAlerts: readonly GatewayBackgroundRunAlert[];
   readonly metrics: GatewayBackgroundRunMetrics;
+  readonly slo?: GatewayBackgroundRunSloStatus;
 }
 
 // ============================================================================

@@ -1,0 +1,9 @@
+{
+  "wrapperVersion": "0.1.0",
+  "keyId": "local-dev",
+  "releaseChannel": "local-dev",
+  "releaseRepository": "tetsuo-ai/agenc-core",
+  "releaseTag": "agenc-v0.1.0",
+  "revokedManifestDigests": [],
+  "revokedRuntimeVersions": []
+}

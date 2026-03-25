@@ -22,6 +22,12 @@ export interface BackgroundRunQualityRunnerConfig {
   readonly runId?: string;
 }
 
+async function closeMemoryBackend(
+  backend: InMemoryBackend | SqliteBackend,
+): Promise<void> {
+  await backend.close();
+}
+
 function makeActorResult(
   content: string,
   tokenCount: number,
@@ -41,6 +47,7 @@ function makeActorResult(
     durationMs: 5,
     compacted: false,
     stopReason: "completed",
+    completionState: "completed",
   };
 }
 
@@ -182,8 +189,9 @@ async function buildScenarioArtifact(params: {
 async function runCompletionScenario(
   now: () => number,
 ): Promise<BackgroundRunScenarioArtifact> {
+  const backend = new InMemoryBackend();
   const store = new BackgroundRunStore({
-    memoryBackend: new InMemoryBackend(),
+    memoryBackend: backend,
   });
   const supervisor = new BackgroundRunSupervisor({
     chatExecutor: createScriptedChatExecutor([
@@ -217,43 +225,48 @@ async function runCompletionScenario(
     publishUpdate: async () => undefined,
     now,
   });
+  try {
+    await supervisor.startRun({
+      sessionId: "background-run-quality-completion",
+      objective: "Complete the benchmark task.",
+    });
+    await waitForSnapshot(
+      supervisor,
+      "background-run-quality-completion",
+      (snapshot) => snapshot.state === "working",
+    );
+    await supervisor.signalRun({
+      sessionId: "background-run-quality-completion",
+      type: "process_exit",
+      content: 'Managed process "watcher" (proc_completion) exited (exitCode=0).',
+      data: {
+        processId: "proc_completion",
+        exitCode: 0,
+      },
+    });
+    await waitForTerminalSnapshot(supervisor, "background-run-quality-completion");
 
-  await supervisor.startRun({
-    sessionId: "background-run-quality-completion",
-    objective: "Complete the benchmark task.",
-  });
-  await waitForSnapshot(
-    supervisor,
-    "background-run-quality-completion",
-    (snapshot) => snapshot.state === "working",
-  );
-  await supervisor.signalRun({
-    sessionId: "background-run-quality-completion",
-    type: "process_exit",
-    content: 'Managed process "watcher" (proc_completion) exited (exitCode=0).',
-    data: {
-      processId: "proc_completion",
-      exitCode: 0,
-    },
-  });
-  await waitForTerminalSnapshot(supervisor, "background-run-quality-completion");
-
-  return buildScenarioArtifact({
-    scenarioId: "canary_completion",
-    category: "canary",
-    store,
-    sessionId: "background-run-quality-completion",
-    expectedFinalState: "completed",
-    tokenCount: 12,
-    operatorUxOk: true,
-  });
+    return buildScenarioArtifact({
+      scenarioId: "canary_completion",
+      category: "canary",
+      store,
+      sessionId: "background-run-quality-completion",
+      expectedFinalState: "completed",
+      tokenCount: 12,
+      operatorUxOk: true,
+    });
+  } finally {
+    await supervisor.shutdown();
+    await closeMemoryBackend(backend);
+  }
 }
 
 async function runBlockedScenario(
   now: () => number,
 ): Promise<BackgroundRunScenarioArtifact> {
+  const backend = new InMemoryBackend();
   const store = new BackgroundRunStore({
-    memoryBackend: new InMemoryBackend(),
+    memoryBackend: backend,
   });
   const updates: string[] = [];
   const supervisor = new BackgroundRunSupervisor({
@@ -273,33 +286,38 @@ async function runBlockedScenario(
     },
     now,
   });
+  try {
+    await supervisor.startRun({
+      sessionId: "background-run-quality-blocked",
+      objective: "Attempt a blocked task.",
+    });
+    await waitForSnapshot(
+      supervisor,
+      "background-run-quality-blocked",
+      (snapshot) => snapshot.state === "blocked",
+    );
 
-  await supervisor.startRun({
-    sessionId: "background-run-quality-blocked",
-    objective: "Attempt a blocked task.",
-  });
-  await waitForSnapshot(
-    supervisor,
-    "background-run-quality-blocked",
-    (snapshot) => snapshot.state === "blocked",
-  );
-
-  return buildScenarioArtifact({
-    scenarioId: "blocked_notice",
-    category: "canary",
-    store,
-    sessionId: "background-run-quality-blocked",
-    expectedFinalState: "blocked",
-    tokenCount: 9,
-    operatorUxOk: updates.some((value) => value.includes("operator input")),
-  });
+    return buildScenarioArtifact({
+      scenarioId: "blocked_notice",
+      category: "canary",
+      store,
+      sessionId: "background-run-quality-blocked",
+      expectedFinalState: "blocked",
+      tokenCount: 9,
+      operatorUxOk: updates.some((value) => value.includes("operator input")),
+    });
+  } finally {
+    await supervisor.shutdown();
+    await closeMemoryBackend(backend);
+  }
 }
 
 async function runStopScenario(
   now: () => number,
 ): Promise<BackgroundRunScenarioArtifact> {
+  const backend = new InMemoryBackend();
   const store = new BackgroundRunStore({
-    memoryBackend: new InMemoryBackend(),
+    memoryBackend: backend,
   });
   const supervisor = new BackgroundRunSupervisor({
     chatExecutor: createScriptedChatExecutor([
@@ -316,30 +334,34 @@ async function runStopScenario(
     publishUpdate: async () => undefined,
     now,
   });
+  try {
+    await supervisor.startRun({
+      sessionId: "background-run-quality-stop",
+      objective: "Run until told to stop.",
+    });
+    await waitForSnapshot(
+      supervisor,
+      "background-run-quality-stop",
+      (snapshot) => snapshot.state === "working",
+    );
+    await supervisor.cancelRun(
+      "background-run-quality-stop",
+      "Background run cancelled from the benchmark suite.",
+    );
 
-  await supervisor.startRun({
-    sessionId: "background-run-quality-stop",
-    objective: "Run until told to stop.",
-  });
-  await waitForSnapshot(
-    supervisor,
-    "background-run-quality-stop",
-    (snapshot) => snapshot.state === "working",
-  );
-  await supervisor.cancelRun(
-    "background-run-quality-stop",
-    "Background run cancelled from the benchmark suite.",
-  );
-
-  return buildScenarioArtifact({
-    scenarioId: "operator_stop",
-    category: "canary",
-    store,
-    sessionId: "background-run-quality-stop",
-    expectedFinalState: "cancelled",
-    tokenCount: 6,
-    operatorUxOk: true,
-  });
+    return buildScenarioArtifact({
+      scenarioId: "operator_stop",
+      category: "canary",
+      store,
+      sessionId: "background-run-quality-stop",
+      expectedFinalState: "cancelled",
+      tokenCount: 6,
+      operatorUxOk: true,
+    });
+  } finally {
+    await supervisor.shutdown();
+    await closeMemoryBackend(backend);
+  }
 }
 
 async function runRecoveryScenario(
@@ -442,8 +464,9 @@ async function runRecoveryScenario(
 async function runSoakScenario(
   now: () => number,
 ): Promise<BackgroundRunScenarioArtifact> {
+  const backend = new InMemoryBackend();
   const store = new BackgroundRunStore({
-    memoryBackend: new InMemoryBackend(),
+    memoryBackend: backend,
   });
   const supervisor = new BackgroundRunSupervisor({
     chatExecutor: createScriptedChatExecutor([
@@ -466,61 +489,66 @@ async function runSoakScenario(
     publishUpdate: async () => undefined,
     now,
   });
+  try {
+    await supervisor.startRun({
+      sessionId: "background-run-quality-soak",
+      objective: "Stay active for multiple cycles before completion.",
+    });
+    await waitForSnapshot(
+      supervisor,
+      "background-run-quality-soak",
+      (snapshot) =>
+        snapshot.state === "working" &&
+        snapshot.lastUserUpdate === "Cycle 1 complete.",
+    );
+    await supervisor.signalRun({
+      sessionId: "background-run-quality-soak",
+      content: "Continue with the next supervision cycle.",
+    });
+    await waitForSnapshot(
+      supervisor,
+      "background-run-quality-soak",
+      (snapshot) =>
+        snapshot.state === "working" &&
+        snapshot.lastUserUpdate === "Cycle 2 complete.",
+    );
+    await supervisor.signalRun({
+      sessionId: "background-run-quality-soak",
+      content: "Finalize the supervision cycle.",
+    });
+    await waitForSnapshot(
+      supervisor,
+      "background-run-quality-soak",
+      (snapshot) =>
+        snapshot.state === "working" &&
+        snapshot.lastUserUpdate === "Cycle 3 complete.",
+    );
+    await supervisor.cancelRun(
+      "background-run-quality-soak",
+      "Stopped the soak benchmark after multiple successful supervision cycles.",
+    );
 
-  await supervisor.startRun({
-    sessionId: "background-run-quality-soak",
-    objective: "Stay active for multiple cycles before completion.",
-  });
-  await waitForSnapshot(
-    supervisor,
-    "background-run-quality-soak",
-    (snapshot) =>
-      snapshot.state === "working" &&
-      snapshot.lastUserUpdate === "Cycle 1 complete.",
-  );
-  await supervisor.signalRun({
-    sessionId: "background-run-quality-soak",
-    content: "Continue with the next supervision cycle.",
-  });
-  await waitForSnapshot(
-    supervisor,
-    "background-run-quality-soak",
-    (snapshot) =>
-      snapshot.state === "working" &&
-      snapshot.lastUserUpdate === "Cycle 2 complete.",
-  );
-  await supervisor.signalRun({
-    sessionId: "background-run-quality-soak",
-    content: "Finalize the supervision cycle.",
-  });
-  await waitForSnapshot(
-    supervisor,
-    "background-run-quality-soak",
-    (snapshot) =>
-      snapshot.state === "working" &&
-      snapshot.lastUserUpdate === "Cycle 3 complete.",
-  );
-  await supervisor.cancelRun(
-    "background-run-quality-soak",
-    "Stopped the soak benchmark after multiple successful supervision cycles.",
-  );
-
-  return buildScenarioArtifact({
-    scenarioId: "multi_cycle_soak",
-    category: "soak",
-    store,
-    sessionId: "background-run-quality-soak",
-    expectedFinalState: "cancelled",
-    tokenCount: 15,
-    operatorUxOk: true,
-  });
+    return buildScenarioArtifact({
+      scenarioId: "multi_cycle_soak",
+      category: "soak",
+      store,
+      sessionId: "background-run-quality-soak",
+      expectedFinalState: "cancelled",
+      tokenCount: 15,
+      operatorUxOk: true,
+    });
+  } finally {
+    await supervisor.shutdown();
+    await closeMemoryBackend(backend);
+  }
 }
 
 async function runProviderStallScenario(
   now: () => number,
 ): Promise<BackgroundRunScenarioArtifact> {
+  const backend = new InMemoryBackend();
   const store = new BackgroundRunStore({
-    memoryBackend: new InMemoryBackend(),
+    memoryBackend: backend,
   });
   const supervisor = new BackgroundRunSupervisor({
     chatExecutor: {
@@ -557,36 +585,40 @@ async function runProviderStallScenario(
     publishUpdate: async () => undefined,
     now,
   });
+  try {
+    await supervisor.startRun({
+      sessionId: "background-run-quality-provider-stall",
+      objective: "Complete even if the actor call stalls briefly.",
+    });
+    await waitForSnapshot(
+      supervisor,
+      "background-run-quality-provider-stall",
+      (snapshot) => snapshot.state === "working",
+    );
+    await supervisor.signalRun({
+      sessionId: "background-run-quality-provider-stall",
+      type: "process_exit",
+      content: 'Managed process "stall-watcher" (proc_stall) exited (exitCode=0).',
+      data: {
+        processId: "proc_stall",
+        exitCode: 0,
+      },
+    });
+    await waitForTerminalSnapshot(supervisor, "background-run-quality-provider-stall");
 
-  await supervisor.startRun({
-    sessionId: "background-run-quality-provider-stall",
-    objective: "Complete even if the actor call stalls briefly.",
-  });
-  await waitForSnapshot(
-    supervisor,
-    "background-run-quality-provider-stall",
-    (snapshot) => snapshot.state === "working",
-  );
-  await supervisor.signalRun({
-    sessionId: "background-run-quality-provider-stall",
-    type: "process_exit",
-    content: 'Managed process "stall-watcher" (proc_stall) exited (exitCode=0).',
-    data: {
-      processId: "proc_stall",
-      exitCode: 0,
-    },
-  });
-  await waitForTerminalSnapshot(supervisor, "background-run-quality-provider-stall");
-
-  return buildScenarioArtifact({
-    scenarioId: "provider_stall",
-    category: "chaos",
-    store,
-    sessionId: "background-run-quality-provider-stall",
-    expectedFinalState: "completed",
-    tokenCount: 8,
-    operatorUxOk: true,
-  });
+    return buildScenarioArtifact({
+      scenarioId: "provider_stall",
+      category: "chaos",
+      store,
+      sessionId: "background-run-quality-provider-stall",
+      expectedFinalState: "completed",
+      tokenCount: 8,
+      operatorUxOk: true,
+    });
+  } finally {
+    await supervisor.shutdown();
+    await closeMemoryBackend(backend);
+  }
 }
 
 export async function runBackgroundRunQualitySuite(

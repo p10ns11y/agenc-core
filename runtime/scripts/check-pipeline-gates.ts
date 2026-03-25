@@ -177,6 +177,121 @@ function parseCliArgs(argv: string[]): CliOptions {
       );
       continue;
     }
+    if (arg === "--min-live-coding-pass-rate" && argv[i + 1]) {
+      options.thresholds.minLiveCodingPassRate = parseThreshold(argv[++i]!, arg);
+      continue;
+    }
+    if (arg === "--min-orchestration-baseline-pass-rate" && argv[i + 1]) {
+      options.thresholds.minOrchestrationBaselinePassRate = parseThreshold(
+        argv[++i]!,
+        arg,
+      );
+      continue;
+    }
+    if (arg === "--min-effect-ledger-completeness-rate" && argv[i + 1]) {
+      options.thresholds.minEffectLedgerCompletenessRate = parseThreshold(
+        argv[++i]!,
+        arg,
+      );
+      continue;
+    }
+    if (arg === "--min-safety-pass-rate" && argv[i + 1]) {
+      options.thresholds.minSafetyPassRate = parseThreshold(argv[++i]!, arg);
+      continue;
+    }
+    if (arg === "--min-safety-approval-correctness-rate" && argv[i + 1]) {
+      options.thresholds.minSafetyApprovalCorrectnessRate = parseThreshold(
+        argv[++i]!,
+        arg,
+      );
+      continue;
+    }
+    if (arg === "--min-long-horizon-pass-rate" && argv[i + 1]) {
+      options.thresholds.minLongHorizonPassRate = parseThreshold(argv[++i]!, arg);
+      continue;
+    }
+    if (arg === "--min-restart-recovery-success-rate" && argv[i + 1]) {
+      options.thresholds.minRestartRecoverySuccessRate = parseThreshold(
+        argv[++i]!,
+        arg,
+      );
+      continue;
+    }
+    if (arg === "--min-compaction-continuation-rate" && argv[i + 1]) {
+      options.thresholds.minCompactionContinuationRate = parseThreshold(
+        argv[++i]!,
+        arg,
+      );
+      continue;
+    }
+    if (arg === "--min-background-persistence-rate" && argv[i + 1]) {
+      options.thresholds.minBackgroundPersistenceRate = parseThreshold(
+        argv[++i]!,
+        arg,
+      );
+      continue;
+    }
+    if (arg === "--min-implementation-gate-mandatory-pass-rate" && argv[i + 1]) {
+      options.thresholds.minImplementationGateMandatoryPassRate = parseThreshold(
+        argv[++i]!,
+        arg,
+      );
+      continue;
+    }
+    if (
+      arg === "--max-implementation-gate-false-completed-scenarios" &&
+      argv[i + 1]
+    ) {
+      options.thresholds.maxImplementationGateFalseCompletedScenarios =
+        parseThreshold(argv[++i]!, arg);
+      continue;
+    }
+    if (arg === "--min-chaos-pass-rate" && argv[i + 1]) {
+      options.thresholds.minChaosPassRate = parseThreshold(argv[++i]!, arg);
+      continue;
+    }
+    if (arg === "--min-provider-timeout-recovery-rate" && argv[i + 1]) {
+      options.thresholds.minProviderTimeoutRecoveryRate = parseThreshold(
+        argv[++i]!,
+        arg,
+      );
+      continue;
+    }
+    if (arg === "--min-tool-timeout-containment-rate" && argv[i + 1]) {
+      options.thresholds.minToolTimeoutContainmentRate = parseThreshold(
+        argv[++i]!,
+        arg,
+      );
+      continue;
+    }
+    if (arg === "--min-persistence-safe-mode-rate" && argv[i + 1]) {
+      options.thresholds.minPersistenceSafeModeRate = parseThreshold(
+        argv[++i]!,
+        arg,
+      );
+      continue;
+    }
+    if (arg === "--min-approval-store-safe-mode-rate" && argv[i + 1]) {
+      options.thresholds.minApprovalStoreSafeModeRate = parseThreshold(
+        argv[++i]!,
+        arg,
+      );
+      continue;
+    }
+    if (arg === "--min-child-run-crash-containment-rate" && argv[i + 1]) {
+      options.thresholds.minChildRunCrashContainmentRate = parseThreshold(
+        argv[++i]!,
+        arg,
+      );
+      continue;
+    }
+    if (arg === "--min-daemon-restart-recovery-rate" && argv[i + 1]) {
+      options.thresholds.minDaemonRestartRecoveryRate = parseThreshold(
+        argv[++i]!,
+        arg,
+      );
+      continue;
+    }
     if (arg === "--help") {
       console.log(
         [
@@ -208,6 +323,24 @@ function parseCliArgs(argv: string[]): CliOptions {
           "  --min-pass-caret-k-delta-vs-baseline <float>",
           "  --fail-fast-harmful-delegation-rate <float>",
           "  --fail-fast-runaway-cap-hit-rate <float>",
+          "  --min-live-coding-pass-rate <float>",
+          "  --min-orchestration-baseline-pass-rate <float>",
+          "  --min-effect-ledger-completeness-rate <float>",
+          "  --min-safety-pass-rate <float>",
+          "  --min-safety-approval-correctness-rate <float>",
+          "  --min-long-horizon-pass-rate <float>",
+          "  --min-restart-recovery-success-rate <float>",
+          "  --min-compaction-continuation-rate <float>",
+          "  --min-background-persistence-rate <float>",
+          "  --min-implementation-gate-mandatory-pass-rate <float>",
+          "  --max-implementation-gate-false-completed-scenarios <float>",
+          "  --min-chaos-pass-rate <float>",
+          "  --min-provider-timeout-recovery-rate <float>",
+          "  --min-tool-timeout-containment-rate <float>",
+          "  --min-persistence-safe-mode-rate <float>",
+          "  --min-approval-store-safe-mode-rate <float>",
+          "  --min-child-run-crash-containment-rate <float>",
+          "  --min-daemon-restart-recovery-rate <float>",
           "",
           "Options:",
           "  --dry-run   Always exit 0, but print failures",

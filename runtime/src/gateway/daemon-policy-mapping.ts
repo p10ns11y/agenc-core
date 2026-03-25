@@ -8,8 +8,18 @@
  * @module
  */
 
-import type { GatewayPolicyConfig } from "./types.js";
+import type { GatewayApprovalConfig, GatewayPolicyConfig } from "./types.js";
 import type { RuntimeSessionCredentialConfig } from "../policy/index.js";
+
+export function mapGatewayApprovalMode(
+  approvals: GatewayApprovalConfig | undefined,
+):
+  | "safe_local_dev"
+  | "trusted_operator"
+  | "unattended_background"
+  | "benchmark" {
+  return approvals?.mode ?? "safe_local_dev";
+}
 
 export function mapScopedActionBudgets(
   value: GatewayPolicyConfig["scopedActionBudgets"],

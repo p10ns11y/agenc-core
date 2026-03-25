@@ -4,6 +4,8 @@
  * @module
  */
 
+import { resolve as resolvePath } from "node:path";
+
 import type { PromptBudgetSection } from "./prompt-budget.js";
 import type {
   Pipeline,
@@ -55,6 +57,7 @@ import {
   executePlannerPipelineWithVerifierLoop,
   runSubagentVerifierRound,
 } from "./chat-executor-planner-verifier-loop.js";
+import { buildPlannerVerifierAdmission } from "./chat-executor-verifier.js";
 import {
   deriveDelegationContextClusterId,
   type DelegationBanditPolicyTuner,
@@ -68,6 +71,7 @@ import type {
   ToolCallRecord,
   ExecutionContext,
   PlannerDiagnostic,
+  PlannerPlan,
   PlannerDeterministicToolStepIntent,
   PlannerSubAgentTaskStepIntent,
   ResolvedSubagentVerifierConfig,
@@ -80,6 +84,10 @@ import {
   generateFallbackContent,
   truncateText,
 } from "./chat-executor-text.js";
+
+const DOC_ONLY_ARTIFACT_RE = /\.(?:md|mdx|txt|rst|adoc)$/i;
+const DOC_ONLY_BASENAME_RE =
+  /(?:^|\/)(?:README|CHANGELOG|CONTRIBUTING|LICENSE|COPYING|NOTES|AGENTS|AGENC|PLAN|TASK_BREAKDOWN)(?:\.[^/]+)?$/i;
 
 // ============================================================================
 // Dependencies interface
@@ -94,6 +102,7 @@ export interface PlannerExecutionConfig {
   readonly allowedTools: Set<string> | null;
   readonly delegationBanditTuner?: DelegationBanditPolicyTuner;
   readonly resolveHostToolingProfile?: () => HostToolingProfile | null;
+  readonly resolveHostWorkspaceRoot?: () => string | null;
 }
 
 export interface PlannerExecutionCallbacks {
@@ -143,6 +152,85 @@ export interface PlannerExecutionCallbacks {
     stage: string,
     requestTimeoutMs: number,
   ): string;
+}
+
+function isDocOnlyPlannerArtifact(path: string): boolean {
+  return DOC_ONLY_ARTIFACT_RE.test(path) || DOC_ONLY_BASENAME_RE.test(path);
+}
+
+function resolvePlannerWorkspaceRoot(
+  ctx: ExecutionContext,
+  config: PlannerExecutionConfig,
+): string | undefined {
+  if (typeof ctx.message.metadata?.workspaceRoot === "string") {
+    return ctx.message.metadata.workspaceRoot;
+  }
+  const hostWorkspaceRoot = config.resolveHostWorkspaceRoot?.();
+  return typeof hostWorkspaceRoot === "string" &&
+      hostWorkspaceRoot.trim().length > 0
+    ? hostWorkspaceRoot
+    : undefined;
+}
+
+function shouldBlockPlannerImplementationFallback(
+  subagentSteps: readonly PlannerSubAgentTaskStepIntent[],
+): boolean {
+  return subagentSteps.some((step) => {
+    const executionContext = step.executionContext;
+    const artifactPaths = [
+      ...(executionContext?.targetArtifacts ?? []),
+      ...(executionContext?.requiredSourceArtifacts ?? []),
+      ...(executionContext?.inputArtifacts ?? []),
+    ].filter((path) => path.trim().length > 0);
+    const docOnlyArtifacts =
+      artifactPaths.length > 0 &&
+      artifactPaths.every((path) => isDocOnlyPlannerArtifact(path));
+    if (docOnlyArtifacts) {
+      return false;
+    }
+
+    const requiredCapabilities = step.requiredToolCapabilities.map((capability) =>
+      capability.trim().toLowerCase(),
+    );
+    if (
+      requiredCapabilities.some((capability) =>
+        capability.includes("write") ||
+        capability.includes("append") ||
+        capability.includes("delete") ||
+        capability.includes("move") ||
+        capability.includes("mkdir") ||
+        capability.includes("text_editor")
+      )
+    ) {
+      return true;
+    }
+
+    if (
+      requiredCapabilities.some((capability) => capability.includes("bash")) &&
+      /\b(?:build|compile|typecheck|lint|test|install|implement|scaffold|write|edit|create|fix|refactor|migrate)\b/i.test(
+        [
+          step.objective,
+          step.inputContract,
+          ...step.acceptanceCriteria,
+        ].join(" "),
+      )
+    ) {
+      return true;
+    }
+
+    return (
+      executionContext?.verificationMode === "mutation_required" ||
+      executionContext?.verificationMode === "deterministic_followup" ||
+      executionContext?.stepKind === "delegated_write" ||
+      executionContext?.stepKind === "delegated_scaffold" ||
+      executionContext?.stepKind === "delegated_validation" ||
+      executionContext?.effectClass === "filesystem_write" ||
+      executionContext?.effectClass === "filesystem_scaffold" ||
+      executionContext?.effectClass === "shell" ||
+      executionContext?.effectClass === "mixed" ||
+      Boolean(executionContext?.completionContract)
+    );
+  });
 }
 
 // ============================================================================
@@ -208,6 +296,55 @@ function buildPipelineFailureSignature(result: PipelineResult): string {
     String(result.totalSteps),
     normalizedError,
   ].join("::");
+}
+
+const EXPLICIT_FILE_WRITE_TARGET_RE =
+  /\b(?:write|create|draft|generate|produce|make|save|update|overwrite)\b[\s\S]{0,160}?(?:to|into|as)?\s*[`'"]?((?:\/|\.\/|\.\.\/)?[A-Za-z0-9._/\-]+)[`'"]?/gi;
+
+function looksLikeExplicitFileTarget(candidate: string): boolean {
+  const trimmed = candidate.trim();
+  if (!trimmed) return false;
+  const normalized = trimmed.replace(/[),.;:]+$/g, "");
+  if (!normalized) return false;
+  const segments = normalized.split("/").filter(Boolean);
+  const base = segments.length > 0 ? segments[segments.length - 1]! : normalized;
+  if (base === "." || base === "..") return false;
+  return (
+    normalized.startsWith("/") ||
+    normalized.startsWith("./") ||
+    normalized.startsWith("../") ||
+    base.startsWith(".") ||
+    base.includes(".") ||
+    /^(?:README|AGENC|AGENTS|Makefile|Dockerfile)$/i.test(base)
+  );
+}
+
+export function inferExplicitFileWriteTarget(messageText: string): string | undefined {
+  EXPLICIT_FILE_WRITE_TARGET_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = EXPLICIT_FILE_WRITE_TARGET_RE.exec(messageText)) !== null) {
+    const candidate = (match[1] ?? "").trim();
+    if (!looksLikeExplicitFileTarget(candidate)) continue;
+    return candidate.replace(/[),.;:]+$/g, "");
+  }
+  return undefined;
+}
+
+function plannerAlreadyMutatesFiles(plannerPlan: PlannerPlan): boolean {
+  return plannerPlan.steps.some(
+    (step) =>
+      step.stepType === "deterministic_tool" &&
+      (step.tool === "system.writeFile" || step.tool === "system.appendFile"),
+  );
+}
+
+function normalizeToolCallTargetPath(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.trim().length === 0) return undefined;
+  try {
+    return resolvePath(value.trim());
+  } catch {
+    return undefined;
+  }
 }
 
 // ============================================================================
@@ -277,6 +414,7 @@ export async function executePlannerPath(
     plannerAttempt <= maxPlannerAttempts;
     plannerAttempt++
   ) {
+    const plannerWorkspaceRoot = resolvePlannerWorkspaceRoot(ctx, config);
     const plannerMessages = buildPlannerMessages(
       ctx.messageText,
       ctx.history,
@@ -290,6 +428,7 @@ export async function executePlannerPath(
         maxDelegationDepth: config.delegationDecisionConfig.maxDepth,
         childCanDelegate: config.delegationNestingDepth + 1 < config.delegationDecisionConfig.maxDepth,
       },
+      plannerWorkspaceRoot,
     );
     const plannerResponse = await callbacks.callModelForPhase(ctx, {
       phase: "planner",
@@ -315,6 +454,7 @@ export async function executePlannerPath(
       content: plannerResponse.content,
       toolCalls: plannerResponse.toolCalls,
       repairRequirements: explicitOrchestrationRequirements,
+      plannerWorkspaceRoot,
     });
     ctx.plannerSummaryState.diagnostics.push(...plannerParse.diagnostics);
     const plannerPlan = plannerParse.plan;
@@ -527,6 +667,7 @@ export async function executePlannerPath(
     );
     const plannerStepContractDiagnostics = validatePlannerStepContracts(
       plannerPlan,
+      ctx.messageText,
     );
     const verificationRequirementDiagnostics =
       explicitVerificationRequirements.length > 0 ||
@@ -891,6 +1032,7 @@ export async function executePlannerPath(
           subagentSteps,
           complexityScore: ctx.plannerDecision.score,
           tunedThreshold: ctx.tunedDelegationThreshold,
+          budgetSnapshot: ctx.delegationBudgetSnapshot,
           delegationConfig: config.delegationDecisionConfig,
         },
         ctx.plannerSummaryState,
@@ -932,6 +1074,10 @@ export async function executePlannerPath(
       ctx.history,
       ctx.messages,
       ctx.messageSections,
+      ctx.stateful?.artifactContext?.artifactRefs,
+      typeof ctx.message.metadata?.workspaceRoot === "string"
+        ? ctx.message.metadata.workspaceRoot
+        : undefined,
       ctx.expandedRoutedToolNames.length > 0
         ? ctx.expandedRoutedToolNames
         : ctx.activeRoutedToolNames.length > 0
@@ -1008,12 +1154,29 @@ export async function executePlannerPath(
         delegatedSteps: subagentSteps.map((step) => step.name),
       });
 
-      const shouldRunSubagentVerifier =
-        subagentSteps.length > 0 &&
-        delegationDecision?.shouldDelegate === true &&
-        (
+      const plannerVerifierAdmission = buildPlannerVerifierAdmission({
+        subagentSteps,
+        deterministicSteps,
+        verificationContract: ctx.requiredToolEvidence?.verificationContract,
+        completionContract: ctx.requiredToolEvidence?.completionContract,
+        includeSubagentOutputVerification:
           config.subagentVerifierConfig.enabled ||
-          config.subagentVerifierConfig.force
+          config.subagentVerifierConfig.force,
+      });
+      const shouldRunPlannerVerifier =
+        plannerVerifierAdmission.verifierWorkItems.length > 0 &&
+        (
+          (
+            plannerVerifierAdmission.requiresMandatoryImplementationVerification ||
+            (
+              subagentSteps.length > 0 &&
+              delegationDecision?.shouldDelegate === true
+            )
+          ) &&
+          (
+            config.subagentVerifierConfig.enabled ||
+            config.subagentVerifierConfig.force
+          )
         );
       const {
         verifierRounds,
@@ -1022,15 +1185,17 @@ export async function executePlannerPath(
       } = await executePlannerPipelineWithVerifierLoop({
         pipeline,
         plannerPlan,
-        subagentSteps,
+        verifierWorkItems: plannerVerifierAdmission.verifierWorkItems,
         deterministicSteps,
         plannerExecutionContext,
-        shouldRunSubagentVerifier,
+        shouldRunPlannerVerifier,
+        requiresMandatoryImplementationVerification:
+          plannerVerifierAdmission.requiresMandatoryImplementationVerification,
         verifierConfig: config.subagentVerifierConfig,
         plannerSummaryState: ctx.plannerSummaryState,
         checkRequestTimeout: (stage: string) => callbacks.checkRequestTimeout(ctx, stage),
         runPipelineWithGlobalTimeout: (p: Pipeline) => callbacks.runPipelineWithTimeout(ctx, p),
-        runSubagentVerifierRound: (input) =>
+        runPlannerVerifierRound: (input) =>
           runSubagentVerifierRound({
             systemPrompt: ctx.systemPrompt,
             messageText: ctx.messageText,
@@ -1038,10 +1203,13 @@ export async function executePlannerPath(
             stateful: ctx.stateful,
             plannerDiagnostics: ctx.plannerSummaryState.diagnostics,
             plannerPlan: input.plannerPlan,
-            subagentSteps: input.subagentSteps,
+            verifierWorkItems: input.verifierWorkItems,
             pipelineResult: input.pipelineResult,
+            plannerToolCalls: input.plannerToolCalls,
             plannerContext: input.plannerContext,
             round: input.round,
+            requiresMandatoryImplementationVerification:
+              input.requiresMandatoryImplementationVerification,
             callModelForPhase: (phaseInput) => callbacks.callModelForPhase(ctx, phaseInput),
           }),
         onVerifierRoundFinished: (payload) =>
@@ -1061,7 +1229,7 @@ export async function executePlannerPath(
       });
 
       if (
-        shouldRunSubagentVerifier &&
+        shouldRunPlannerVerifier &&
         verifierRounds === 0 &&
         !ctx.plannerSummaryState.subagentVerification.performed
       ) {
@@ -1099,6 +1267,7 @@ export async function executePlannerPath(
           attempt: plannerAttempt,
           pipelineId: pipeline.id,
           status: pipelineResult.status,
+          completionState: pipelineResult.completionState,
           completedSteps: pipelineResult.completedSteps,
           totalSteps: pipelineResult.totalSteps,
           decomposition: pipelineResult.decomposition,
@@ -1160,6 +1329,7 @@ export async function executePlannerPath(
           attempt: plannerAttempt,
           pipelineId: pipeline.id,
           status: pipelineResult.status,
+          completionState: pipelineResult.completionState,
           completedSteps: pipelineResult.completedSteps,
           totalSteps: pipelineResult.totalSteps,
           error: pipelineResult.error,
@@ -1199,6 +1369,7 @@ export async function executePlannerPath(
           attempt: plannerAttempt,
           pipelineId: pipeline.id,
           status: pipelineResult.status,
+          completionState: pipelineResult.completionState,
           completedSteps: pipelineResult.completedSteps,
           totalSteps: pipelineResult.totalSteps,
           error: pipelineResult.error,
@@ -1288,13 +1459,39 @@ export async function executePlannerPath(
           ctx.stopReason !== "completed"
         )
       ) {
-        const synthesisMessages = buildPlannerSynthesisMessages(
+        const requestedWriteTarget =
+          !plannerAlreadyMutatesFiles(plannerPlan)
+            ? inferExplicitFileWriteTarget(ctx.messageText)
+            : undefined;
+        let synthesisMessages = buildPlannerSynthesisMessages(
           ctx.systemPrompt,
           ctx.messageText,
           plannerPlan,
           pipelineResult,
           verificationDecision,
         );
+        const synthesisWriteTarget =
+          requestedWriteTarget &&
+          (
+            plannerPlan.requiresSynthesis ||
+            hasSynthesisStep
+          )
+            ? requestedWriteTarget
+            : undefined;
+        if (synthesisWriteTarget) {
+          synthesisMessages = [
+            synthesisMessages[0]!,
+            synthesisMessages[1]!,
+            {
+              role: "system",
+              content:
+                `The original request requires materializing a file, not just describing it. ` +
+                `Use \`system.writeFile\` with the exact target path \`${synthesisWriteTarget}\` before finishing. ` +
+                "Do not inline the full file content as a plain chat answer without writing it.",
+            },
+            ...synthesisMessages.slice(2),
+          ];
+        }
         const synthesisSections: PromptBudgetSection[] = [
           "system_anchor",
           "system_runtime",
@@ -1303,6 +1500,7 @@ export async function executePlannerPath(
         const stopReasonBeforeSynthesis = ctx.stopReason;
         const stopReasonDetailBeforeSynthesis = ctx.stopReasonDetail;
         try {
+          const toolCallCountBeforeSynthesis = ctx.allToolCalls.length;
           const synthesisResponse = await callbacks.callModelForPhase(ctx, {
             phase: "planner_synthesis",
             callMessages: synthesisMessages,
@@ -1311,11 +1509,47 @@ export async function executePlannerPath(
             statefulSessionId: ctx.sessionId,
             statefulResumeAnchor: ctx.stateful?.resumeAnchor,
             statefulHistoryCompacted: ctx.stateful?.historyCompacted,
-            routedToolNames: [],
-            toolChoice: "none",
+            routedToolNames: synthesisWriteTarget ? ["system.writeFile"] : [],
+            toolChoice: synthesisWriteTarget ? "auto" : "none",
             budgetReason:
               "Planner synthesis blocked by max model recalls per request budget",
           });
+          if (synthesisWriteTarget) {
+            const normalizedTarget = normalizeToolCallTargetPath(
+              synthesisWriteTarget,
+            );
+            const wroteRequestedTarget = ctx.allToolCalls
+              .slice(toolCallCountBeforeSynthesis)
+              .some((call) => {
+                if (call.isError || call.name !== "system.writeFile") {
+                  return false;
+                }
+                const callPath = normalizeToolCallTargetPath(
+                  (call.args as { path?: unknown } | undefined)?.path,
+                );
+                return normalizedTarget !== undefined && callPath === normalizedTarget;
+              });
+            if (!wroteRequestedTarget) {
+              callbacks.setStopReason(
+                ctx,
+                "validation_error",
+                `Required synthesis write target was not materialized: ${synthesisWriteTarget}`,
+              );
+              ctx.finalContent =
+                `Required file target was not written: ${synthesisWriteTarget}. ` +
+                "The model returned synthesis output without materializing the artifact.";
+              ctx.plannerSummaryState.diagnostics.push({
+                category: "runtime",
+                code: "planner_synthesis_missing_materialized_artifact",
+                message:
+                  "Planner synthesis returned without writing the explicit requested artifact target",
+                details: {
+                  targetPath: synthesisWriteTarget,
+                },
+              });
+              return;
+            }
+          }
           if (synthesisResponse) {
             ctx.response = synthesisResponse;
             ctx.finalContent = ensureSubagentProvenanceCitations(
@@ -1422,6 +1656,31 @@ export async function executePlannerPath(
         stopReasonDetail: ctx.stopReasonDetail,
         diagnostics: ctx.plannerSummaryState.diagnostics,
         latestDiagnostics: latestPlannerValidationDiagnostics,
+        handled: true,
+      });
+      ctx.plannerHandled = true;
+      return;
+    }
+    if (
+      subagentSteps.length > 0 &&
+      delegationDecision?.shouldDelegate === false &&
+      shouldBlockPlannerImplementationFallback(subagentSteps)
+    ) {
+      callbacks.setStopReason(
+        ctx,
+        "validation_error",
+        "Planner produced an implementation-scoped delegated plan, but runtime delegation admission rejected it. Inline legacy fallback is disabled for this task class.",
+      );
+      ctx.finalContent =
+        `Planner produced an implementation-scoped delegated plan, ` +
+        `but runtime delegation admission rejected it (${delegationDecision.reason}). ` +
+        `Inline legacy fallback is disabled for this task class; re-plan the work with a single-owner execution contract or provide an explicit workflow verification contract.`;
+      callbacks.emitPlannerTrace(ctx, "planner_path_finished", {
+        plannerCalls: plannerAttempt,
+        routeReason: ctx.plannerSummaryState.routeReason,
+        stopReason: ctx.stopReason,
+        stopReasonDetail: ctx.stopReasonDetail,
+        diagnostics: ctx.plannerSummaryState.diagnostics,
         handled: true,
       });
       ctx.plannerHandled = true;

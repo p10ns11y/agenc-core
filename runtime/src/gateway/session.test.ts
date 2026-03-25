@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { createHash } from "node:crypto";
 import {
+  SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY,
+  SESSION_STATEFUL_ARTIFACT_RECORDS_METADATA_KEY,
   SessionManager,
   SESSION_STATEFUL_HISTORY_COMPACTED_METADATA_KEY,
   SESSION_STATEFUL_RESUME_ANCHOR_METADATA_KEY,
@@ -317,13 +319,19 @@ describe("SessionManager", () => {
       const result = await mgr.compact(session.id);
       expect(result).not.toBeNull();
       expect(result!.messagesRemoved).toBe(5);
-      // 5 kept + 1 summary = 6
       expect(result!.messagesRetained).toBe(6);
-      expect(result!.summaryGenerated).toBe(false); // no summarizer
+      expect(result!.summaryGenerated).toBe(true);
+      expect(result!.artifactCount).toBeGreaterThan(0);
       expect(session.history[0].role).toBe("system");
       expect(session.history[0].content).toContain(
-        "5 earlier messages removed",
+        "Compacted context snapshot",
       );
+      expect(
+        session.metadata[SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY],
+      ).toBeDefined();
+      expect(
+        session.metadata[SESSION_STATEFUL_ARTIFACT_RECORDS_METADATA_KEY],
+      ).toBeDefined();
       expect(
         session.metadata[SESSION_STATEFUL_HISTORY_COMPACTED_METADATA_KEY],
       ).toBe(true);
@@ -345,12 +353,14 @@ describe("SessionManager", () => {
       expect(result).not.toBeNull();
       expect(result!.summaryGenerated).toBe(true);
       expect(result!.summaryQuality).toBe("accepted");
+      expect(result!.artifactCount).toBeGreaterThan(0);
       expect(summarizer).toHaveBeenCalledOnce();
       expect(session.history[0].role).toBe("system");
       expect(session.history[0].content).toContain("decisions");
+      expect(session.history[0].content).toContain("Artifact refs:");
     });
 
-    it("'summarize' without summarizer falls back to truncate", async () => {
+    it("'summarize' without summarizer still preserves artifact-backed context", async () => {
       const mgr = new SessionManager(makeConfig({ compaction: "summarize" }));
       const session = mgr.getOrCreate(makeParams());
       for (let i = 0; i < 10; i++) {
@@ -359,11 +369,60 @@ describe("SessionManager", () => {
 
       const result = await mgr.compact(session.id);
       expect(result).not.toBeNull();
-      expect(result!.summaryGenerated).toBe(false);
+      expect(result!.summaryGenerated).toBe(true);
       expect(result!.messagesRemoved).toBe(5);
-      expect(session.history).toHaveLength(5);
-      // Should be truncation — no system summary message
-      expect(session.history[0].content).toBe("m5");
+      expect(session.history).toHaveLength(6);
+      expect(session.history[0]).toMatchObject({
+        role: "system",
+      });
+      expect(String(session.history[0].content)).toContain(
+        "Compacted context snapshot",
+      );
+      expect(
+        session.metadata[SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY],
+      ).toBeDefined();
+    });
+
+    it("dedupes artifact refs across repeated compactions during long sessions", async () => {
+      const summarizer: Summarizer = vi
+        .fn()
+        .mockResolvedValue("PLAN.md and src/main.c remain the main artifacts.");
+      const mgr = new SessionManager(makeConfig({ compaction: "summarize" }), {
+        summarizer,
+      });
+      const session = mgr.getOrCreate(makeParams());
+      session.history.push(
+        msg("user", "Review PLAN.md and update src/main.c next."),
+        msg("assistant", "Next step: verify PLAN.md before touching src/main.c."),
+        msg("tool", "system.readFile: PLAN.md contains the shell roadmap."),
+        msg("assistant", "Open loop: fix src/main.c parser edge cases."),
+        msg("tool", "system.bash test output for src/main.c passed 4 tests."),
+        msg("assistant", "Decision: keep src/main.c minimal for now."),
+      );
+
+      const first = await mgr.compact(session.id);
+      expect(first?.artifactCount).toBeGreaterThan(0);
+
+      session.history.push(
+        msg("user", "Re-review PLAN.md and src/main.c before finalizing."),
+        msg("tool", "system.readFile: PLAN.md still references src/main.c milestones."),
+        msg("assistant", "Remaining: verify src/main.c and update PLAN.md only if needed."),
+        msg("tool", "system.bash test output for src/main.c passed 5 tests."),
+        msg("assistant", "Decision: PLAN.md and src/main.c stay aligned."),
+        msg("user", "Ship it."),
+      );
+
+      const second = await mgr.compact(session.id);
+      const state = session.metadata[
+        SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY
+      ] as { artifactRefs?: Array<{ digest: string; title: string }> };
+      expect(second?.artifactCount).toBeGreaterThan(0);
+      expect(state.artifactRefs?.length).toBeGreaterThan(0);
+      const digests = new Set(state.artifactRefs?.map((artifact) => artifact.digest));
+      expect(digests.size).toBe(state.artifactRefs?.length);
+      expect(
+        state.artifactRefs?.some((artifact) => artifact.title.includes("PLAN.md")),
+      ).toBe(true);
     });
 
     it("returns null for unknown session", async () => {
@@ -624,7 +683,7 @@ describe("SessionManager", () => {
   });
 
   describe("summary quality checks", () => {
-    it("rejects low-information summaries and falls back to truncation", async () => {
+    it("rejects low-information narrative summaries but preserves artifact-backed compaction", async () => {
       const summarizer: Summarizer = vi
         .fn()
         .mockResolvedValue("ok");
@@ -638,9 +697,12 @@ describe("SessionManager", () => {
 
       const result = await mgr.compact(session.id);
       expect(result).not.toBeNull();
-      expect(result!.summaryGenerated).toBe(false);
+      expect(result!.summaryGenerated).toBe(true);
       expect(result!.summaryQuality).toBe("rejected");
-      expect(session.history[0].content).toBe("important-m5");
+      expect(session.history[0].role).toBe("system");
+      expect(String(session.history[0].content)).toContain(
+        "Compacted context snapshot",
+      );
     });
 
     it("truncates oversize summaries to bounded length", async () => {

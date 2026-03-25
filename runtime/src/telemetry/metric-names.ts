@@ -56,6 +56,11 @@ export const TELEMETRY_METRIC_NAMES = {
     "agenc.background_runs.recovery_success_rate",
   BACKGROUND_RUN_VERIFIER_ACCURACY:
     "agenc.background_runs.verifier_accuracy",
+  APPROVAL_RESPONSE_LATENCY_MS: "agenc.approval.response_latency_ms",
+  RUNTIME_INCIDENTS_TOTAL: "agenc.runtime.incidents.total",
+  RUNTIME_DEGRADED_DEPENDENCIES_TOTAL:
+    "agenc.runtime.degraded_dependencies.total",
+  RUNTIME_MODE_ACTIVE: "agenc.runtime.mode.active",
   // Adaptive verifier
   VERIFIER_ADAPTIVE_RISK_SCORE: "agenc.verifier.adaptive.risk_score",
   VERIFIER_ADAPTIVE_RISK_TIER_TOTAL: "agenc.verifier.adaptive.risk_tier.total",

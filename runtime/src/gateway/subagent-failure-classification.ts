@@ -15,8 +15,8 @@ import type { SubAgentResult } from "./sub-agent.js";
 import {
   type DelegatedWorkingDirectoryResolution,
   resolveDelegatedWorkingDirectory,
-  resolveDelegatedWorkingDirectoryPath,
 } from "./delegation-tool.js";
+import { sanitizeDelegationContextRequirements } from "../utils/delegation-execution-context.js";
 import {
   resolveDelegationBudgetHintMs,
 } from "./delegation-timeout.js";
@@ -24,6 +24,7 @@ import type { SubagentFailureClass, SubagentRetryRule } from "./subagent-orchest
 import {
   DEFAULT_TOOL_BUDGET_PER_REQUEST,
 } from "../llm/chat-executor-constants.js";
+import { buildCanonicalDelegatedFilesystemScope } from "../workflow/delegated-filesystem-scope.js";
 
 /* ------------------------------------------------------------------ */
 /*  Budget & tool budget constants                                     */
@@ -188,11 +189,7 @@ export function classifySubagentFailureResult(
 /* ------------------------------------------------------------------ */
 
 export function resolveEffectiveDelegatedWorkingDirectory(input: {
-  readonly task?: string;
-  readonly objective?: string;
-  readonly inputContract?: string;
-  readonly acceptanceCriteria?: readonly string[];
-  readonly contextRequirements?: readonly string[];
+  readonly executionContext?: PipelinePlannerSubagentStep["executionContext"];
 }): (DelegatedWorkingDirectoryResolution & { readonly anchored: boolean }) | undefined {
   const delegatedWorkingDirectory = resolveDelegatedWorkingDirectory(input);
   if (!delegatedWorkingDirectory) {
@@ -214,95 +211,16 @@ export function isAnchoredDelegatedWorkingDirectory(path: string): boolean {
   return false;
 }
 
-export function normalizeAnchoredDelegatedWorkingDirectory(
-  directoryPath: string,
-  workspaceRoot?: string,
-): string {
-  const normalized = directoryPath.trim();
-  if (normalized.length === 0 || !workspaceRoot) {
-    return normalized;
-  }
-  const resolvedPath = resolveDelegatedWorkingDirectoryPath(
-    normalized,
-    workspaceRoot,
-  );
-  return resolvedPath ?? normalized;
-}
-
-export function resolvePlannerContextDelegatedWorkingDirectory(
-  pipeline: Pipeline,
-  hostWorkspaceRoot?: string | null,
-): {
-  readonly path: string;
-  readonly anchored: boolean;
-  readonly source?: DelegatedWorkingDirectoryResolution["source"];
-} | undefined {
-  const cwdFromPipeline = (pipeline.plannerContext as Record<string, unknown> | undefined)?.delegatedWorkingDirectory;
-  if (typeof cwdFromPipeline !== "string" || cwdFromPipeline.trim().length === 0) {
-    return undefined;
-  }
-  const path = hostWorkspaceRoot
-    ? normalizeAnchoredDelegatedWorkingDirectory(
-        cwdFromPipeline,
-        hostWorkspaceRoot,
-      )
-    : cwdFromPipeline;
-  return { path, anchored: isAnchoredDelegatedWorkingDirectory(path), source: "context_requirement" };
-}
-
-export function resolveInheritedDelegatedWorkingDirectory(
+export function stepRequiresStructuredDelegatedFilesystemScope(
   step: PipelinePlannerSubagentStep,
-  pipeline: Pipeline,
-  hostWorkspaceRoot?: string | null,
-): {
-  readonly path: string;
-  readonly anchored: boolean;
-  readonly source?: DelegatedWorkingDirectoryResolution["source"];
-} | undefined {
-  // 1. Try planner-context CWD.
-  const plannerContextCwd = resolvePlannerContextDelegatedWorkingDirectory(
-    pipeline,
-    hostWorkspaceRoot,
+): boolean {
+  return Boolean(
+    step.executionContext?.workspaceRoot?.trim().length ||
+      step.executionContext?.allowedReadRoots?.length ||
+      step.executionContext?.allowedWriteRoots?.length ||
+      step.executionContext?.requiredSourceArtifacts?.length ||
+      step.executionContext?.targetArtifacts?.length,
   );
-  if (plannerContextCwd) return plannerContextCwd;
-
-  // 2. Try step-level extraction.
-  const effective = resolveEffectiveDelegatedWorkingDirectory({
-    task: step.name,
-    objective: step.objective,
-    inputContract: step.inputContract,
-    acceptanceCriteria: step.acceptanceCriteria,
-    contextRequirements: step.contextRequirements,
-  });
-  if (effective) {
-    const normalized = hostWorkspaceRoot
-      ? normalizeAnchoredDelegatedWorkingDirectory(
-          effective.path,
-          hostWorkspaceRoot,
-        )
-      : effective.path;
-    return { path: normalized, anchored: isAnchoredDelegatedWorkingDirectory(normalized), source: effective.source };
-  }
-
-  // 3. Try parent request extraction.
-  const parentRequest = pipeline.plannerContext?.parentRequest?.trim();
-  if (typeof parentRequest === "string" && parentRequest.length > 0) {
-    const parentCwd = resolveEffectiveDelegatedWorkingDirectory({
-      task: step.name,
-      objective: parentRequest,
-    });
-    if (parentCwd) {
-      const normalized = hostWorkspaceRoot
-        ? normalizeAnchoredDelegatedWorkingDirectory(
-            parentCwd.path,
-            hostWorkspaceRoot,
-          )
-        : parentCwd.path;
-      return { path: normalized, anchored: isAnchoredDelegatedWorkingDirectory(normalized), source: parentCwd.source };
-    }
-  }
-
-  return undefined;
 }
 
 export function resolvePlannerStepWorkingDirectory(
@@ -314,18 +232,23 @@ export function resolvePlannerStepWorkingDirectory(
   readonly anchored: boolean;
   readonly source?: DelegatedWorkingDirectoryResolution["source"];
 } | undefined {
-  const inherited = resolveInheritedDelegatedWorkingDirectory(
-    step,
-    pipeline,
-    hostWorkspaceRoot,
-  );
-  if (inherited) return inherited;
-
-  // Fallback: host workspace root.
-  if (typeof hostWorkspaceRoot === "string" && hostWorkspaceRoot.trim().length > 0) {
+  void pipeline;
+  void hostWorkspaceRoot;
+  const canonicalScope = buildCanonicalDelegatedFilesystemScope({
+    workspaceRoot: step.executionContext?.workspaceRoot,
+    allowedReadRoots: step.executionContext?.allowedReadRoots,
+    allowedWriteRoots: step.executionContext?.allowedWriteRoots,
+    inputArtifacts: step.executionContext?.inputArtifacts,
+    requiredSourceArtifacts: step.executionContext?.requiredSourceArtifacts,
+    targetArtifacts: step.executionContext?.targetArtifacts,
+  });
+  if (canonicalScope.workspaceRoot) {
     return {
-      path: hostWorkspaceRoot,
-      anchored: isAnchoredDelegatedWorkingDirectory(hostWorkspaceRoot),
+      path: canonicalScope.workspaceRoot,
+      anchored: isAnchoredDelegatedWorkingDirectory(
+        canonicalScope.workspaceRoot,
+      ),
+      source: "execution_envelope",
     };
   }
 
@@ -334,38 +257,8 @@ export function resolvePlannerStepWorkingDirectory(
 
 export function buildEffectiveContextRequirements(
   step: PipelinePlannerSubagentStep,
-  delegatedWorkingDirectory?: string,
 ): readonly string[] {
-  if (
-    typeof delegatedWorkingDirectory !== "string" ||
-    delegatedWorkingDirectory.trim().length === 0
-  ) {
-    return step.contextRequirements;
-  }
-
-  const normalizedRequirement = `cwd=${delegatedWorkingDirectory}`;
-  let replaced = false;
-  const rewritten = step.contextRequirements
-    .map((requirement) => {
-      if (
-        /^(?:cwd|working(?:[_ -]?directory))\s*(?:=|:)\s*(.+)$/i.test(
-          requirement,
-        )
-      ) {
-        replaced = true;
-        return normalizedRequirement;
-      }
-      return requirement;
-    })
-    .filter((requirement, index, entries) =>
-      requirement.length > 0 && entries.indexOf(requirement) === index
-    );
-
-  if (replaced) {
-    return rewritten;
-  }
-
-  return [normalizedRequirement, ...rewritten];
+  return sanitizeDelegationContextRequirements(step.contextRequirements);
 }
 
 /* ------------------------------------------------------------------ */

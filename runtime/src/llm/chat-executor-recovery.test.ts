@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildRecoveryHints,
+  computeQualityProxy,
   inferRecoveryHint,
 } from "./chat-executor-recovery.js";
 
@@ -353,5 +354,23 @@ describe("chat-executor-recovery", () => {
     expect(hint?.message).toContain("does not expand shell globs");
     expect(hint?.message).toContain("find");
     expect(hint?.message).toContain("shell mode");
+  });
+
+  it("scores completed workflow states higher than needs-verification states", () => {
+    expect(
+      computeQualityProxy({
+        completionState: "completed",
+        verifierPerformed: true,
+        verifierOverall: "pass",
+        failedToolCalls: 0,
+      }),
+    ).toBeGreaterThan(
+      computeQualityProxy({
+        completionState: "needs_verification",
+        verifierPerformed: false,
+        verifierOverall: "skipped",
+        failedToolCalls: 0,
+      }),
+    );
   });
 });

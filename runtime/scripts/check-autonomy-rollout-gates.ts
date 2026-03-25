@@ -38,8 +38,12 @@ export function resolveProjectPathCandidates(
     return [inputPath];
   }
   const repoRoot = path.resolve(baseDir, "..");
+  const normalizedInputPath = inputPath.replace(/\\/g, "/");
+  const runtimeRelativeInput = normalizedInputPath.startsWith("runtime/")
+    ? normalizedInputPath.slice("runtime/".length)
+    : normalizedInputPath;
   return [
-    path.resolve(baseDir, inputPath),
+    path.resolve(baseDir, runtimeRelativeInput),
     path.resolve(repoRoot, inputPath),
   ];
 }

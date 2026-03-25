@@ -82,6 +82,7 @@ function createResult(
     durationMs: 10,
     compacted: false,
     stopReason: "completed",
+    completionState: "completed",
     ...overrides,
   };
 }
@@ -335,6 +336,9 @@ You have broad access to this machine via the system.bash tool.`,
     );
     expect(webChat.broadcastEvent).toHaveBeenCalledWith("chat.response", {
       sessionId: "session:test",
+      completionState: "completed",
+      stopReason: "completed",
+      stopReasonDetail: undefined,
     });
     expect(hooks.dispatch).toHaveBeenCalledWith("message:outbound", {
       sessionId: "session:test",

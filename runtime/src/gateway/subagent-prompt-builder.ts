@@ -39,7 +39,14 @@ import {
   extractTerms,
 } from "./subagent-context-curation.js";
 import {
+  buildDelegationExecutionContext,
+  canonicalizeDelegationExecutionContext,
+  sanitizeDelegationContextRequirements,
+} from "../utils/delegation-execution-context.js";
+import type { DelegationStepAdmission } from "./delegation-admission.js";
+import {
   isNodeWorkspaceRelevant,
+  collectReachableVerificationCategories,
 } from "./subagent-workspace-probes.js";
 
 /* ------------------------------------------------------------------ */
@@ -135,12 +142,17 @@ export function collectDependencyContexts(
 export function buildArtifactRelevanceTerms(
   step: PipelinePlannerSubagentStep,
 ): ReadonlySet<string> {
+  const sanitizedContextRequirements = sanitizeDelegationContextRequirements(
+    step.contextRequirements,
+  );
   const aggregate = [
     step.objective,
     step.inputContract,
     ...step.acceptanceCriteria,
-    ...step.contextRequirements,
+    ...sanitizedContextRequirements,
     ...step.requiredToolCapabilities,
+    ...(step.executionContext?.requiredSourceArtifacts ?? []),
+    ...(step.executionContext?.targetArtifacts ?? []),
   ].join(" ");
   return new Set(extractTerms(aggregate));
 }
@@ -278,7 +290,7 @@ export function buildWorkspaceVerificationContractLines(
     step.objective,
     step.inputContract,
     ...step.acceptanceCriteria,
-    ...step.contextRequirements,
+    ...sanitizeDelegationContextRequirements(step.contextRequirements),
     pipeline.plannerContext?.parentRequest ?? "",
     ...downstreamRootScripts.map((script) => `npm run ${script}`),
   ];
@@ -312,9 +324,25 @@ export function buildEffectiveDelegationSpec(
     readonly parentRequest?: string;
     readonly lastValidationCode?: DelegationOutputValidationCode;
     readonly delegatedWorkingDirectory?: string;
+    readonly admission?: DelegationStepAdmission;
     readonly resolveHostToolingProfile?: () => HostToolingProfile | null;
   } = {},
 ): DelegationContractSpec {
+  const reachableVerificationCategories = collectReachableVerificationCategories(
+    step,
+    pipeline,
+  );
+  const effectiveVerificationMode =
+    step.executionContext?.verificationMode ??
+    (reachableVerificationCategories.size > 0
+      ? "deterministic_followup"
+      : undefined);
+  const effectiveExecutionContext =
+    canonicalizeDelegationExecutionContext(step.executionContext);
+  const sanitizedContextRequirements = sanitizeDelegationContextRequirements(
+    step.contextRequirements,
+  );
+
   return {
     task: step.name,
     objective: step.objective,
@@ -327,7 +355,40 @@ export function buildEffectiveDelegationSpec(
       options.resolveHostToolingProfile,
     ),
     requiredToolCapabilities: step.requiredToolCapabilities,
-    contextRequirements: step.contextRequirements,
+    contextRequirements: sanitizedContextRequirements,
+    executionContext:
+      effectiveExecutionContext &&
+      effectiveVerificationMode !== effectiveExecutionContext.verificationMode
+        ? buildDelegationExecutionContext({
+          workspaceRoot: effectiveExecutionContext.workspaceRoot,
+          allowedReadRoots: effectiveExecutionContext.allowedReadRoots,
+          allowedWriteRoots: effectiveExecutionContext.allowedWriteRoots,
+          allowedTools: effectiveExecutionContext.allowedTools,
+          inputArtifacts: effectiveExecutionContext.inputArtifacts,
+          targetArtifacts: effectiveExecutionContext.targetArtifacts,
+          requiredSourceArtifacts:
+            effectiveExecutionContext.requiredSourceArtifacts,
+          effectClass: effectiveExecutionContext.effectClass,
+          verificationMode: effectiveVerificationMode,
+          stepKind: effectiveExecutionContext.stepKind,
+          completionContract: effectiveExecutionContext.completionContract,
+          fallbackPolicy: effectiveExecutionContext.fallbackPolicy,
+          resumePolicy: effectiveExecutionContext.resumePolicy,
+          approvalProfile: effectiveExecutionContext.approvalProfile,
+        })
+        : effectiveExecutionContext,
+    ...(options.admission?.shape
+      ? { delegationShape: options.admission.shape }
+      : {}),
+    ...(options.admission?.isolationReason
+      ? { isolationReason: options.admission.isolationReason }
+      : {}),
+    ...(options.admission && options.admission.ownedArtifacts.length > 0
+      ? { ownedArtifacts: options.admission.ownedArtifacts }
+      : {}),
+    ...(options.admission && options.admission.verifierObligations.length > 0
+      ? { verifierObligations: options.admission.verifierObligations }
+      : {}),
     ...(options.lastValidationCode
       ? { lastValidationCode: options.lastValidationCode }
       : {}),
@@ -371,7 +432,7 @@ export function buildDerivedWorkspaceAcceptanceCriteria(
     step.objective,
     step.inputContract,
     ...step.acceptanceCriteria,
-    ...step.contextRequirements,
+    ...sanitizeDelegationContextRequirements(step.contextRequirements),
     pipeline.plannerContext?.parentRequest ?? "",
     ...downstreamRootScripts.map((script) => `npm run ${script}`),
   ];
@@ -383,12 +444,14 @@ export function buildDerivedWorkspaceAcceptanceCriteria(
   }
 
   const criteria: string[] = [];
-  if (downstreamRootScripts.length > 0) {
+  const authorsWorkspaceManifestOrConfig =
+    stepAuthorsNodeWorkspaceManifestOrConfig(step, pipeline);
+  if (downstreamRootScripts.length > 0 && authorsWorkspaceManifestOrConfig) {
     criteria.push(
       `Root package.json authored with npm scripts for ${downstreamRootScripts.join(", ")}.`,
     );
   }
-  if (stepAuthorsNodeWorkspaceManifestOrConfig(step, pipeline)) {
+  if (authorsWorkspaceManifestOrConfig) {
     criteria.push(
       "Buildable TypeScript workspace packages use package-local tsconfig/project references or equivalent so `npm run build --workspace=<workspace-name>` verifies the targeted package without compiling sibling packages.",
     );
@@ -417,19 +480,22 @@ export function stepAuthorsNodeWorkspaceManifestOrConfig(
   step: PipelinePlannerSubagentStep,
   pipeline?: Pipeline,
 ): boolean {
+  const sanitizedContextRequirements = sanitizeDelegationContextRequirements(
+    step.contextRequirements,
+  );
   const combined = [
     step.name,
     step.objective,
     step.inputContract,
     ...step.acceptanceCriteria,
-    ...step.contextRequirements,
+    ...sanitizedContextRequirements,
   ].join(" ");
   const hasNodeWorkspaceCue = isNodeWorkspaceRelevant([
     combined,
     pipeline?.plannerContext?.parentRequest ?? "",
   ]);
   const hasManifestOrConfigTarget =
-    /\b(?:manifest|config|package\.json|tsconfig(?:\.[a-z]+)?\.json|vite\.config(?:\.[a-z]+)?|vitest\.config(?:\.[a-z]+)?|readme|workspace|workspaces|dependencies|devdependencies|scripts?|bin)\b/i
+    /\b(?:manifest|config|package\.json|tsconfig(?:\.[a-z]+)?\.json|vite\.config(?:\.[a-z]+)?|vitest\.config(?:\.[a-z]+)?|pnpm-workspace\.yaml|readme|scripts?)\b/i
       .test(combined);
   const hasAuthoringVerb =
     /\b(?:author|create|scaffold|write|update|define|configure|declare|add)\b/i
@@ -452,7 +518,7 @@ export function isPreInstallNodeWorkspaceStep(
     step.objective,
     step.inputContract,
     ...step.acceptanceCriteria,
-    ...step.contextRequirements,
+    ...sanitizeDelegationContextRequirements(step.contextRequirements),
   ].join(" ");
   return isNodeWorkspaceRelevant([combined]);
 }
@@ -743,7 +809,9 @@ export function buildRetryTaskPrompt(
           inputContract: step.inputContract,
           acceptanceCriteria: step.acceptanceCriteria,
           requiredToolCapabilities: step.requiredToolCapabilities,
-          contextRequirements: step.contextRequirements,
+          contextRequirements: sanitizeDelegationContextRequirements(
+            step.contextRequirements,
+          ),
         })
       ) {
         corrections.push(...buildBrowserEvidenceRetryGuidance(allowedTools));
@@ -775,6 +843,14 @@ export function buildRetryTaskPrompt(
       );
       corrections.push(
         "Stay within the file-authoring or inspection contract for this phase and leave verification for the later step.",
+      );
+    }
+    if (failure.validationCode === "missing_required_source_evidence") {
+      corrections.push(
+        "Inspect the named source file artifacts from the input contract or context requirements before writing again.",
+      );
+      corrections.push(
+        "If those sources describe intended or planned structure, say that explicitly instead of presenting those files as already present.",
       );
     }
     if (failure.validationCode === "acceptance_probe_failed") {
@@ -862,7 +938,7 @@ export function buildHostToolingPromptSection(
     step.objective,
     step.inputContract,
     ...step.acceptanceCriteria,
-    ...step.contextRequirements,
+    ...sanitizeDelegationContextRequirements(step.contextRequirements),
     pipeline.plannerContext?.parentRequest ?? "",
     ...dependencyArtifactCandidates.map((candidate) => candidate.path),
   ];

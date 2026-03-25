@@ -9,17 +9,25 @@
 
 import { createHash } from "node:crypto";
 import type { LLMMessage } from "../llm/types.js";
+import type { ArtifactCompactionState } from "../memory/artifact-store.js";
+import { compactHistoryIntoArtifactContext } from "../llm/context-compaction.js";
 
 export const SESSION_STATEFUL_RESUME_ANCHOR_METADATA_KEY =
   "statefulResumeAnchor";
 export const SESSION_STATEFUL_HISTORY_COMPACTED_METADATA_KEY =
   "statefulHistoryCompacted";
+export const SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY =
+  "statefulArtifactContext";
+export const SESSION_STATEFUL_ARTIFACT_RECORDS_METADATA_KEY =
+  "statefulArtifactRecords";
 
 export function clearStatefulContinuationMetadata(
   metadata: Record<string, unknown>,
 ): void {
   delete metadata[SESSION_STATEFUL_RESUME_ANCHOR_METADATA_KEY];
   delete metadata[SESSION_STATEFUL_HISTORY_COMPACTED_METADATA_KEY];
+  delete metadata[SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY];
+  delete metadata[SESSION_STATEFUL_ARTIFACT_RECORDS_METADATA_KEY];
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +92,9 @@ export interface CompactionResult {
   readonly summaryQuality?: "accepted" | "rejected" | "not_applicable";
   /** Final summary length when a summary message is retained. */
   readonly summaryChars?: number;
+  /** Structured artifact-backed compaction state retained for resume/context reuse. */
+  readonly artifactState?: ArtifactCompactionState;
+  readonly artifactCount?: number;
 }
 
 export type SessionCompactionPhase = "before" | "after" | "error";
@@ -196,6 +207,25 @@ function hasUsefulSummaryOverlap(
     }
   }
   return false;
+}
+
+function readArtifactCompactionState(
+  metadata: Record<string, unknown>,
+): ArtifactCompactionState | undefined {
+  const candidate = metadata[SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY];
+  if (typeof candidate !== "object" || candidate === null) return undefined;
+  const record = candidate as Record<string, unknown>;
+  if (record.version !== 1) return undefined;
+  if (typeof record.snapshotId !== "string" || record.snapshotId.length === 0) {
+    return undefined;
+  }
+  if (typeof record.sessionId !== "string" || record.sessionId.length === 0) {
+    return undefined;
+  }
+  if (!Array.isArray(record.artifactRefs)) {
+    return undefined;
+  }
+  return candidate as ArtifactCompactionState;
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +411,7 @@ export class SessionManager {
         switch (strategy) {
           case "truncate": {
             session.history = history.slice(dropCount);
+            delete session.metadata[SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY];
             result = {
               messagesRemoved: dropCount,
               messagesRetained: keepCount,
@@ -392,77 +423,87 @@ export class SessionManager {
 
           case "sliding-window": {
             const toSummarize = history.slice(0, dropCount);
-            let summaryText: string;
+            let narrativeSummary: string | undefined;
             let summaryGenerated = false;
             let summaryQuality: CompactionResult["summaryQuality"] =
               "not_applicable";
-
             if (this.summarizer) {
-              summaryText = normalizeSummaryText(
+              const candidateSummary = normalizeSummaryText(
                 await this.summarizer(toSummarize),
               );
-              if (hasUsefulSummaryOverlap(summaryText, toSummarize)) {
+              if (hasUsefulSummaryOverlap(candidateSummary, toSummarize)) {
+                narrativeSummary = candidateSummary;
                 summaryGenerated = true;
                 summaryQuality = "accepted";
               } else {
-                summaryText = `[Compacted: ${dropCount} earlier messages removed]`;
                 summaryQuality = "rejected";
               }
-            } else {
-              summaryText = `[Compacted: ${dropCount} earlier messages removed]`;
             }
-
-            const summaryMsg: LLMMessage = {
-              role: "system",
-              content: summaryText,
-            };
-            session.history = [summaryMsg, ...history.slice(dropCount)];
+            const compacted = compactHistoryIntoArtifactContext({
+              sessionId,
+              history,
+              keepTailCount: keepCount,
+              existingState: readArtifactCompactionState(session.metadata),
+              source: "session_compaction",
+              ...(narrativeSummary ? { narrativeSummary } : {}),
+            });
+            session.metadata[SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY] =
+              compacted.state;
+            session.metadata[SESSION_STATEFUL_ARTIFACT_RECORDS_METADATA_KEY] =
+              compacted.records;
+            session.history = [...compacted.compactedHistory];
             result = {
               messagesRemoved: dropCount,
-              messagesRetained: keepCount + 1,
-              summaryGenerated,
+              messagesRetained: compacted.compactedHistory.length,
+              summaryGenerated: summaryGenerated || compacted.state.artifactRefs.length > 0,
               summaryQuality,
-              summaryChars: summaryText.length,
+              summaryChars: compacted.summaryText.length,
+              artifactState: compacted.state,
+              artifactCount: compacted.state.artifactRefs.length,
             };
             break;
           }
 
           case "summarize": {
-            if (!this.summarizer) {
-              // Fall back to truncate
-              session.history = history.slice(dropCount);
-              result = {
-                messagesRemoved: dropCount,
-                messagesRetained: keepCount,
-                summaryGenerated: false,
-                summaryQuality: "not_applicable",
-              };
-              break;
-            }
-
             const toSummarize = history.slice(0, dropCount);
-            const summary = normalizeSummaryText(
-              await this.summarizer(toSummarize),
-            );
-            if (!hasUsefulSummaryOverlap(summary, toSummarize)) {
-              session.history = history.slice(dropCount);
-              result = {
-                messagesRemoved: dropCount,
-                messagesRetained: keepCount,
-                summaryGenerated: false,
-                summaryQuality: "rejected",
-              };
-            } else {
-              const summaryMsg: LLMMessage = { role: "system", content: summary };
-              session.history = [summaryMsg, ...history.slice(dropCount)];
-              result = {
-                messagesRemoved: dropCount,
-                messagesRetained: keepCount + 1,
-                summaryGenerated: true,
-                summaryQuality: "accepted",
-                summaryChars: summary.length,
-              };
+            let narrativeSummary: string | undefined;
+            let summaryGenerated = false;
+            let summaryQuality: CompactionResult["summaryQuality"] =
+              "not_applicable";
+            if (this.summarizer) {
+              const candidateSummary = normalizeSummaryText(
+                await this.summarizer(toSummarize),
+              );
+              if (hasUsefulSummaryOverlap(candidateSummary, toSummarize)) {
+                narrativeSummary = candidateSummary;
+                summaryGenerated = true;
+                summaryQuality = "accepted";
+              } else {
+                summaryQuality = "rejected";
+              }
             }
+            const compacted = compactHistoryIntoArtifactContext({
+              sessionId,
+              history,
+              keepTailCount: keepCount,
+              existingState: readArtifactCompactionState(session.metadata),
+              source: "session_compaction",
+              ...(narrativeSummary ? { narrativeSummary } : {}),
+            });
+            session.metadata[SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY] =
+              compacted.state;
+            session.metadata[SESSION_STATEFUL_ARTIFACT_RECORDS_METADATA_KEY] =
+              compacted.records;
+            session.history = [...compacted.compactedHistory];
+            result = {
+              messagesRemoved: dropCount,
+              messagesRetained: compacted.compactedHistory.length,
+              summaryGenerated: summaryGenerated || compacted.state.artifactRefs.length > 0,
+              summaryQuality,
+              summaryChars: compacted.summaryText.length,
+              artifactState: compacted.state,
+              artifactCount: compacted.state.artifactRefs.length,
+            };
             break;
           }
         }

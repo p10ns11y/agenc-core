@@ -1325,6 +1325,17 @@ function validateApprovalsSection(approvals: unknown, errors: string[]): void {
     errors.push("approvals.enabled must be a boolean");
   }
   if (
+    approvals.mode !== undefined &&
+    approvals.mode !== "safe_local_dev" &&
+    approvals.mode !== "trusted_operator" &&
+    approvals.mode !== "unattended_background" &&
+    approvals.mode !== "benchmark"
+  ) {
+    errors.push(
+      "approvals.mode must be one of safe_local_dev, trusted_operator, unattended_background, benchmark",
+    );
+  }
+  if (
     approvals.gateDesktopAutomation !== undefined &&
     typeof approvals.gateDesktopAutomation !== "boolean"
   ) {

@@ -11,6 +11,7 @@ import type {
   PipelinePlannerContextMemorySource,
   PipelineStopReasonHint,
 } from "../workflow/pipeline.js";
+import type { ContextArtifactRef } from "../memory/artifact-store.js";
 import type { LLMUsage } from "../llm/types.js";
 import type {
   DelegationOutputValidationCode,
@@ -151,6 +152,8 @@ export interface DependencyArtifactCandidate {
   readonly depth: number;
 }
 
+export interface SessionArtifactContextCandidate extends ContextArtifactRef {}
+
 export interface DependencyContextEntry {
   readonly dependencyName: string;
   readonly result: string | null;
@@ -212,6 +215,12 @@ export interface SubagentContextDiagnostics {
     readonly truncated: boolean;
   };
   readonly dependencyArtifacts: {
+    readonly selected: number;
+    readonly available: number;
+    readonly omitted: number;
+    readonly truncated: boolean;
+  };
+  readonly artifactContext: {
     readonly selected: number;
     readonly available: number;
     readonly omitted: number;

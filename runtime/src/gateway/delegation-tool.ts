@@ -7,9 +7,9 @@
  * @module
  */
 
-import { dirname, resolve as resolvePath } from "node:path";
 import type { Tool } from "../tools/types.js";
 import { safeStringify } from "../tools/types.js";
+import type { DelegationExecutionContext } from "../utils/delegation-execution-context.js";
 
 export const EXECUTE_WITH_AGENT_TOOL_NAME = "execute_with_agent";
 
@@ -23,9 +23,15 @@ export interface ExecuteWithAgentInput {
   readonly timeoutMs?: number;
   readonly tools?: readonly string[];
   readonly requiredToolCapabilities?: readonly string[];
-  readonly contextRequirements?: readonly string[];
   readonly inputContract?: string;
   readonly acceptanceCriteria?: readonly string[];
+  readonly executionContext?: DelegationExecutionContext;
+  readonly delegationAdmission?: {
+    readonly shape?: string;
+    readonly isolationReason?: string;
+    readonly ownedArtifacts?: readonly string[];
+    readonly verifierObligations?: readonly string[];
+  };
   readonly spawnDecisionScore?: number;
 }
 
@@ -65,24 +71,118 @@ function toOptionalTimeout(value: unknown): number | undefined {
   return rounded;
 }
 
-const WORKING_DIRECTORY_CONTEXT_REQUIREMENT_RE =
-  /^(?:cwd|working(?:[_ -]?directory))\s*(?:=|:)\s*(.+)$/i;
-const WORKING_DIRECTORY_TEXT_PATTERNS = [
-  /\bchange\s+to\s+(?<path>(?:~\/|\/)\S+)\s+directory\b/i,
-  /\b(?:in|under|within)\s+(?<path>(?:~\/|\/)\S+)\s+(?:directory|workspace|project|repo|repository|monorepo)\b/i,
-  /\b(?:workspace|project|repo|repository|monorepo)(?:\s+(?:root|directory))?\s+(?:at|in|under)\s+(?<path>(?:~\/|\/)\S+)\b/i,
-  /\b(?:create|build|implement|run|work)\b[\s\S]{0,80}\b(?:in|under|within)\s+(?<path>(?:~\/|\/)\S+)\b/i,
-  /\b(?:cwd|working(?:[_ -]?directory))\s*(?:=|:|to)\s*(?<path>(?:~\/|\/)\S+)/i,
-] as const;
-const ABSOLUTE_PATH_TOKEN_RE =
-  /(?<![A-Za-z0-9._~:/-])(?<path>(?:~\/|\/)[^\s"'`<>|()[\]{}:,;]+)/g;
-const FILE_LIKE_BASENAME_RE =
-  /(?:\.[A-Za-z0-9]{1,8}|(?:^|\/)(?:Dockerfile|Makefile|README|LICENSE|CHANGELOG)(?:\.[A-Za-z0-9]+)?)$/i;
-const WORKSPACE_ALIAS_ROOT = "/workspace";
+function toExecutionContext(value: unknown): DelegationExecutionContext | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const workspaceRoot =
+    toNonEmptyString(record.workspaceRoot) ??
+    toNonEmptyString(record.workspace_root);
+  const allowedReadRoots =
+    toTrimmedStringArray(record.allowedReadRoots) ??
+    toTrimmedStringArray(record.allowed_read_roots);
+  const allowedWriteRoots =
+    toTrimmedStringArray(record.allowedWriteRoots) ??
+    toTrimmedStringArray(record.allowed_write_roots);
+  const allowedTools =
+    toTrimmedStringArray(record.allowedTools) ??
+    toTrimmedStringArray(record.allowed_tools);
+  const inputArtifacts =
+    toTrimmedStringArray(record.inputArtifacts) ??
+    toTrimmedStringArray(record.input_artifacts);
+  const requiredSourceArtifacts =
+    toTrimmedStringArray(record.requiredSourceArtifacts) ??
+    toTrimmedStringArray(record.required_source_artifacts);
+  const targetArtifacts =
+    toTrimmedStringArray(record.targetArtifacts) ??
+    toTrimmedStringArray(record.target_artifacts);
+  const effectClass =
+    toNonEmptyString(record.effectClass) ??
+    toNonEmptyString(record.effect_class);
+  const verificationMode =
+    toNonEmptyString(record.verificationMode) ??
+    toNonEmptyString(record.verification_mode);
+  const stepKind =
+    toNonEmptyString(record.stepKind) ??
+    toNonEmptyString(record.step_kind);
+  const fallbackPolicy =
+    toNonEmptyString(record.fallbackPolicy) ??
+    toNonEmptyString(record.fallback_policy);
+  const resumePolicy =
+    toNonEmptyString(record.resumePolicy) ??
+    toNonEmptyString(record.resume_policy);
+  const approvalProfile =
+    toNonEmptyString(record.approvalProfile) ??
+    toNonEmptyString(record.approval_profile);
+
+  if (
+    !workspaceRoot &&
+    !allowedReadRoots &&
+    !allowedWriteRoots &&
+    !allowedTools &&
+    !inputArtifacts &&
+    !requiredSourceArtifacts &&
+    !targetArtifacts &&
+    !effectClass &&
+    !verificationMode &&
+    !stepKind &&
+    !fallbackPolicy &&
+    !resumePolicy &&
+    !approvalProfile
+  ) {
+    return undefined;
+  }
+
+  return {
+    ...(workspaceRoot ? { workspaceRoot } : {}),
+    ...(allowedReadRoots ? { allowedReadRoots } : {}),
+    ...(allowedWriteRoots ? { allowedWriteRoots } : {}),
+    ...(allowedTools ? { allowedTools } : {}),
+    ...(inputArtifacts ? { inputArtifacts } : {}),
+    ...(requiredSourceArtifacts ? { requiredSourceArtifacts } : {}),
+    ...(targetArtifacts ? { targetArtifacts } : {}),
+    ...(effectClass ? { effectClass: effectClass as any } : {}),
+    ...(verificationMode ? { verificationMode: verificationMode as any } : {}),
+    ...(stepKind ? { stepKind: stepKind as any } : {}),
+    ...(fallbackPolicy ? { fallbackPolicy: fallbackPolicy as any } : {}),
+    ...(resumePolicy ? { resumePolicy: resumePolicy as any } : {}),
+    ...(approvalProfile ? { approvalProfile: approvalProfile as any } : {}),
+  };
+}
+
+function toDelegationAdmission(value: unknown): ExecuteWithAgentInput["delegationAdmission"] | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const ownedArtifacts =
+    toTrimmedStringArray(record.ownedArtifacts) ??
+    toTrimmedStringArray(record.owned_artifacts);
+  const verifierObligations =
+    toTrimmedStringArray(record.verifierObligations) ??
+    toTrimmedStringArray(record.verifier_obligations);
+  const shape =
+    toNonEmptyString(record.shape) ??
+    toNonEmptyString(record.delegationShape) ??
+    toNonEmptyString(record.delegation_shape);
+  const isolationReason =
+    toNonEmptyString(record.isolationReason) ??
+    toNonEmptyString(record.isolation_reason);
+  if (!shape && !isolationReason && !ownedArtifacts && !verifierObligations) {
+    return undefined;
+  }
+  return {
+    ...(shape ? { shape } : {}),
+    ...(isolationReason ? { isolationReason } : {}),
+    ...(ownedArtifacts ? { ownedArtifacts } : {}),
+    ...(verifierObligations ? { verifierObligations } : {}),
+  };
+}
 
 export interface DelegatedWorkingDirectoryResolution {
   readonly path: string;
-  readonly source: "context_requirement" | "task_text";
+  readonly source: "execution_envelope";
 }
 
 interface DelegatedWorkingDirectoryInput {
@@ -90,7 +190,7 @@ interface DelegatedWorkingDirectoryInput {
   readonly objective?: string;
   readonly inputContract?: string;
   readonly acceptanceCriteria?: readonly string[];
-  readonly contextRequirements?: readonly string[];
+  readonly executionContext?: DelegationExecutionContext;
 }
 
 function expandHomeDirectory(rawPath: string): string {
@@ -114,117 +214,17 @@ function normalizeDelegatedPathToken(rawPath: string): string {
   return withoutTrailingPunctuation.replace(/\/+$/g, "");
 }
 
-function normalizeDelegatedDirectoryCandidate(rawPath: string): string {
-  const normalizedPath = normalizeDelegatedPathToken(rawPath);
-  if (normalizedPath === "/") return normalizedPath;
-  if (FILE_LIKE_BASENAME_RE.test(normalizedPath)) {
-    return dirname(normalizedPath);
-  }
-  return normalizedPath;
-}
-
-function collectWorkingDirectoryText(input: DelegatedWorkingDirectoryInput): readonly string[] {
-  return [
-    input.task,
-    input.objective,
-    input.inputContract,
-    input.acceptanceCriteria?.join("\n"),
-  ].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
-}
-
-function inferDelegatedWorkingDirectory(
-  input: DelegatedWorkingDirectoryInput,
-): string | undefined {
-  const textSegments = collectWorkingDirectoryText(input);
-  for (const segment of textSegments) {
-    for (const pattern of WORKING_DIRECTORY_TEXT_PATTERNS) {
-      const match = segment.match(pattern);
-      const candidate = match?.groups?.path?.trim();
-      if (candidate) {
-        return normalizeDelegatedDirectoryCandidate(candidate);
-      }
-    }
-  }
-
-  const discovered = new Set<string>();
-  for (const segment of textSegments) {
-    for (const match of segment.matchAll(ABSOLUTE_PATH_TOKEN_RE)) {
-      const candidate = match.groups?.path?.trim();
-      if (!candidate) continue;
-      discovered.add(normalizeDelegatedDirectoryCandidate(candidate));
-    }
-  }
-
-  if (discovered.size === 1) {
-    return [...discovered][0];
-  }
-  return undefined;
-}
-
-export function extractDelegatedWorkingDirectory(
-  contextRequirements?: readonly string[],
-): string | undefined {
-  if (!Array.isArray(contextRequirements)) return undefined;
-  for (const requirement of contextRequirements) {
-    if (typeof requirement !== "string") continue;
-    const match = requirement.match(WORKING_DIRECTORY_CONTEXT_REQUIREMENT_RE);
-    const workingDirectory = match?.[1]?.trim();
-    if (workingDirectory) {
-      return normalizeDelegatedDirectoryCandidate(workingDirectory);
-    }
-  }
-  return undefined;
-}
-
 export function resolveDelegatedWorkingDirectory(
   input: DelegatedWorkingDirectoryInput,
 ): DelegatedWorkingDirectoryResolution | undefined {
-  const explicit = extractDelegatedWorkingDirectory(input.contextRequirements);
-  if (explicit) {
+  const explicitWorkspaceRoot = input.executionContext?.workspaceRoot?.trim();
+  if (explicitWorkspaceRoot) {
     return {
-      path: explicit,
-      source: "context_requirement",
+      path: normalizeDelegatedPathToken(explicitWorkspaceRoot),
+      source: "execution_envelope",
     };
   }
-
-  const inferred = inferDelegatedWorkingDirectory(input);
-  if (!inferred) return undefined;
-  return {
-    path: inferred,
-    source: "task_text",
-  };
-}
-
-export function resolveDelegatedWorkingDirectoryPath(
-  workingDirectory: string,
-  hostWorkspaceRoot?: string,
-): string {
-  const normalizedWorkingDirectory =
-    normalizeDelegatedDirectoryCandidate(workingDirectory);
-  const normalizedHostWorkspaceRoot = hostWorkspaceRoot?.trim().length
-    ? resolvePath(expandHomeDirectory(hostWorkspaceRoot.trim()))
-    : undefined;
-
-  if (
-    !normalizedHostWorkspaceRoot ||
-    normalizedHostWorkspaceRoot === WORKSPACE_ALIAS_ROOT
-  ) {
-    return normalizedWorkingDirectory;
-  }
-
-  if (
-    normalizedWorkingDirectory === WORKSPACE_ALIAS_ROOT ||
-    normalizedWorkingDirectory.startsWith(`${WORKSPACE_ALIAS_ROOT}/`)
-  ) {
-    const relativePath = normalizedWorkingDirectory
-      .slice(WORKSPACE_ALIAS_ROOT.length)
-      .replace(/^\/+/, "");
-    return relativePath.length > 0
-      ? resolvePath(normalizedHostWorkspaceRoot, relativePath)
-      : normalizedHostWorkspaceRoot;
-  }
-
-  return normalizedWorkingDirectory;
+  return undefined;
 }
 
 export function parseExecuteWithAgentInput(
@@ -245,12 +245,12 @@ export function parseExecuteWithAgentInput(
     toTrimmedStringArray(args.requiredToolCapabilities) ??
     toTrimmedStringArray(args.required_tool_capabilities) ??
     toTrimmedStringArray(args.requiredCapabilities);
-  const contextRequirements =
-    toTrimmedStringArray(args.contextRequirements) ??
-    toTrimmedStringArray(args.context_requirements);
   const acceptanceCriteria =
     toTrimmedStringArray(args.acceptanceCriteria) ??
     toTrimmedStringArray(args.acceptance_criteria);
+  const explicitExecutionContext =
+    toExecutionContext(args.executionContext) ??
+    toExecutionContext(args.execution_context);
 
   return {
     ok: true,
@@ -263,11 +263,14 @@ export function parseExecuteWithAgentInput(
       timeoutMs: toOptionalTimeout(args.timeoutMs),
       tools,
       requiredToolCapabilities,
-      contextRequirements,
       inputContract:
         toNonEmptyString(args.inputContract) ??
         toNonEmptyString(args.input_contract),
       acceptanceCriteria,
+      executionContext: explicitExecutionContext,
+      delegationAdmission:
+        toDelegationAdmission(args.delegationAdmission) ??
+        toDelegationAdmission(args.delegation_admission),
       spawnDecisionScore:
         toOptionalScore(args.spawnDecisionScore) ??
         toOptionalScore(args.spawn_decision_score) ??
@@ -310,12 +313,6 @@ export function createExecuteWithAgentTool(): Tool {
           description: "Capability-oriented tool requirements for child execution",
           items: { type: "string" },
         },
-        contextRequirements: {
-          type: "array",
-          description:
-            "Optional scoped context requirements for child execution, such as cwd=/path",
-          items: { type: "string" },
-        },
         timeoutMs: {
           type: "number",
           description: "Optional child timeout in milliseconds (1000-3600000)",
@@ -328,6 +325,80 @@ export function createExecuteWithAgentTool(): Tool {
           type: "array",
           description: "Optional acceptance criteria checklist for the child task",
           items: { type: "string" },
+        },
+        executionContext: {
+          type: "object",
+          description:
+            "Optional structured execution envelope for the child task",
+          properties: {
+            workspaceRoot: {
+              type: "string",
+              description: "Canonical workspace root for the delegated phase",
+            },
+            allowedReadRoots: {
+              type: "array",
+              items: { type: "string" },
+            },
+        allowedWriteRoots: {
+          type: "array",
+          items: { type: "string" },
+        },
+            allowedTools: {
+              type: "array",
+              items: { type: "string" },
+            },
+            inputArtifacts: {
+              type: "array",
+              items: { type: "string" },
+            },
+            requiredSourceArtifacts: {
+              type: "array",
+              items: { type: "string" },
+            },
+            targetArtifacts: {
+              type: "array",
+              items: { type: "string" },
+            },
+            effectClass: {
+              type: "string",
+            },
+            verificationMode: {
+              type: "string",
+            },
+            stepKind: {
+              type: "string",
+            },
+            fallbackPolicy: {
+              type: "string",
+            },
+            resumePolicy: {
+              type: "string",
+            },
+            approvalProfile: {
+              type: "string",
+            },
+          },
+        },
+        delegationAdmission: {
+          type: "object",
+          description:
+            "Optional runtime-owned delegation admission record describing why this child is isolated",
+          properties: {
+            shape: {
+              type: "string",
+            },
+            isolationReason: {
+              type: "string",
+            },
+            ownedArtifacts: {
+              type: "array",
+              items: { type: "string" },
+            },
+            verifierObligations: {
+              type: "array",
+              items: { type: "string" },
+            },
+          },
         },
         spawnDecisionScore: {
           type: "number",

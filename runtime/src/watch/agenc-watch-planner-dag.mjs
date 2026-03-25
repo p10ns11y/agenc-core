@@ -21,6 +21,10 @@ export function planStatusTone(value) {
       return "red";
     case "cancelled":
       return "amber";
+    case "partial":
+      return "amber";
+    case "needs_verification":
+      return "amber";
     case "blocked":
       return "amber";
     default:
@@ -38,6 +42,10 @@ export function planStatusGlyph(value) {
       return "[!]";
     case "cancelled":
       return "[-]";
+    case "partial":
+      return "[~]";
+    case "needs_verification":
+      return "[?]";
     case "blocked":
       return "[?]";
     default:
@@ -63,6 +71,10 @@ export function plannerDagStatusTone(value) {
       return "red";
     case "cancelled":
       return "amber";
+    case "partial":
+      return "amber";
+    case "needs_verification":
+      return "amber";
     case "blocked":
       return "amber";
     default:
@@ -80,6 +92,10 @@ export function plannerDagStatusGlyph(value) {
       return "\u2715";
     case "cancelled":
       return "\u25cc";
+    case "partial":
+      return "\u25d0";
+    case "needs_verification":
+      return "\u25d4";
     case "blocked":
       return "\u25cd";
     default:
@@ -188,6 +204,14 @@ export function recomputePlannerDagStatus(watchState, plannerDagNodes) {
   }
   if (nodes.some((node) => node.status === "failed")) {
     watchState.plannerDagStatus = "failed";
+    return;
+  }
+  if (nodes.some((node) => node.status === "needs_verification")) {
+    watchState.plannerDagStatus = "needs_verification";
+    return;
+  }
+  if (nodes.some((node) => node.status === "partial")) {
+    watchState.plannerDagStatus = "partial";
     return;
   }
   if (nodes.some((node) => node.status === "blocked")) {

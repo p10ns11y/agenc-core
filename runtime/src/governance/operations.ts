@@ -8,7 +8,7 @@
  */
 
 import { PublicKey, SystemProgram } from "@solana/web3.js";
-import { BN, type Program } from "@coral-xyz/anchor";
+import anchor, { type Program } from "@coral-xyz/anchor";
 import type { AgencCoordination } from "../types/agenc_coordination.js";
 import type { Logger } from "../utils/logger.js";
 import { silentLogger } from "../utils/logger.js";
@@ -201,11 +201,11 @@ export class GovernanceOperations {
 
     const signature = await (this.program.methods as any)
       .initializeGovernance(
-        new BN(params.votingPeriod),
-        new BN(params.executionDelay),
+        new anchor.BN(params.votingPeriod),
+        new anchor.BN(params.executionDelay),
         params.quorumBps,
         params.approvalThresholdBps,
-        new BN(params.minProposalStake),
+        new anchor.BN(params.minProposalStake),
       )
       .accountsPartial({
         governanceConfig: this.governanceConfigPda,
@@ -236,12 +236,12 @@ export class GovernanceOperations {
 
     const signature = await (this.program.methods as any)
       .createProposal(
-        new BN(params.nonce.toString()),
+        new anchor.BN(params.nonce.toString()),
         params.proposalType,
         Array.from(params.titleHash),
         Array.from(params.descriptionHash),
         Array.from(payload),
-        new BN(params.votingPeriod),
+        new anchor.BN(params.votingPeriod),
       )
       .accountsPartial({
         proposal: proposalPda,

@@ -15,7 +15,11 @@ describe("subrun-contract", () => {
         role: "worker",
         scope: {
           allowedTools: ["system.processStatus", "system.httpGet"],
+          workspaceRoot: "/tmp/agenc-shell",
+          allowedReadRoots: ["/tmp/agenc-shell"],
           allowedWriteRoots: ["/tmp"],
+          requiredSourceArtifacts: ["/tmp/agenc-shell/PLAN.md"],
+          targetArtifacts: ["/tmp/agenc-shell/AGENC.md"],
           allowedHosts: ["example.com"],
         },
         artifactContract: {
@@ -63,6 +67,19 @@ describe("subrun-contract", () => {
         childRunIds: [],
       }),
     ).toThrow(/depth/i);
+
+    expect(() =>
+      assertValidDurableSubrunSpec({
+        objective: "bad scope",
+        role: "worker",
+        scope: {
+          allowedTools: ["system.processStatus"],
+          requiredSourceArtifacts: [""],
+        },
+        artifactContract: { requiredKinds: [] },
+        budget: { maxRuntimeMs: 1_000 },
+      }),
+    ).toThrow(/requiredSourceArtifacts/i);
   });
 
   it("checks artifact contract satisfaction and nested budget totals", () => {

@@ -11,7 +11,13 @@ This document is the production rollout contract for AgenC's durable autonomy ru
 - Stop latency: mean stop latency must stay under `2000ms`.
 - Event loss rate: replay inconsistency rate must stay at `0`.
 
-Release automation enforces these targets with `npm --prefix runtime run autonomy:rollout:gates`.
+Release automation enforces these targets through the required runtime validation lane:
+
+- local/root command: `npm run validate:runtime`
+- runtime gate inside that lane: `npm --prefix runtime run autonomy:rollout:gates`
+- checked-in CI inputs: `runtime/benchmarks/autonomy-gateway.ci.json` and `docs/autonomy-runtime-rollout.manifest.json`
+- rollout evidence produced in-lane: delegation and background-run benchmark artifacts under `runtime/benchmarks/artifacts/`
+- required PR workflows: `Package Pack Smoke` and `Private Kernel Registry Validation`
 
 ## Feature Flags and Kill Switches
 

@@ -114,6 +114,7 @@ function createDelegationSummary(
     delegatedCases: 8,
     usefulDelegations: 6,
     harmfulDelegations: 1,
+    unnecessaryDelegations: 2,
     plannerExecutionMismatches: 0,
     childTimeouts: 0,
     childFailures: 0,

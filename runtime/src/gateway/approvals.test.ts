@@ -8,6 +8,7 @@ import {
   DEFAULT_DESKTOP_APPROVAL_RULES,
   DEFAULT_APPROVAL_RULES,
 } from './approvals.js';
+import { createEffectApprovalPolicy } from './effect-approval-policy.js';
 import { buildMCPApprovalRules } from '../policy/mcp-governance.js';
 import type {
   ApprovalRule,
@@ -262,6 +263,130 @@ describe('ApprovalEngine', () => {
       expect(eng.requiresApproval('wallet.transfer', { amount: 0.5, to: 'enemy123' })).toBeNull();
       // Neither passes
       expect(eng.requiresApproval('wallet.transfer', { amount: 0.5, to: 'friend1' })).toBeNull();
+    });
+
+    it("uses effect-centric policy to require approval for shell in safe local dev mode", () => {
+      const eng = new ApprovalEngine({
+        effectPolicy: createEffectApprovalPolicy({
+          mode: "safe_local_dev",
+          workspaceRoot: "/tmp/workspace",
+        }),
+        generateId: () => "x",
+      });
+
+      const decision = eng.simulate(
+        "system.bash",
+        { command: "git status" },
+        "sess-1",
+        {
+          effect: {
+            effectId: "effect-1",
+            idempotencyKey: "idem-1",
+            effectClass: "shell",
+            effectKind: "shell_command",
+            targets: ["/tmp/workspace"],
+          },
+        },
+      );
+
+      expect(decision.required).toBe(true);
+      expect(decision.reasonCode).toBe("shell_read_only");
+      expect(decision.decisionSource).toBe("effect_policy");
+    });
+
+    it("keeps read-only file flows ergonomic under the effect policy", () => {
+      const eng = new ApprovalEngine({
+        effectPolicy: createEffectApprovalPolicy({
+          mode: "safe_local_dev",
+          workspaceRoot: "/tmp/workspace",
+        }),
+        generateId: () => "x",
+      });
+
+      const decision = eng.simulate(
+        "system.readFile",
+        { path: "/tmp/workspace/README.md" },
+        "sess-1",
+      );
+
+      expect(decision.required).toBe(false);
+      expect(decision.denied).toBe(false);
+      expect(decision.reasonCode).toBe("read_only_effect");
+    });
+
+    it("scopes always-approve elevation to the effect risk class instead of the tool name", async () => {
+      let idSeq = 0;
+      const eng = new ApprovalEngine({
+        effectPolicy: createEffectApprovalPolicy({
+          mode: "safe_local_dev",
+          workspaceRoot: "/tmp/workspace",
+        }),
+        timeoutMs: 1000,
+        generateId: () => `req-${++idSeq}`,
+      });
+
+      const initial = eng.simulate(
+        "system.bash",
+        { command: "git status" },
+        "sess-1",
+        {
+          effect: {
+            effectId: "effect-1",
+            idempotencyKey: "idem-1",
+            effectClass: "shell",
+            effectKind: "shell_command",
+            targets: ["/tmp/workspace"],
+          },
+        },
+      );
+
+      expect(initial.required).toBe(true);
+
+      const request = eng.createRequest(
+        "system.bash",
+        { command: "git status" },
+        "sess-1",
+        initial.requestPreview!.message,
+        initial.rule!,
+        {
+          effect: {
+            effectId: "effect-1",
+            idempotencyKey: "idem-1",
+            effectClass: "shell",
+            effectKind: "shell_command",
+            targets: ["/tmp/workspace"],
+          },
+          approvalScopeKey: initial.approvalScopeKey,
+          reasonCode: initial.reasonCode,
+          decisionSource: initial.decisionSource,
+        },
+      );
+
+      const approvalPromise = eng.requestApproval(request);
+      void eng.resolve(request.id, {
+        requestId: request.id,
+        disposition: "always",
+      });
+      await approvalPromise;
+
+      const followup = eng.simulate(
+        "system.bash",
+        { command: "rm -rf src" },
+        "sess-1",
+        {
+          effect: {
+            effectId: "effect-2",
+            idempotencyKey: "idem-2",
+            effectClass: "shell",
+            effectKind: "shell_command",
+            targets: ["/tmp/workspace/src"],
+          },
+        },
+      );
+
+      expect(followup.required).toBe(true);
+      expect(followup.elevated).toBe(false);
+      expect(followup.reasonCode).toBe("shell_mutation");
     });
   });
 

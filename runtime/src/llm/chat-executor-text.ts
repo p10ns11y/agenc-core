@@ -15,6 +15,7 @@ import type {
   PromptBudgetSection,
 } from "./prompt-budget.js";
 import type { ToolCallRecord, ChatPromptShape } from "./chat-executor-types.js";
+import type { WorkflowCompletionState } from "../workflow/completion-state.js";
 import {
   MAX_FINAL_RESPONSE_CHARS,
   REPETITIVE_LINE_MIN_COUNT,
@@ -614,6 +615,105 @@ export function reconcileTerminalFailureContent(params: {
   }
 
   return `${fallback}\n\nPartial response before failure:\n${truncateText(trimmed, 600)}`;
+}
+
+const FALSE_SUCCESS_SIGNAL_RE =
+  /\b(?:implemented|implementation complete|fully functional|matches the spec|done|finished|complete(?:d)?|success(?:fully)?)\b/i;
+const HONEST_PARTIAL_SIGNAL_RE =
+  /\b(?:partial|partially|incomplete|unfinished|not fully implemented|remaining work)\b/i;
+const HONEST_VERIFICATION_SIGNAL_RE =
+  /\b(?:needs verification|requires verification|verification (?:pending|required)|not yet verified)\b/i;
+
+export function reconcileTerminalCompletionStateContent(params: {
+  content: string;
+  completionState: WorkflowCompletionState;
+  stopReason: string;
+  stopReasonDetail?: string;
+  toolCalls: readonly ToolCallRecord[];
+}): string {
+  const {
+    content,
+    completionState,
+    stopReason,
+    stopReasonDetail,
+    toolCalls,
+  } = params;
+  if (completionState === "completed") {
+    return content;
+  }
+  if (completionState === "blocked") {
+    return reconcileTerminalFailureContent({
+      content,
+      stopReason,
+      stopReasonDetail,
+      toolCalls,
+    });
+  }
+
+  const fallback = buildTerminalCompletionStateFallback({
+    completionState,
+    stopReason,
+    stopReasonDetail,
+    toolCalls,
+  });
+  const trimmed = content.trim();
+  if (trimmed.length === 0) {
+    return fallback;
+  }
+  if (
+    isLowInformationCompletion(trimmed) ||
+    looksLikeExecutionPlan(trimmed) ||
+    isContradictoryCompletionStateCopy(trimmed, completionState)
+  ) {
+    return fallback;
+  }
+  return `${fallback}\n\nCurrent agent summary:\n${truncateText(trimmed, 600)}`;
+}
+
+function buildTerminalCompletionStateFallback(params: {
+  completionState: Exclude<WorkflowCompletionState, "completed" | "blocked">;
+  stopReason: string;
+  stopReasonDetail?: string;
+  toolCalls: readonly ToolCallRecord[];
+}): string {
+  const lines: string[] = [];
+  if (params.completionState === "partial") {
+    lines.push("Execution made partial progress but did not finish the requested work.");
+  } else {
+    lines.push("Execution produced changes, but completion still needs verification before it can be marked done.");
+  }
+  if (typeof params.stopReasonDetail === "string" && params.stopReasonDetail.trim()) {
+    lines.push(params.stopReasonDetail.trim());
+  } else if (params.stopReason !== "completed") {
+    lines.push(`Stop reason: ${params.stopReason.replace(/_/g, " ")}.`);
+  }
+  const successfulCalls = params.toolCalls.filter((toolCall) =>
+    !didToolCallFail(toolCall.isError, toolCall.result),
+  );
+  if (successfulCalls.length > 0) {
+    lines.push(
+      `Grounded work recorded: ${summarizeToolCalls(successfulCalls).trim()}`,
+    );
+  }
+  return lines.join("\n\n");
+}
+
+function isContradictoryCompletionStateCopy(
+  content: string,
+  completionState: Exclude<WorkflowCompletionState, "completed" | "blocked">,
+): boolean {
+  if (FALSE_SUCCESS_SIGNAL_RE.test(content)) {
+    if (completionState === "partial" && !HONEST_PARTIAL_SIGNAL_RE.test(content)) {
+      return true;
+    }
+    if (
+      completionState === "needs_verification" &&
+      !HONEST_VERIFICATION_SIGNAL_RE.test(content)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 const EXPLICIT_FAILURE_SIGNAL_RE =

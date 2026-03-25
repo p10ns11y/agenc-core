@@ -20,6 +20,10 @@ import type {
   BackgroundRunWatchRegistration,
 } from "./background-run-store.js";
 import type { PolicyEvaluationScope } from "../policy/types.js";
+import type {
+  WorkflowProgressRequirement,
+  WorkflowProgressSnapshot,
+} from "../workflow/completion-progress.js";
 
 export interface BackgroundRunEventRecord {
   readonly summary: string;
@@ -76,6 +80,8 @@ export interface BackgroundRunOperatorSummary {
   readonly lastWakeReason?: BackgroundRunWakeReason;
   readonly carryForwardSummary?: string;
   readonly blockerSummary?: string;
+  readonly completionState?: WorkflowProgressSnapshot["completionState"];
+  readonly remainingRequirements?: readonly WorkflowProgressRequirement[];
   readonly approvalRequired: boolean;
   readonly approvalState: BackgroundRunApprovalState["status"];
   readonly preferredWorkerId?: string;
@@ -96,6 +102,7 @@ export interface BackgroundRunOperatorDetail
   readonly observedTargets: readonly BackgroundRunObservedTarget[];
   readonly watchRegistrations: readonly BackgroundRunWatchRegistration[];
   readonly recentEvents: readonly BackgroundRunEventRecord[];
+  readonly completionProgress?: WorkflowProgressSnapshot;
 }
 
 export type BackgroundRunVerificationOverrideMode =

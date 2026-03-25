@@ -74,4 +74,49 @@ describe('mutation regression integration', () => {
       expect(dryOutput).toContain('Mutation regression gates: FAIL');
     }
   });
+
+  it('supports checked-in mutation gate policy manifests via CLI', async () => {
+    const manifestPath = fileURLToPath(new URL('../benchmarks/v1/manifest.json', import.meta.url));
+    const artifact = await new MutationRunner({
+      now: () => 1700000000700,
+      runId: 'mutation-corpus-policy',
+    }).runFromFile(manifestPath, { mutationSeed: 13 });
+
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'agenc-mutation-policy-'));
+    const artifactPath = path.join(tempDir, 'mutation-artifact.json');
+    const policyPath = path.join(tempDir, 'mutation-policy.json');
+    await writeFile(artifactPath, `${serializeMutationArtifact(artifact)}\n`, 'utf8');
+    await writeFile(
+      policyPath,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        name: 'ci-policy',
+        updatedAt: '2026-03-25T00:00:00Z',
+        thresholds: {
+          maxAggregatePassRateDrop: 0.6,
+          maxAggregateConformanceDrop: 0.4,
+          maxAggregateCostUtilityDrop: 0.45,
+          maxScenarioPassRateDrop: 1.0,
+          maxOperatorPassRateDrop: 0.6,
+          maxChaosScenarioFailRate: 0.0,
+        },
+      })}\n`,
+      'utf8',
+    );
+
+    const scriptPath = fileURLToPath(new URL('../scripts/check-mutation-gates.ts', import.meta.url));
+    const run = await runCommand(
+      process.execPath,
+      ['--import', 'tsx', scriptPath, '--artifact', artifactPath, '--policy', policyPath],
+      {
+        cwd: path.resolve(fileURLToPath(new URL('..', import.meta.url))),
+      },
+    );
+
+    expect(run.exitCode).toBe(0);
+    const output = `${run.stdout}\n${run.stderr}`.trim();
+    if (output.length > 0) {
+      expect(output).toContain('Mutation regression gates: PASS');
+    }
+  });
 });

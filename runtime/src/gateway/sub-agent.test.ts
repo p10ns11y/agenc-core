@@ -755,6 +755,16 @@ describe("SubAgentManager", () => {
           durationMs: 1,
           compacted: false,
           stopReason: "completed",
+          completionState: "completed",
+          completionProgress: {
+            completionState: "completed",
+            stopReason: "completed",
+            requiredRequirements: [],
+            satisfiedRequirements: [],
+            remainingRequirements: [],
+            reusableEvidence: [],
+            updatedAt: 1_700_000_000_000,
+          },
         });
 
       try {
@@ -843,7 +853,8 @@ describe("SubAgentManager", () => {
     it("enforces successful tool-call evidence when the sub-agent phase requires tools", async () => {
       const executeSpy = vi.spyOn(ChatExecutor.prototype, "execute")
         .mockResolvedValueOnce({
-          content: "Completed from memory",
+          content:
+            "Sub-agent did not reach a completed workflow state (blocked). child reported no tool calls.",
           provider: "mock",
           model: "mock",
           usedFallback: false,
@@ -856,7 +867,19 @@ describe("SubAgentManager", () => {
           callUsage: [],
           durationMs: 1,
           compacted: false,
-          stopReason: "completed",
+          stopReason: "validation_error",
+          stopReasonDetail: "child reported no tool calls.",
+          validationCode: "missing_successful_tool_evidence",
+          completionState: "blocked",
+          completionProgress: {
+            completionState: "blocked",
+            stopReason: "validation_error",
+            requiredRequirements: ["successful_tool_evidence"],
+            satisfiedRequirements: [],
+            remainingRequirements: ["successful_tool_evidence"],
+            reusableEvidence: [],
+            updatedAt: 1_700_000_000_000,
+          },
         });
 
       try {
@@ -885,6 +908,7 @@ describe("SubAgentManager", () => {
           expect.objectContaining({
             requiredToolEvidence: expect.objectContaining({
               maxCorrectionAttempts: 1,
+              unsafeBenchmarkMode: false,
               delegationSpec,
             }),
           }),
@@ -894,10 +918,86 @@ describe("SubAgentManager", () => {
       }
     });
 
+    it("preserves child completion progress and refuses completion when the workflow state needs verification", async () => {
+      const executeSpy = vi.spyOn(ChatExecutor.prototype, "execute")
+        .mockResolvedValueOnce({
+          content: "Implemented the requested file updates.",
+          provider: "mock",
+          model: "mock",
+          usedFallback: false,
+          toolCalls: [{
+            name: "system.writeFile",
+            args: { path: "/tmp/project/src/parser.ts", content: "export {};\n" },
+            result: '{"ok":true}',
+            isError: false,
+            durationMs: 1,
+          }],
+          tokenUsage: {
+            promptTokens: 10,
+            completionTokens: 5,
+            totalTokens: 15,
+          },
+          callUsage: [],
+          durationMs: 1,
+          compacted: false,
+          stopReason: "completed",
+          completionState: "needs_verification",
+          completionProgress: {
+            completionState: "needs_verification",
+            stopReason: "completed",
+            requiredRequirements: ["workflow_verifier_pass", "build_verification"],
+            satisfiedRequirements: [],
+            remainingRequirements: ["workflow_verifier_pass", "build_verification"],
+            reusableEvidence: [],
+            updatedAt: 1_700_000_000_000,
+          },
+        });
+
+      try {
+        const manager = new SubAgentManager(makeManagerConfig());
+        const sessionId = await manager.spawn({
+          parentSessionId: "p",
+          task: "Implement parser",
+          requireToolCall: true,
+          delegationSpec: {
+            objective: "Implement parser",
+            inputContract: "Return the delegated completion summary",
+            acceptanceCriteria: ["Parser implementation is verified"],
+            executionContext: {
+              version: "v1",
+              workspaceRoot: "/tmp/project",
+              allowedReadRoots: ["/tmp/project"],
+              allowedWriteRoots: ["/tmp/project"],
+              targetArtifacts: ["/tmp/project/src/parser.ts"],
+              effectClass: "filesystem_write",
+              verificationMode: "mutation_required",
+              stepKind: "delegated_write",
+            },
+          },
+        });
+        await settle();
+
+        const result = manager.getResult(sessionId);
+        const info = manager.getInfo(sessionId);
+        expect(result).not.toBeNull();
+        expect(result!.success).toBe(false);
+        expect(result!.completionState).toBe("needs_verification");
+        expect(result!.completionProgress?.remainingRequirements).toEqual([
+          "workflow_verifier_pass",
+          "build_verification",
+        ]);
+        expect(result!.stopReason).toBe("completed");
+        expect(info?.status).toBe("failed");
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
     it("preserves delegated validation codes for low-signal browser evidence", async () => {
       const executeSpy = vi.spyOn(ChatExecutor.prototype, "execute")
         .mockResolvedValueOnce({
-          content: "Heat Signature, Gunpoint, Monaco.",
+          content:
+            "Sub-agent did not reach a completed workflow state (blocked). Missing browser-grounded evidence for the cited references.",
           provider: "mock",
           model: "mock",
           usedFallback: false,
@@ -916,7 +1016,20 @@ describe("SubAgentManager", () => {
           callUsage: [],
           durationMs: 1,
           compacted: false,
-          stopReason: "completed",
+          stopReason: "validation_error",
+          stopReasonDetail:
+            "Missing browser-grounded evidence for the cited references.",
+          validationCode: "low_signal_browser_evidence",
+          completionState: "blocked",
+          completionProgress: {
+            completionState: "blocked",
+            stopReason: "validation_error",
+            requiredRequirements: ["browser_grounding"],
+            satisfiedRequirements: [],
+            remainingRequirements: ["browser_grounding"],
+            reusableEvidence: [],
+            updatedAt: 1_700_000_000_000,
+          },
         });
 
       try {
@@ -954,7 +1067,7 @@ describe("SubAgentManager", () => {
       const executeSpy = vi.spyOn(ChatExecutor.prototype, "execute")
         .mockResolvedValueOnce({
           content:
-            "**Phase scaffold_manifests completed.** Authored manifests and ran npm install to confirm the links work.",
+            "Sub-agent did not reach a completed workflow state (blocked). dependency-install commands were executed during a scaffold-only phase.",
           provider: "mock",
           model: "mock",
           usedFallback: false,
@@ -976,7 +1089,22 @@ describe("SubAgentManager", () => {
           callUsage: [],
           durationMs: 1,
           compacted: false,
-          stopReason: "completed",
+          stopReason: "validation_error",
+          stopReasonDetail:
+            "dependency-install commands were executed during a scaffold-only phase.",
+          validationCode: "forbidden_phase_action",
+          completionState: "blocked",
+          completionProgress: {
+            completionState: "blocked",
+            stopReason: "validation_error",
+            requiredRequirements: [],
+            satisfiedRequirements: [],
+            remainingRequirements: [
+              "No install/build/test commands executed or claimed",
+            ],
+            reusableEvidence: [],
+            updatedAt: 1_700_000_000_000,
+          },
         });
 
       try {
@@ -1037,6 +1165,16 @@ describe("SubAgentManager", () => {
           durationMs: 1,
           compacted: false,
           stopReason: "completed",
+          completionState: "completed",
+          completionProgress: {
+            completionState: "completed",
+            stopReason: "completed",
+            requiredRequirements: [],
+            satisfiedRequirements: [],
+            remainingRequirements: [],
+            reusableEvidence: [],
+            updatedAt: 1_700_000_000_000,
+          },
         });
 
       try {
@@ -1070,6 +1208,82 @@ describe("SubAgentManager", () => {
           expect.objectContaining({
             requiredToolEvidence: expect.objectContaining({
               maxCorrectionAttempts: 1,
+              unsafeBenchmarkMode: true,
+              delegationSpec,
+            }),
+          }),
+        );
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("still passes the delegated contract into child execution when tool calls are optional", async () => {
+      const executeSpy = vi.spyOn(ChatExecutor.prototype, "execute")
+        .mockResolvedValueOnce({
+          content:
+            "Sub-agent did not reach a completed workflow state (blocked). Missing file mutation evidence for /tmp/project/src/parser.ts.",
+          provider: "mock",
+          model: "mock",
+          usedFallback: false,
+          toolCalls: [],
+          tokenUsage: {
+            promptTokens: 10,
+            completionTokens: 5,
+            totalTokens: 15,
+          },
+          callUsage: [],
+          durationMs: 1,
+          compacted: false,
+          stopReason: "validation_error",
+          stopReasonDetail:
+            "Missing file mutation evidence for /tmp/project/src/parser.ts.",
+          validationCode: "missing_file_mutation_evidence",
+          completionState: "blocked",
+          completionProgress: {
+            completionState: "blocked",
+            stopReason: "validation_error",
+            requiredRequirements: ["mutation_evidence"],
+            satisfiedRequirements: [],
+            remainingRequirements: ["mutation_evidence"],
+            reusableEvidence: [],
+            updatedAt: 1_700_000_000_000,
+          },
+        });
+
+      try {
+        const manager = new SubAgentManager(makeManagerConfig());
+        const delegationSpec = {
+          objective: "Summarize the coupled implementation result",
+          inputContract: "Return the delegated completion summary",
+          acceptanceCriteria: ["Describe the completed work accurately"],
+          executionContext: {
+            version: "v1",
+            workspaceRoot: "/tmp/project",
+            allowedReadRoots: ["/tmp/project"],
+            allowedWriteRoots: ["/tmp/project"],
+            targetArtifacts: ["/tmp/project/src/parser.ts"],
+            effectClass: "filesystem_write",
+            verificationMode: "mutation_required",
+            stepKind: "delegated_write",
+          },
+        } as const;
+        const sessionId = await manager.spawn({
+          parentSessionId: "p",
+          task: "a",
+          requireToolCall: false,
+          delegationSpec,
+        });
+        await settle();
+
+        const result = manager.getResult(sessionId);
+        expect(result).not.toBeNull();
+        expect(result!.success).toBe(false);
+        expect(result!.stopReason).toBe("validation_error");
+        expect(executeSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            requiredToolEvidence: expect.objectContaining({
+              maxCorrectionAttempts: 0,
               delegationSpec,
             }),
           }),
@@ -1126,6 +1340,16 @@ describe("SubAgentManager", () => {
           durationMs: 1,
           compacted: false,
           stopReason: "completed",
+          completionState: "completed",
+          completionProgress: {
+            completionState: "completed",
+            stopReason: "completed",
+            requiredRequirements: [],
+            satisfiedRequirements: [],
+            remainingRequirements: [],
+            reusableEvidence: [],
+            updatedAt: 1_700_000_000_000,
+          },
         });
 
       try {
@@ -1770,6 +1994,16 @@ describe("SubAgentManager", () => {
           durationMs: 10,
           compacted: false,
           stopReason: "completed",
+          completionState: "completed",
+          completionProgress: {
+            completionState: "completed",
+            stopReason: "completed",
+            requiredRequirements: [],
+            satisfiedRequirements: [],
+            remainingRequirements: [],
+            reusableEvidence: [],
+            updatedAt: 1_700_000_000_000,
+          },
         } as any)
         .mockResolvedValueOnce({
           content: "TOKEN=NEON-AXIS-17",
@@ -1781,6 +2015,16 @@ describe("SubAgentManager", () => {
           durationMs: 12,
           compacted: false,
           stopReason: "completed",
+          completionState: "completed",
+          completionProgress: {
+            completionState: "completed",
+            stopReason: "completed",
+            requiredRequirements: [],
+            satisfiedRequirements: [],
+            remainingRequirements: [],
+            reusableEvidence: [],
+            updatedAt: 1_700_000_000_001,
+          },
         } as any);
       const manager = new SubAgentManager(makeManagerConfig());
 

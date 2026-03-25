@@ -20,7 +20,6 @@ import type {
   BackgroundRunControlAction,
   BackgroundRunOperatorErrorPayload,
 } from '../../gateway/background-run-operator.js';
-import type { ObservabilitySummary } from '../../observability/types.js';
 import { createProgram, createReadOnlyProgram } from '../../idl.js';
 import {
   buildMarketplaceReputationSummaryForAgent,
@@ -84,7 +83,6 @@ const SOLANA_NOT_CONFIGURED =
   'On-chain task operations require Solana connection — configure connection.rpcUrl in config';
 const DESKTOP_MEMORY_LIMIT_RE = /^\d+(?:[bkmg])?$/i;
 const DESKTOP_CPU_LIMIT_RE = /^(?:\d+(?:\.\d+)?|\.\d+)$/;
-const DEFAULT_OBSERVABILITY_WINDOW_MS = 86_400_000;
 
 function parseDesktopResourceOverride(
   value: unknown,
@@ -245,46 +243,6 @@ function parseToolError(result: { content: string; isError?: boolean }): string 
   } catch {
     return result.content;
   }
-}
-
-function emptyObservabilitySummary(windowMs: number): ObservabilitySummary {
-  return {
-    windowMs,
-    traces: {
-      total: 0,
-      completed: 0,
-      errors: 0,
-      open: 0,
-      completenessRate: 1,
-    },
-    events: {
-      providerErrors: 0,
-      toolRejections: 0,
-      routeMisses: 0,
-      completionGateFailures: 0,
-    },
-    topTools: [],
-    topStopReasons: [],
-  };
-}
-
-function listScopedObservabilitySessionIds(
-  request: HandlerRequestContext,
-): readonly string[];
-function listScopedObservabilitySessionIds(
-  request: HandlerRequestContext,
-  requestedSessionId: string | undefined,
-): readonly string[] | 'unauthorized';
-function listScopedObservabilitySessionIds(
-  request: HandlerRequestContext,
-  requestedSessionId?: string,
-): readonly string[] | 'unauthorized' {
-  if (requestedSessionId) {
-    return request.isSessionOwned(requestedSessionId)
-      ? [requestedSessionId]
-      : 'unauthorized';
-  }
-  return [...new Set(request.listOwnedSessionIds())];
 }
 
 // ============================================================================
@@ -1840,7 +1798,7 @@ export async function handleObservabilitySummary(
   payload: Record<string, unknown> | undefined,
   id: string | undefined,
   send: SendFn,
-  request: HandlerRequestContext,
+  _request: HandlerRequestContext,
 ): Promise<void> {
   if (!deps.getObservabilitySummary) {
     send({ type: 'error', error: 'Observability API not available', id });
@@ -1850,19 +1808,9 @@ export async function handleObservabilitySummary(
     typeof payload?.windowMs === 'number' && Number.isFinite(payload.windowMs)
       ? payload.windowMs
       : undefined;
-  const scopedSessionIds = listScopedObservabilitySessionIds(request);
-  if (scopedSessionIds.length === 0) {
-    send({
-      type: 'observability.summary',
-      payload: emptyObservabilitySummary(windowMs ?? DEFAULT_OBSERVABILITY_WINDOW_MS),
-      id,
-    });
-    return;
-  }
   await safeAsync(send, id, 'error', 'Failed to load observability summary', async () => {
     const summary = await deps.getObservabilitySummary!({
       windowMs,
-      sessionIds: scopedSessionIds,
     });
     if (!summary) {
       send({ type: 'error', error: 'Observability summary unavailable', id });
@@ -1877,7 +1825,7 @@ export async function handleObservabilityTraces(
   payload: Record<string, unknown> | undefined,
   id: string | undefined,
   send: SendFn,
-  request: HandlerRequestContext,
+  _request: HandlerRequestContext,
 ): Promise<void> {
   if (!deps.listObservabilityTraces) {
     send({ type: 'error', error: 'Observability API not available', id });
@@ -1887,15 +1835,6 @@ export async function handleObservabilityTraces(
     typeof payload?.sessionId === 'string' && payload.sessionId.length > 0
       ? payload.sessionId
       : undefined;
-  const scopedSessionIds = listScopedObservabilitySessionIds(request, sessionId);
-  if (scopedSessionIds === 'unauthorized') {
-    send({ type: 'error', error: 'Not authorized for target session trace data', id });
-    return;
-  }
-  if (scopedSessionIds.length === 0) {
-    send({ type: 'observability.traces', payload: [], id });
-    return;
-  }
   await safeAsync(send, id, 'error', 'Failed to list observability traces', async () => {
     const traces = await deps.listObservabilityTraces!({
       limit:
@@ -1915,7 +1854,6 @@ export async function handleObservabilityTraces(
           ? payload.status
           : undefined,
       sessionId,
-      sessionIds: scopedSessionIds,
     });
     send({ type: 'observability.traces', payload: traces ?? [], id });
   });
@@ -1926,7 +1864,7 @@ export async function handleObservabilityTrace(
   payload: Record<string, unknown> | undefined,
   id: string | undefined,
   send: SendFn,
-  request: HandlerRequestContext,
+  _request: HandlerRequestContext,
 ): Promise<void> {
   if (!deps.getObservabilityTrace) {
     send({ type: 'error', error: 'Observability API not available', id });
@@ -1943,13 +1881,6 @@ export async function handleObservabilityTrace(
       send({ type: 'error', error: `Observability trace "${traceId}" not found`, id });
       return;
     }
-    if (
-      detail.summary.sessionId &&
-      !request.isSessionOwned(detail.summary.sessionId)
-    ) {
-      send({ type: 'error', error: 'Not authorized for target session trace data', id });
-      return;
-    }
     send({ type: 'observability.trace', payload: detail, id });
   });
 }
@@ -1959,7 +1890,7 @@ export async function handleObservabilityArtifact(
   payload: Record<string, unknown> | undefined,
   id: string | undefined,
   send: SendFn,
-  request: HandlerRequestContext,
+  _request: HandlerRequestContext,
 ): Promise<void> {
   if (!deps.getObservabilityArtifact || !deps.getObservabilityTrace) {
     send({ type: 'error', error: 'Observability API not available', id });
@@ -1975,13 +1906,6 @@ export async function handleObservabilityArtifact(
     const detail = await deps.getObservabilityTrace!(traceId);
     if (!detail) {
       send({ type: 'error', error: `Observability trace "${traceId}" not found`, id });
-      return;
-    }
-    if (
-      detail.summary.sessionId &&
-      !request.isSessionOwned(detail.summary.sessionId)
-    ) {
-      send({ type: 'error', error: 'Not authorized for target session trace data', id });
       return;
     }
     const allowed = detail.events.some((event) => event.artifact?.path === path);
@@ -2003,7 +1927,7 @@ export async function handleObservabilityLogs(
   payload: Record<string, unknown> | undefined,
   id: string | undefined,
   send: SendFn,
-  request: HandlerRequestContext,
+  _request: HandlerRequestContext,
 ): Promise<void> {
   if (!deps.getObservabilityLogTail || !deps.getObservabilityTrace) {
     send({ type: 'error', error: 'Observability API not available', id });
@@ -2017,13 +1941,6 @@ export async function handleObservabilityLogs(
   const detail = await deps.getObservabilityTrace(traceId);
   if (!detail) {
     send({ type: 'error', error: `Observability trace "${traceId}" not found`, id });
-    return;
-  }
-  if (
-    detail.summary.sessionId &&
-    !request.isSessionOwned(detail.summary.sessionId)
-  ) {
-    send({ type: 'error', error: 'Not authorized for target session trace data', id });
     return;
   }
   await safeAsync(send, id, 'error', 'Failed to read daemon logs', async () => {

@@ -1,20 +1,47 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, vi } from "vitest";
 import type { ControlResponse } from "./types.js";
 import type { ApprovalEngine } from "./approvals.js";
 import { ApprovalEngine as ApprovalEngineImpl } from "./approvals.js";
+import { createEffectApprovalPolicy } from "./effect-approval-policy.js";
 import {
   DelegationPolicyEngine,
   SubAgentLifecycleEmitter,
 } from "./delegation-runtime.js";
+import type { SubAgentResult } from "./sub-agent.js";
 import { createSessionToolHandler } from "./tool-handler-factory.js";
 import { SessionCredentialBroker } from "../policy/session-credentials.js";
 import { SESSION_ALLOWED_ROOTS_ARG } from "../tools/system/filesystem.js";
+import { createMockMemoryBackend } from "../memory/test-utils.js";
+import { EffectLedger } from "../workflow/effect-ledger.js";
 
 function createTempDir(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
+}
+
+async function waitForPendingApproval(
+  approvalEngine: ApprovalEngineImpl,
+  timeoutMs = 1_000,
+): Promise<void> {
+  const startedAt = Date.now();
+  while (approvalEngine.getPending().length === 0) {
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error("Timed out waiting for pending approval request");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+
+function makeCompletedChildResult(
+  result: Omit<SubAgentResult, "completionState" | "stopReason">,
+): SubAgentResult {
+  return {
+    ...result,
+    completionState: "completed",
+    stopReason: "completed",
+  };
 }
 
 describe("createSessionToolHandler", () => {
@@ -358,6 +385,7 @@ describe("createSessionToolHandler", () => {
     expect(baseHandler).toHaveBeenCalledWith("system.writeFile", {
       path: "/tmp/project-root/src/grid.ts",
       content: "export const grid = true;\n",
+      [SESSION_ALLOWED_ROOTS_ARG]: ["/tmp/project-root"],
     });
     expect(sentMessages[0]).toMatchObject({
       type: "tools.executing",
@@ -421,6 +449,32 @@ describe("createSessionToolHandler", () => {
     );
   });
 
+  it("injects the delegated cwd as an allowed filesystem root even without an explicit workspace context callback", async () => {
+    const workspaceRoot = createTempDir("agenc-tool-handler-delegated-root-");
+    const baseHandler = vi.fn(async () => '{"ok":true}');
+    const handler = createSessionToolHandler({
+      sessionId: "session-1",
+      baseHandler,
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: workspaceRoot,
+      scopedFilesystemRoot: workspaceRoot,
+    });
+
+    try {
+      await handler("system.readFile", {
+        path: "PLAN.md",
+      });
+    } finally {
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+
+    expect(baseHandler).toHaveBeenCalledWith("system.readFile", {
+      path: `${workspaceRoot}/PLAN.md`,
+      [SESSION_ALLOWED_ROOTS_ARG]: [workspaceRoot],
+    });
+  });
+
   it("strips spoofed internal allowed-root args from caller-controlled input", async () => {
     const workspaceRoot = createTempDir("agenc-tool-handler-spoofed-root-");
     const baseHandler = vi.fn(async () => '{"ok":true}');
@@ -445,6 +499,7 @@ describe("createSessionToolHandler", () => {
     expect(baseHandler).toHaveBeenCalledWith("system.writeFile", {
       path: `${workspaceRoot}/src/index.ts`,
       content: "export const safe = true;\n",
+      [SESSION_ALLOWED_ROOTS_ARG]: [workspaceRoot],
     });
   });
 
@@ -554,6 +609,7 @@ describe("createSessionToolHandler", () => {
     expect(baseHandler).toHaveBeenNthCalledWith(1, "system.writeFile", {
       path: `${workspaceRoot}/project/package.json`,
       content: "{\n}\n",
+      [SESSION_ALLOWED_ROOTS_ARG]: [workspaceRoot],
     });
     expect(baseHandler).toHaveBeenNthCalledWith(2, "system.bash", {
       command: "mkdir",
@@ -588,7 +644,71 @@ describe("createSessionToolHandler", () => {
     expect(baseHandler).toHaveBeenCalledWith("system.writeFile", {
       path: `${hostWorkspaceRoot}/signal-cartography-ts-57/package.json`,
       content: "{\n}\n",
+      [SESSION_ALLOWED_ROOTS_ARG]: [delegatedWorkspaceRoot],
     });
+  });
+
+  it("rejects leaked /workspace aliases during delegated structured tool execution instead of repairing them on the fly", async () => {
+    const delegatedWorkspaceRoot = createTempDir("agenc-tool-handler-delegated-alias-");
+    const baseHandler = vi.fn(async () => '{"ok":true}');
+    const handler = createSessionToolHandler({
+      sessionId: "subagent:test-session",
+      baseHandler,
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: delegatedWorkspaceRoot,
+      workspaceAliasRoot: delegatedWorkspaceRoot,
+      scopedFilesystemRoot: delegatedWorkspaceRoot,
+    });
+
+    let result = "";
+    try {
+      result = await handler("system.writeFile", {
+        path: "/workspace/project/package.json",
+        content: "{\n}\n",
+      });
+    } finally {
+      rmSync(delegatedWorkspaceRoot, { recursive: true, force: true });
+    }
+
+    expect(JSON.parse(result)).toEqual({
+      error:
+        'Delegated tool execution requires canonical host paths before execution. ' +
+        'path still uses the logical /workspace alias (/workspace/project/package.json). ' +
+        'Canonicalize /workspace aliases before the child session starts.',
+    });
+    expect(baseHandler).not.toHaveBeenCalled();
+  });
+
+  it("rejects leaked /workspace aliases inside delegated shell commands instead of rewriting them at tool time", async () => {
+    const delegatedWorkspaceRoot = createTempDir("agenc-tool-handler-delegated-shell-alias-");
+    const baseHandler = vi.fn(async () => '{"stdout":"","exitCode":0}');
+    const handler = createSessionToolHandler({
+      sessionId: "subagent:test-session",
+      baseHandler,
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: delegatedWorkspaceRoot,
+      workspaceAliasRoot: delegatedWorkspaceRoot,
+      scopedFilesystemRoot: delegatedWorkspaceRoot,
+    });
+
+    let result = "";
+    try {
+      result = await handler("system.bash", {
+        command: "cd /workspace/project && mkdir -p /workspace/project/src && pwd",
+      });
+    } finally {
+      rmSync(delegatedWorkspaceRoot, { recursive: true, force: true });
+    }
+
+    expect(JSON.parse(result)).toEqual({
+      error:
+        'Delegated tool execution requires canonical host paths before execution. ' +
+        'shell command references the logical /workspace alias (/workspace/project). ' +
+        'Canonicalize /workspace aliases before the child session starts.',
+    });
+    expect(baseHandler).not.toHaveBeenCalled();
   });
 
   it("omits an auto-injected cwd when bootstrapping a missing delegated workspace via absolute paths", async () => {
@@ -700,6 +820,7 @@ describe("createSessionToolHandler", () => {
     expect(baseHandler).toHaveBeenCalledWith("system.writeFile", {
       path: "/tmp/other-project/src/index.ts",
       content: "export const broken = true;\n",
+      [SESSION_ALLOWED_ROOTS_ARG]: ["/tmp/project-root"],
     });
   });
 
@@ -1056,6 +1177,103 @@ describe("createSessionToolHandler", () => {
       command: "npm",
       args: ["run", "build"],
     });
+    expect(sentMessages.some((msg) => msg.type === "approval.request")).toBe(false);
+  });
+
+  it("requires approval for system.bash in safe local dev mode", async () => {
+    const sentMessages: ControlResponse[] = [];
+    const send = vi.fn((msg: ControlResponse): void => {
+      sentMessages.push(msg);
+    });
+    const baseHandler = vi.fn(async () => "build-complete");
+    const approvalEngine = new ApprovalEngineImpl({
+      effectPolicy: createEffectApprovalPolicy({
+        mode: "safe_local_dev",
+        workspaceRoot: "/tmp/workspace",
+      }),
+    });
+
+    const handler = createSessionToolHandler({
+      sessionId: "session-1",
+      baseHandler,
+      routerId: "router-a",
+      send,
+      approvalEngine,
+    });
+
+    const pendingPromise = handler("system.bash", {
+      command: "git status",
+      cwd: "/tmp/workspace",
+    });
+
+    await Promise.resolve();
+    const approvalRequest = sentMessages.find((msg) => msg.type === "approval.request");
+    expect(approvalRequest).toBeDefined();
+    const requestId = (approvalRequest!.payload as { requestId: string }).requestId;
+    await approvalEngine.resolve(requestId, {
+      requestId,
+      disposition: "yes",
+    });
+
+    const result = await pendingPromise;
+    expect(result).toBe("build-complete");
+    expect(baseHandler).toHaveBeenCalled();
+  });
+
+  it("keeps read-only file operations approval-free in safe local dev mode", async () => {
+    const sentMessages: ControlResponse[] = [];
+    const send = vi.fn((msg: ControlResponse): void => {
+      sentMessages.push(msg);
+    });
+    const baseHandler = vi.fn(async () => "file contents");
+    const approvalEngine = new ApprovalEngineImpl({
+      effectPolicy: createEffectApprovalPolicy({
+        mode: "safe_local_dev",
+        workspaceRoot: "/tmp/workspace",
+      }),
+    });
+
+    const handler = createSessionToolHandler({
+      sessionId: "session-1",
+      baseHandler,
+      routerId: "router-a",
+      send,
+      approvalEngine,
+    });
+
+    const result = await handler("system.readFile", {
+      path: "/tmp/workspace/README.md",
+    });
+
+    expect(result).toBe("file contents");
+    expect(sentMessages.some((msg) => msg.type === "approval.request")).toBe(false);
+  });
+
+  it("blocks destructive desktop automation in unattended background mode", async () => {
+    const sentMessages: ControlResponse[] = [];
+    const send = vi.fn((msg: ControlResponse): void => {
+      sentMessages.push(msg);
+    });
+    const baseHandler = vi.fn(async () => "clicked");
+    const approvalEngine = new ApprovalEngineImpl({
+      effectPolicy: createEffectApprovalPolicy({
+        mode: "unattended_background",
+        workspaceRoot: "/tmp/workspace",
+      }),
+    });
+
+    const handler = createSessionToolHandler({
+      sessionId: "session-1",
+      baseHandler,
+      routerId: "router-a",
+      send,
+      approvalEngine,
+    });
+
+    const result = await handler("mcp.peekaboo.click", { x: 5, y: 10 });
+
+    expect(baseHandler).not.toHaveBeenCalled();
+    expect(result).toContain("Denied by approval policy");
     expect(sentMessages.some((msg) => msg.type === "approval.request")).toBe(false);
   });
 
@@ -1532,6 +1750,17 @@ describe("createSessionToolHandler", () => {
         sessionId: "subagent:child-1",
         output: '{"summary":"child completed"}',
         success: true,
+        completionState: "completed",
+        completionProgress: {
+          completionState: "completed",
+          stopReason: "completed",
+          requiredRequirements: [],
+          satisfiedRequirements: [],
+          remainingRequirements: [],
+          reusableEvidence: [],
+          updatedAt: 1_700_000_000_000,
+        },
+        stopReason: "completed",
         durationMs: 42,
         toolCalls: [
           {
@@ -1585,12 +1814,17 @@ describe("createSessionToolHandler", () => {
       task: "Inspect file",
       tools: ["system.readFile"],
       timeoutMs: 120_000,
+      executionContext: {
+        workspaceRoot: "/tmp/project-root",
+        allowedReadRoots: ["/tmp/project-root"],
+      },
     });
     const parsed = JSON.parse(result) as {
       success?: boolean;
       status?: string;
       subagentSessionId?: string;
       objective?: string;
+      completionState?: string;
     };
 
     expect(baseHandler).not.toHaveBeenCalled();
@@ -1605,6 +1839,7 @@ describe("createSessionToolHandler", () => {
     );
     expect(parsed.success).toBe(true);
     expect(parsed.status).toBe("completed");
+    expect(parsed.completionState).toBe("completed");
     expect(parsed.subagentSessionId).toBe("subagent:child-1");
     expect(parsed.objective).toBe("Inspect file");
 
@@ -1624,7 +1859,152 @@ describe("createSessionToolHandler", () => {
     );
   });
 
-  it("passes delegated working-directory context requirements through execute_with_agent spawn", async () => {
+  it("does not surface delegated child success when completion state still needs verification", async () => {
+    const handler = createSessionToolHandler({
+      sessionId: "session-parent",
+      baseHandler: vi.fn(async () => "should-not-run"),
+      availableToolNames: ["system.writeFile", "system.bash"],
+      routerId: "router-a",
+      send: vi.fn(),
+      delegation: () => ({
+        subAgentManager: {
+          spawn: vi.fn(async () => "subagent:child-verify"),
+          getResult: vi.fn(() => ({
+            sessionId: "subagent:child-verify",
+            output: "Implemented the requested files.",
+            success: true,
+            completionState: "needs_verification",
+            completionProgress: {
+              completionState: "needs_verification",
+              stopReason: "completed",
+              requiredRequirements: ["workflow_verifier_pass", "build_verification"],
+              satisfiedRequirements: [],
+              remainingRequirements: ["workflow_verifier_pass", "build_verification"],
+              reusableEvidence: [],
+              updatedAt: 1_700_000_000_000,
+            },
+            stopReason: "completed",
+            durationMs: 42,
+            toolCalls: [
+              {
+                name: "system.writeFile",
+                args: { path: "/tmp/project/src/main.ts" },
+                result: '{"ok":true}',
+                isError: false,
+                durationMs: 5,
+              },
+            ],
+          })),
+          getInfo: vi.fn(() => ({
+            sessionId: "subagent:child-verify",
+            parentSessionId: "session-parent",
+            depth: 1,
+            status: "failed",
+            startedAt: Date.now() - 100,
+            task: "Implement the CLI",
+          })),
+        } as any,
+        policyEngine: null,
+        verifier: null,
+        lifecycleEmitter: null,
+      }),
+    });
+
+    const result = await handler("execute_with_agent", {
+      task: "Implement the CLI",
+      tools: ["system.writeFile", "system.bash"],
+      executionContext: {
+        workspaceRoot: "/tmp/project",
+        allowedReadRoots: ["/tmp/project"],
+        allowedWriteRoots: ["/tmp/project"],
+      },
+    });
+    const parsed = JSON.parse(result) as {
+      success?: boolean;
+      status?: string;
+      error?: string;
+      completionState?: string;
+      completionProgress?: { remainingRequirements?: string[] };
+    };
+
+    expect(parsed.success).toBe(false);
+    expect(parsed.status).toBe("failed");
+    expect(parsed.completionState).toBe("needs_verification");
+    expect(parsed.completionProgress?.remainingRequirements).toEqual([
+      "workflow_verifier_pass",
+      "build_verification",
+    ]);
+    expect(parsed.error).toContain("did not reach a completed workflow state");
+    expect(parsed.error).toContain("workflow_verifier_pass");
+  });
+
+  it("allows non-filesystem execute_with_agent delegation without a structured execution envelope", async () => {
+    const subAgentManager = {
+      spawn: vi.fn(async () => "subagent:child-1"),
+      getResult: vi.fn(() => makeCompletedChildResult({
+        sessionId: "subagent:child-1",
+        output: '{"summary":"child completed"}',
+        success: true,
+        durationMs: 42,
+        toolCalls: [
+          {
+            name: "web_search",
+            args: { query: "AgenC runtime migration closure" },
+            result: '{"results":[{"title":"result"}]}',
+            isError: false,
+            durationMs: 5,
+          },
+        ],
+      })),
+      getInfo: vi.fn(() => ({
+        sessionId: "subagent:child-1",
+        parentSessionId: "session-parent",
+        depth: 1,
+        status: "completed",
+        startedAt: Date.now() - 100,
+        task: "Summarize the architectural risks from the provided request only",
+      })),
+    };
+
+    const handler = createSessionToolHandler({
+      sessionId: "session-parent",
+      baseHandler: vi.fn(async () => "should-not-run"),
+      availableToolNames: ["web_search"],
+      routerId: "router-a",
+      send: vi.fn(),
+      delegation: () => ({
+        subAgentManager: subAgentManager as any,
+        policyEngine: null,
+        verifier: null,
+        lifecycleEmitter: null,
+      }),
+    });
+
+    const result = await handler("execute_with_agent", {
+      task: "Summarize the architectural risks from the provided request only",
+      tools: ["web_search"],
+    });
+    const parsed = JSON.parse(result) as {
+      success?: boolean;
+      status?: string;
+    };
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.status).toBe("completed");
+    expect(subAgentManager.spawn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parentSessionId: "session-parent",
+        tools: ["web_search"],
+      }),
+    );
+    expect(subAgentManager.spawn).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        workingDirectory: expect.any(String),
+      }),
+    );
+  });
+
+  it("rejects contextRequirements-only local-file execute_with_agent calls before spawn", async () => {
     const subAgentManager = {
       spawn: vi.fn(async () => "subagent:child-1"),
       getResult: vi.fn(() => ({
@@ -1666,7 +2046,7 @@ describe("createSessionToolHandler", () => {
       }),
     });
 
-    await handler("execute_with_agent", {
+    const result = await handler("execute_with_agent", {
       task: "Implement the grid router core",
       tools: ["system.writeFile"],
       contextRequirements: [
@@ -1674,22 +2054,23 @@ describe("createSessionToolHandler", () => {
         "working_directory=/tmp/project-root/grid-router-ts",
       ],
     });
+    const parsed = JSON.parse(result) as {
+      success?: boolean;
+      status?: string;
+      error?: string;
+      issues?: Array<{ code?: string }>;
+    };
 
-    expect(subAgentManager.spawn).toHaveBeenCalledWith(
-      expect.objectContaining({
-        parentSessionId: "session-parent",
-        workingDirectory: "/tmp/project-root/grid-router-ts",
-        delegationSpec: expect.objectContaining({
-          contextRequirements: [
-            "repo_context",
-            "working_directory=/tmp/project-root/grid-router-ts",
-          ],
-        }),
-      }),
+    expect(subAgentManager.spawn).not.toHaveBeenCalled();
+    expect(parsed.success).toBe(false);
+    expect(parsed.status).toBe("failed");
+    expect(parsed.error).toContain("structured executionContext");
+    expect(parsed.issues?.map((issue) => issue.code)).toContain(
+      "missing_execution_context",
     );
   });
 
-  it("maps /workspace delegated cwd requirements onto the configured host workspace root for execute_with_agent", async () => {
+  it("rejects local-file execute_with_agent calls that rely on /workspace cwd hints without a structured envelope", async () => {
     const hostWorkspaceRoot = "/home/tetsuo/agent-test";
     const subAgentManager = {
       spawn: vi.fn(async () => "subagent:child-1"),
@@ -1735,28 +2116,76 @@ describe("createSessionToolHandler", () => {
       }),
     });
 
-    await handler("execute_with_agent", {
+    const result = await handler("execute_with_agent", {
       task: "Scaffold the signal cartography workspace",
       tools: ["system.writeFile", "system.bash"],
       contextRequirements: ["cwd=/workspace/signal-cartography-ts-57"],
     });
+    const parsed = JSON.parse(result) as {
+      success?: boolean;
+      status?: string;
+      error?: string;
+      issues?: Array<{ code?: string }>;
+    };
 
-    expect(subAgentManager.spawn).toHaveBeenCalledWith(
-      expect.objectContaining({
-        parentSessionId: "session-parent",
-        workingDirectory: `${hostWorkspaceRoot}/signal-cartography-ts-57`,
-        workingDirectorySource: "context_requirement",
-        prompt: expect.stringContaining(
-          `Use \`${hostWorkspaceRoot}/signal-cartography-ts-57\` as the working directory for this phase.`,
-        ),
-        delegationSpec: expect.objectContaining({
-          contextRequirements: ["cwd=/workspace/signal-cartography-ts-57"],
-        }),
-      }),
+    expect(subAgentManager.spawn).not.toHaveBeenCalled();
+    expect(parsed.success).toBe(false);
+    expect(parsed.status).toBe("failed");
+    expect(parsed.error).toContain("structured executionContext");
+    expect(parsed.issues?.map((issue) => issue.code)).toContain(
+      "missing_execution_context",
     );
   });
 
-  it("infers a delegated working directory from execute_with_agent objective text when context requirements are omitted", async () => {
+  it("rejects broken delegated local-file contracts before child spawn", async () => {
+    const hostWorkspaceRoot = "/home/tetsuo/git/AgenC/agenc-core";
+    const subAgentManager = {
+      spawn: vi.fn(async () => "subagent:child-1"),
+      getResult: vi.fn(),
+      getInfo: vi.fn(),
+    };
+
+    const handler = createSessionToolHandler({
+      sessionId: "session-parent",
+      baseHandler: vi.fn(async () => "should-not-run"),
+      availableToolNames: ["system.readFile"],
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: hostWorkspaceRoot,
+      delegation: () => ({
+        subAgentManager: subAgentManager as any,
+        policyEngine: null,
+        verifier: null,
+        lifecycleEmitter: null,
+      }),
+    });
+
+    const result = await handler("execute_with_agent", {
+      task: "Inspect PLAN.md",
+      tools: ["system.readFile"],
+      executionContext: {
+        workspaceRoot: "/workspace",
+        allowedReadRoots: ["/workspace"],
+        requiredSourceArtifacts: ["/home/tetsuo/git/AgenC/AGENTS.md"],
+      },
+    });
+    const parsed = JSON.parse(result) as {
+      success?: boolean;
+      status?: string;
+      error?: string;
+      issues?: Array<{ code?: string }>;
+    };
+
+    expect(subAgentManager.spawn).not.toHaveBeenCalled();
+    expect(parsed.success).toBe(false);
+    expect(parsed.status).toBe("failed");
+    expect(parsed.error).toContain("outside the delegated read roots");
+    expect(parsed.issues?.map((issue) => issue.code)).toContain(
+      "required_source_outside_read_roots",
+    );
+  });
+
+  it("requires a structured execution envelope instead of inferring delegated cwd from objective text", async () => {
     const subAgentManager = {
       spawn: vi.fn(async () => "subagent:child-1"),
       getResult: vi.fn(() => ({
@@ -1805,25 +2234,312 @@ describe("createSessionToolHandler", () => {
       objective:
         "Write the core terrain router files under /home/tetsuo/agent-test/terrain-router-ts-2 and keep all code changes there.",
       tools: ["system.writeFile", "system.bash"],
+      executionContext: {
+        workspaceRoot: "/home/tetsuo/agent-test/terrain-router-ts-2",
+        allowedReadRoots: ["/home/tetsuo/agent-test/terrain-router-ts-2"],
+        allowedWriteRoots: ["/home/tetsuo/agent-test/terrain-router-ts-2"],
+        targetArtifacts: [
+          "/home/tetsuo/agent-test/terrain-router-ts-2/packages/core/src/index.ts",
+        ],
+      },
     });
 
     expect(subAgentManager.spawn).toHaveBeenCalledWith(
       expect.objectContaining({
         parentSessionId: "session-parent",
         workingDirectory: "/home/tetsuo/agent-test/terrain-router-ts-2",
-        workingDirectorySource: "task_text",
         prompt: expect.stringContaining(
           "Use `/home/tetsuo/agent-test/terrain-router-ts-2` as the working directory for this phase.",
         ),
+        delegationSpec: expect.objectContaining({
+          executionContext: expect.objectContaining({
+            workspaceRoot: "/home/tetsuo/agent-test/terrain-router-ts-2",
+            targetArtifacts: [
+              "/home/tetsuo/agent-test/terrain-router-ts-2/packages/core/src/index.ts",
+            ],
+          }),
+        }),
       }),
     );
+  });
+
+  it("blocks delegated child writes outside the execution envelope target artifacts", async () => {
+    const baseHandler = vi.fn(async () => JSON.stringify({ ok: true }));
+    const subAgentManager = {
+      getInfo: vi.fn(() => ({
+        sessionId: "subagent:child-1",
+        parentSessionId: "session-parent",
+        depth: 1,
+        status: "running",
+        startedAt: Date.now() - 100,
+        task: "Write the repository guide",
+      })),
+      getExecutionContext: vi.fn(() => ({
+        version: "v1",
+        workspaceRoot: "/tmp/workspace",
+        allowedReadRoots: ["/tmp/workspace"],
+        allowedWriteRoots: ["/tmp/workspace"],
+        targetArtifacts: ["/tmp/workspace/AGENC.md"],
+      })),
+    };
+
+    const handler = createSessionToolHandler({
+      sessionId: "subagent:child-1",
+      baseHandler,
+      availableToolNames: ["system.writeFile"],
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: "/tmp/workspace",
+      delegation: () => ({
+        subAgentManager: subAgentManager as any,
+        policyEngine: null,
+        verifier: null,
+        lifecycleEmitter: null,
+      }),
+    });
+
+    const result = await handler("system.writeFile", {
+      path: "../escape/README.md",
+      content: "# nope\n",
+    });
+
+    expect(baseHandler).not.toHaveBeenCalled();
+    expect(JSON.parse(result)).toEqual({
+      error:
+        'Delegated write path "/tmp/escape/README.md" is outside the execution envelope roots',
+    });
+  });
+
+  it("blocks delegated child writes inside the workspace when the target artifact contract does not authorize the path", async () => {
+    const baseHandler = vi.fn(async () => JSON.stringify({ ok: true }));
+    const subAgentManager = {
+      getInfo: vi.fn(() => ({
+        sessionId: "subagent:child-1b",
+        parentSessionId: "session-parent",
+        depth: 1,
+        status: "running",
+        startedAt: Date.now() - 100,
+        task: "Write the repository guide",
+      })),
+      getExecutionContext: vi.fn(() => ({
+        version: "v1",
+        workspaceRoot: "/tmp/workspace",
+        allowedReadRoots: ["/tmp/workspace"],
+        allowedWriteRoots: ["/tmp/workspace"],
+        targetArtifacts: ["/tmp/workspace/AGENC.md"],
+      })),
+    };
+
+    const handler = createSessionToolHandler({
+      sessionId: "subagent:child-1b",
+      baseHandler,
+      availableToolNames: ["system.writeFile"],
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: "/tmp/workspace",
+      delegation: () => ({
+        subAgentManager: subAgentManager as any,
+        policyEngine: null,
+        verifier: null,
+        lifecycleEmitter: null,
+      }),
+    });
+
+    const result = await handler("system.writeFile", {
+      path: "/tmp/workspace/README.md",
+      content: "# nope\n",
+    });
+
+    expect(baseHandler).not.toHaveBeenCalled();
+    expect(JSON.parse(result)).toEqual({
+      error:
+        'Delegated write path "/tmp/workspace/README.md" is not permitted by the execution envelope target artifacts',
+    });
+  });
+
+  it("allows scaffold flows within the execution envelope for mkdir plus relative file writes", async () => {
+    const baseHandler = vi.fn(async () => JSON.stringify({ ok: true }));
+    const subAgentManager = {
+      getInfo: vi.fn(() => ({
+        sessionId: "subagent:child-2",
+        parentSessionId: "session-parent",
+        depth: 1,
+        status: "running",
+        startedAt: Date.now() - 100,
+        task: "Scaffold the shell workspace",
+      })),
+      getExecutionContext: vi.fn(() => ({
+        version: "v1",
+        workspaceRoot: "/tmp/shell-workspace",
+        allowedReadRoots: ["/tmp/shell-workspace"],
+        allowedWriteRoots: ["/tmp/shell-workspace"],
+        targetArtifacts: ["/tmp/shell-workspace/src/main.c"],
+      })),
+    };
+
+    const handler = createSessionToolHandler({
+      sessionId: "subagent:child-2",
+      baseHandler,
+      availableToolNames: ["system.mkdir", "system.writeFile"],
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: "/tmp/shell-workspace",
+      delegation: () => ({
+        subAgentManager: subAgentManager as any,
+        policyEngine: null,
+        verifier: null,
+        lifecycleEmitter: null,
+      }),
+    });
+
+    await handler("system.mkdir", { path: "src" });
+    await handler("system.writeFile", {
+      path: "src/main.c",
+      content: "int main(void) { return 0; }\n",
+    });
+
+    expect(baseHandler).toHaveBeenNthCalledWith(1, "system.mkdir", {
+      path: "/tmp/shell-workspace/src",
+      [SESSION_ALLOWED_ROOTS_ARG]: ["/tmp/shell-workspace"],
+    });
+    expect(baseHandler).toHaveBeenNthCalledWith(2, "system.writeFile", {
+      path: "/tmp/shell-workspace/src/main.c",
+      content: "int main(void) { return 0; }\n",
+      [SESSION_ALLOWED_ROOTS_ARG]: ["/tmp/shell-workspace"],
+    });
+  });
+
+  it("does not infer delegated working directory from the most recently read file when local-file delegation omits executionContext", async () => {
+    const workspaceRoot = createTempDir("agenc-delegation-context-");
+    const planPath = join(workspaceRoot, "PLAN.md");
+    const originalPlan =
+      "# Shell Plan\n\n" +
+      "## Parsing\n- Tokenize commands and operators.\n\n" +
+      "## Execution\n- Support pipelines, redirects, and builtins.\n";
+
+    const subAgentManager = {
+      spawn: vi.fn(async () => "subagent:child-1"),
+      getResult: vi.fn(() => ({
+        sessionId: "subagent:child-1",
+        output: '{"summary":"child completed"}',
+        success: true,
+        durationMs: 42,
+        toolCalls: [
+          {
+            name: "system.readFile",
+            args: { path: planPath },
+            result: JSON.stringify({ path: planPath, content: originalPlan }),
+            isError: false,
+            durationMs: 5,
+          },
+        ],
+      })),
+      getInfo: vi.fn(() => ({
+        sessionId: "subagent:child-1",
+        parentSessionId: "session-parent",
+        depth: 1,
+        status: "completed",
+        startedAt: Date.now() - 100,
+        task: "Review PLAN.md",
+      })),
+    };
+
+    const baseHandler = vi.fn(async (toolName: string, args: Record<string, unknown>) => {
+      if (toolName === "system.readFile") {
+        expect(args).toEqual({
+          path: planPath,
+          [SESSION_ALLOWED_ROOTS_ARG]: ["/tmp/fallback-root"],
+        });
+        return JSON.stringify({ path: planPath, content: originalPlan });
+      }
+      return "unexpected";
+    });
+
+    const handler = createSessionToolHandler({
+      sessionId: "session-parent",
+      baseHandler,
+      availableToolNames: ["system.readFile"],
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: "/tmp/fallback-root",
+      delegation: () => ({
+        subAgentManager: subAgentManager as any,
+        policyEngine: null,
+        verifier: null,
+        lifecycleEmitter: null,
+      }),
+    });
+
+    await handler("system.readFile", { path: planPath });
+    const result = await handler("execute_with_agent", {
+      task: "Review PLAN.md for missing shell job-control coverage.",
+      objective:
+        "Read PLAN.md, critique the current shell plan, and point out missing process-group details.",
+      tools: ["system.readFile"],
+    });
+
+    expect(JSON.parse(result)).toMatchObject({
+      success: false,
+      error:
+        "Direct execute_with_agent local-file work must provide a structured executionContext before child execution.",
+    });
+    expect(subAgentManager.spawn).not.toHaveBeenCalled();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it("blocks destructive writeFile overwrites after reading a larger document", async () => {
+    const workspaceRoot = createTempDir("agenc-overwrite-guard-");
+    const planPath = join(workspaceRoot, "PLAN.md");
+    const originalPlan =
+      "# Complete Shell Plan\n\n" +
+      "## Parser\n- Lex quoting, escapes, and operators.\n" +
+      "- Build an AST for pipelines and redirects.\n\n" +
+      "## Execution\n- Fork external commands.\n" +
+      "- Run builtins in-process when required.\n\n" +
+      "## Job Control\n- Track process groups.\n" +
+      "- Transfer terminal foreground ownership.\n";
+
+    const baseHandler = vi.fn(async (toolName: string) => {
+      if (toolName === "system.readFile") {
+        return JSON.stringify({ path: planPath, content: originalPlan });
+      }
+      return JSON.stringify({ path: planPath, bytesWritten: 42 });
+    });
+
+    const handler = createSessionToolHandler({
+      sessionId: "session-parent",
+      baseHandler,
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: workspaceRoot,
+    });
+
+    const readResult = await handler("system.readFile", { path: planPath });
+    expect(JSON.parse(readResult)).toEqual({
+      path: planPath,
+      content: originalPlan,
+    });
+
+    const writeResult = await handler("system.writeFile", {
+      path: planPath,
+      content: "## Post-Review Updates\n\n- Add jobs.\n",
+    });
+    expect(JSON.parse(writeResult)).toEqual({
+      error:
+        `Refusing destructive overwrite of previously-read file "${planPath}". ` +
+        "Preserve the existing content when revising the file, or use system.appendFile for an additive update.",
+    });
+    expect(baseHandler).toHaveBeenCalledTimes(1);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
   it("reuses the latest child session and rewrites leaked recall answers into generic recall guidance", async () => {
     const subAgentManager = {
       findLatestSuccessfulSessionId: vi.fn(() => "subagent:child-memory"),
       spawn: vi.fn(async () => "subagent:child-memory"),
-      getResult: vi.fn(() => ({
+      getResult: vi.fn(() => makeCompletedChildResult({
         sessionId: "subagent:child-memory",
         output: "TOKEN=NEON-AXIS-17",
         success: true,
@@ -1843,7 +2559,7 @@ describe("createSessionToolHandler", () => {
     const handler = createSessionToolHandler({
       sessionId: "session-parent",
       baseHandler: vi.fn(async () => "should-not-run"),
-      availableToolNames: ["desktop.bash"],
+      availableToolNames: ["web_search"],
       routerId: "router-a",
       send: vi.fn(),
       delegation: () => ({
@@ -1921,7 +2637,7 @@ describe("createSessionToolHandler", () => {
     const handler = createSessionToolHandler({
       sessionId: "session-parent",
       baseHandler: vi.fn(async () => "should-not-run"),
-      availableToolNames: ["desktop.bash"],
+      availableToolNames: ["web_search"],
       routerId: "router-a",
       send: vi.fn(),
       delegation: () => ({
@@ -1971,7 +2687,7 @@ describe("createSessionToolHandler", () => {
     const handler = createSessionToolHandler({
       sessionId: "session-parent",
       baseHandler: vi.fn(async () => "should-not-run"),
-      availableToolNames: ["desktop.bash"],
+      availableToolNames: ["web_search"],
       routerId: "router-a",
       send: vi.fn(),
       delegation: () => ({
@@ -2008,7 +2724,7 @@ describe("createSessionToolHandler", () => {
     const subAgentManager = {
       findLatestSuccessfulSessionId: vi.fn(() => undefined),
       spawn: vi.fn(async () => "subagent:child-store"),
-      getResult: vi.fn(() => ({
+      getResult: vi.fn(() => makeCompletedChildResult({
         sessionId: "subagent:child-store",
         output: "CHILD-STORED-C1",
         success: true,
@@ -2028,7 +2744,7 @@ describe("createSessionToolHandler", () => {
     const handler = createSessionToolHandler({
       sessionId: "session-parent",
       baseHandler: vi.fn(async () => "should-not-run"),
-      availableToolNames: ["desktop.bash"],
+      availableToolNames: ["web_search"],
       routerId: "router-a",
       send: vi.fn(),
       delegation: () => ({
@@ -2075,7 +2791,7 @@ describe("createSessionToolHandler", () => {
     const subAgentManager = {
       findLatestSuccessfulSessionId: vi.fn(() => undefined),
       spawn: vi.fn(async () => "subagent:child-real"),
-      getResult: vi.fn(() => ({
+      getResult: vi.fn(() => makeCompletedChildResult({
         sessionId: "subagent:child-real",
         output: JSON.stringify({
           ack: "CHILD-SEALED-C1",
@@ -2098,7 +2814,7 @@ describe("createSessionToolHandler", () => {
     const handler = createSessionToolHandler({
       sessionId: "session-parent",
       baseHandler: vi.fn(async () => "should-not-run"),
-      availableToolNames: ["desktop.bash"],
+      availableToolNames: ["web_search"],
       routerId: "router-a",
       send: vi.fn(),
       delegation: () => ({
@@ -2135,7 +2851,7 @@ describe("createSessionToolHandler", () => {
     const subAgentManager = {
       findLatestSuccessfulSessionId: vi.fn(() => undefined),
       spawn: vi.fn(async () => "subagent:child-real"),
-      getResult: vi.fn(() => ({
+      getResult: vi.fn(() => makeCompletedChildResult({
         sessionId: "subagent:child-real",
         output: 'CHILD-SEALED-C1\n{"ack":true,"childSessionId":"fake-child-handle"}',
         success: true,
@@ -2155,7 +2871,7 @@ describe("createSessionToolHandler", () => {
     const handler = createSessionToolHandler({
       sessionId: "session-parent",
       baseHandler: vi.fn(async () => "should-not-run"),
-      availableToolNames: ["desktop.bash"],
+      availableToolNames: ["web_search"],
       routerId: "router-a",
       send: vi.fn(),
       delegation: () => ({
@@ -2192,7 +2908,7 @@ describe("createSessionToolHandler", () => {
     const lifecycleEvents: Array<Record<string, unknown>> = [];
     const subAgentManager = {
       spawn: vi.fn(async () => "subagent:child-unresolved"),
-      getResult: vi.fn(() => ({
+      getResult: vi.fn(() => makeCompletedChildResult({
         sessionId: "subagent:child-unresolved",
         output: "uname -s: Linux\nnode -v: Command denied\nnpm -v: 11.7.0",
         success: true,
@@ -2225,7 +2941,7 @@ describe("createSessionToolHandler", () => {
     const handler = createSessionToolHandler({
       sessionId: "session-parent",
       baseHandler: vi.fn(async () => "should-not-run"),
-      availableToolNames: ["desktop.bash"],
+      availableToolNames: ["system.bash"],
       routerId: "router-a",
       send: vi.fn(),
       delegation: () => ({
@@ -2238,6 +2954,11 @@ describe("createSessionToolHandler", () => {
 
     const result = await handler("execute_with_agent", {
       task: "collect node version",
+      executionContext: {
+        workspaceRoot: "/tmp/delegated-shell-contract",
+        allowedReadRoots: ["/tmp/delegated-shell-contract"],
+        allowedWriteRoots: ["/tmp/delegated-shell-contract"],
+      },
     });
     const parsed = JSON.parse(result) as {
       success?: boolean;
@@ -2262,7 +2983,8 @@ describe("createSessionToolHandler", () => {
       getResult: vi.fn(() => ({
         sessionId: "subagent:child-json-contract",
         output: "Completed desktop.bash",
-        success: true,
+        success: false,
+        completionState: "needs_verification",
         durationMs: 18,
         toolCalls: [
           {
@@ -2273,6 +2995,10 @@ describe("createSessionToolHandler", () => {
             durationMs: 4,
           },
         ],
+        stopReason: "validation_error",
+        stopReasonDetail:
+          "Malformed result contract: expected JSON object output",
+        validationCode: "expected_json_object",
       })),
       getInfo: vi.fn(() => ({
         sessionId: "subagent:child-json-contract",
@@ -2306,6 +3032,11 @@ describe("createSessionToolHandler", () => {
     const result = await handler("execute_with_agent", {
       task: "Build core game",
       inputContract: "JSON output with files and verification",
+      executionContext: {
+        workspaceRoot: "/tmp/child-json-contract",
+        allowedReadRoots: ["/tmp/child-json-contract"],
+        allowedWriteRoots: ["/tmp/child-json-contract"],
+      },
     });
     const parsed = JSON.parse(result) as {
       success?: boolean;
@@ -2326,7 +3057,8 @@ describe("createSessionToolHandler", () => {
         sessionId: "subagent:child-reference-count",
         output:
           '{"references":[{"name":"a"},{"name":"b"},{"name":"c"},{"name":"d"}],"tuning":{"player_speed":4.5}}',
-        success: true,
+        success: false,
+        completionState: "needs_verification",
         durationMs: 19,
         toolCalls: [
           {
@@ -2337,6 +3069,10 @@ describe("createSessionToolHandler", () => {
             durationMs: 5,
           },
         ],
+        stopReason: "validation_error",
+        stopReasonDetail:
+          "Acceptance criteria not evidenced in child output: expected exactly 3 references, got 4",
+        validationCode: "acceptance_evidence_missing",
       })),
       getInfo: vi.fn(() => ({
         sessionId: "subagent:child-reference-count",
@@ -2386,7 +3122,8 @@ describe("createSessionToolHandler", () => {
         sessionId: "subagent:child-file-evidence",
         output:
           '{"files_created":[{"path":"index.html"},{"path":"src/game.js"}],"verification":[{"command":"python -m http.server 8000","result":"ok"}]}',
-        success: true,
+        success: false,
+        completionState: "needs_verification",
         durationMs: 21,
         toolCalls: [
           {
@@ -2400,6 +3137,10 @@ describe("createSessionToolHandler", () => {
             durationMs: 5,
           },
         ],
+        stopReason: "validation_error",
+        stopReasonDetail:
+          "Execution required mutation evidence for target artifacts but child reported no qualifying file mutations",
+        validationCode: "missing_file_mutation_evidence",
       })),
       getInfo: vi.fn(() => ({
         sessionId: "subagent:child-file-evidence",
@@ -2429,6 +3170,15 @@ describe("createSessionToolHandler", () => {
       task: "Create ALL files for the game",
       inputContract: "JSON output with files and verification",
       acceptanceCriteria: ["Create all files"],
+      executionContext: {
+        workspaceRoot: "/home/agenc/neon-heist",
+        allowedReadRoots: ["/home/agenc/neon-heist"],
+        allowedWriteRoots: ["/home/agenc/neon-heist"],
+        targetArtifacts: [
+          "/home/agenc/neon-heist/index.html",
+          "/home/agenc/neon-heist/src/game.js",
+        ],
+      },
     });
     const parsed = JSON.parse(result) as {
       success?: boolean;
@@ -2436,7 +3186,84 @@ describe("createSessionToolHandler", () => {
     };
 
     expect(parsed.success).toBe(false);
-    expect(parsed.error).toContain("file mutation tools");
+    expect(parsed.error).toContain(
+      "Execution required mutation evidence for target artifacts",
+    );
+  });
+
+  it("accepts delegated explicit file-authoring no-op completions when the target file already satisfies the objective", async () => {
+    const subAgentManager = {
+      spawn: vi.fn(async () => "subagent:child-agenc-md"),
+      getResult: vi.fn(() => makeCompletedChildResult({
+        sessionId: "subagent:child-agenc-md",
+        output:
+          "AGENC.md already exists with all required sections. No mutation needed.",
+        success: true,
+        durationMs: 18,
+        toolCalls: [
+          {
+            name: "system.readFile",
+            args: {
+              path: "/home/tetsuo/git/stream-test/agenc-shell/AGENC.md",
+            },
+            result: JSON.stringify({
+              path: "/home/tetsuo/git/stream-test/agenc-shell/AGENC.md",
+              content:
+                "# Repository Guidelines\n\n## Project Structure & Module Organization\n\n## Build Test and Development Commands\n",
+            }),
+            isError: false,
+            durationMs: 4,
+          },
+        ],
+      })),
+      getInfo: vi.fn(() => ({
+        sessionId: "subagent:child-agenc-md",
+        parentSessionId: "session-parent",
+        depth: 1,
+        status: "completed",
+        startedAt: Date.now() - 20,
+        task: "Generate AGENC.md",
+      })),
+    };
+
+    const handler = createSessionToolHandler({
+      sessionId: "session-parent",
+      baseHandler: vi.fn(async () => "should-not-run"),
+      availableToolNames: ["system.readFile", "system.writeFile"],
+      routerId: "router-a",
+      send: vi.fn(),
+      delegation: () => ({
+        subAgentManager: subAgentManager as any,
+        policyEngine: null,
+        verifier: null,
+        lifecycleEmitter: null,
+      }),
+    });
+
+    const result = await handler("execute_with_agent", {
+      objective:
+        "Create /home/tetsuo/git/stream-test/agenc-shell/AGENC.md with repository guideline sections.",
+      inputContract: "Exploration results with PLAN.md and repo structure",
+      acceptanceCriteria: ["AGENC.md written with all required sections"],
+      requiredToolCapabilities: ["read_file", "write_file"],
+      executionContext: {
+        workspaceRoot: "/home/tetsuo/git/stream-test/agenc-shell",
+        allowedReadRoots: ["/home/tetsuo/git/stream-test/agenc-shell"],
+        allowedWriteRoots: ["/home/tetsuo/git/stream-test/agenc-shell"],
+        targetArtifacts: ["/home/tetsuo/git/stream-test/agenc-shell/AGENC.md"],
+      },
+    });
+    const parsed = JSON.parse(result) as {
+      success?: boolean;
+      status?: string;
+      output?: string;
+      error?: string;
+    };
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.status).toBe("completed");
+    expect(parsed.error).toBeUndefined();
+    expect(parsed.output).toContain("already exists");
   });
 
   it("returns failure when delegated research child has no successful tool-grounded evidence", async () => {
@@ -2446,7 +3273,8 @@ describe("createSessionToolHandler", () => {
         sessionId: "subagent:child-grounding",
         output:
           '{"selected":"pixi","why":["small","fast","simple"],"sources":["https://pixijs.com"]}',
-        success: true,
+        success: false,
+        completionState: "needs_verification",
         durationMs: 22,
         toolCalls: [
           {
@@ -2457,6 +3285,10 @@ describe("createSessionToolHandler", () => {
             durationMs: 6,
           },
         ],
+        stopReason: "validation_error",
+        stopReasonDetail:
+          "Delegated task required successful tool-grounded evidence but all child tool calls failed",
+        validationCode: "missing_successful_tool_evidence",
       })),
       getInfo: vi.fn(() => ({
         sessionId: "subagent:child-grounding",
@@ -2502,7 +3334,7 @@ describe("createSessionToolHandler", () => {
   it("accepts delegated research when child returns provider-native search citations", async () => {
     const subAgentManager = {
       spawn: vi.fn(async () => "subagent:child-native-search"),
-      getResult: vi.fn(() => ({
+      getResult: vi.fn(() => makeCompletedChildResult({
         sessionId: "subagent:child-native-search",
         output:
           '{"selected":"pixi","why":["small","fast"],"citations":["https://pixijs.com","https://docs.phaser.io"]}',
@@ -2592,6 +3424,9 @@ describe("createSessionToolHandler", () => {
     await handler("execute_with_agent", {
       task: "Inspect file quickly",
       timeoutMs: 10_000,
+      executionContext: {
+        workspaceRoot: "/tmp/runtime-timeout-scope",
+      },
     });
 
     expect(subAgentManager.spawn).toHaveBeenCalledWith(
@@ -2640,6 +3475,11 @@ describe("createSessionToolHandler", () => {
         "Create src/Game.ts",
         "Validate localhost runs cleanly",
       ],
+      executionContext: {
+        workspaceRoot: "/tmp/unsafe-benchmark-scope",
+        allowedReadRoots: ["/tmp/unsafe-benchmark-scope"],
+        allowedWriteRoots: ["/tmp/unsafe-benchmark-scope"],
+      },
     });
     const parsed = JSON.parse(result) as {
       success?: boolean;
@@ -2669,18 +3509,27 @@ describe("createSessionToolHandler", () => {
   it("allows overloaded execute_with_agent objectives in unsafe benchmark mode", async () => {
     const subAgentManager = {
       spawn: vi.fn(async () => "subagent:unsafe-benchmark"),
-      getResult: vi.fn(() => ({
+      getResult: vi.fn(() => makeCompletedChildResult({
         sessionId: "subagent:unsafe-benchmark",
         output: '{"summary":"child completed"}',
         success: true,
         durationMs: 42,
-        toolCalls: [{
-          name: "system.bash",
-          args: { command: "npm", args: ["install"] },
-          result: '{"stdout":"ok","stderr":"","exitCode":0}',
-          isError: false,
-          durationMs: 5,
-        }],
+        toolCalls: [
+          {
+            name: "system.bash",
+            args: { command: "npm", args: ["install"] },
+            result: '{"stdout":"ok","stderr":"","exitCode":0}',
+            isError: false,
+            durationMs: 5,
+          },
+          {
+            name: "system.writeFile",
+            args: { path: "/tmp/unsafe-benchmark-scope/src/main.ts" },
+            result: '{"ok":true}',
+            isError: false,
+            durationMs: 5,
+          },
+        ],
       })),
       getInfo: vi.fn(() => ({
         sessionId: "subagent:unsafe-benchmark",
@@ -2725,6 +3574,12 @@ describe("createSessionToolHandler", () => {
         "Create src/Game.ts",
         "Validate localhost runs cleanly",
       ],
+      executionContext: {
+        workspaceRoot: "/tmp/unsafe-benchmark-scope",
+        allowedReadRoots: ["/tmp/unsafe-benchmark-scope"],
+        allowedWriteRoots: ["/tmp/unsafe-benchmark-scope"],
+        targetArtifacts: ["/tmp/unsafe-benchmark-scope/src/main.ts"],
+      },
     });
     const parsed = JSON.parse(result) as {
       success?: boolean;
@@ -2750,7 +3605,7 @@ describe("createSessionToolHandler", () => {
 
     const subAgentManager = {
       spawn: vi.fn(async () => "subagent:unsafe-policy-bypass"),
-      getResult: vi.fn(() => ({
+      getResult: vi.fn(() => makeCompletedChildResult({
         sessionId: "subagent:unsafe-policy-bypass",
         output: '{"summary":"child completed"}',
         success: true,
@@ -2759,9 +3614,9 @@ describe("createSessionToolHandler", () => {
           name: "system.bash",
           args: { command: "npm", args: ["install"] },
           result: '{"stdout":"ok","stderr":"","exitCode":0}',
-          isError: false,
-          durationMs: 5,
-        }],
+            isError: false,
+            durationMs: 5,
+          }],
       })),
       getInfo: vi.fn(() => ({
         sessionId: "subagent:unsafe-policy-bypass",
@@ -2801,6 +3656,12 @@ describe("createSessionToolHandler", () => {
       task: "Scaffold the workspace and validate npm install",
       inputContract: "Return JSON summary",
       acceptanceCriteria: ["Create files", "Run npm install"],
+      executionContext: {
+        workspaceRoot: "/tmp/unsafe-benchmark-policy-bypass",
+        allowedReadRoots: ["/tmp/unsafe-benchmark-policy-bypass"],
+        allowedWriteRoots: ["/tmp/unsafe-benchmark-policy-bypass"],
+        targetArtifacts: ["/tmp/unsafe-benchmark-policy-bypass/src/main.ts"],
+      },
     });
     const parsed = JSON.parse(result) as {
       success?: boolean;
@@ -3009,6 +3870,10 @@ describe("createSessionToolHandler", () => {
       objective:
         'Read docs/RUNTIME_API.md (full path /workspace/docs/RUNTIME_API.md). Focus ONLY on "Delegation Runtime Surface" and "Stateful Response Compaction" sections. Identify exactly one autonomy-validation risk/mismatch with a direct reference.',
       acceptanceCriteria: ["one specific risk or mismatch identified"],
+      executionContext: {
+        workspaceRoot: "/tmp/runtime-docs-scope",
+        allowedReadRoots: ["/tmp/runtime-docs-scope"],
+      },
     });
     expect(typeof result).toBe("string");
     expect(subAgentManager.spawn).toHaveBeenCalledWith(
@@ -3049,6 +3914,7 @@ describe("createSessionToolHandler", () => {
     const handler = createSessionToolHandler({
       sessionId: "session-parent",
       baseHandler: vi.fn(async () => "should-not-run"),
+      availableToolNames: ["web_search"],
       routerId: "router-a",
       send,
       delegation: () => ({
@@ -3061,6 +3927,7 @@ describe("createSessionToolHandler", () => {
 
     const result = await handler("execute_with_agent", {
       task: "Run child",
+      tools: ["web_search"],
     });
     const parsed = JSON.parse(result) as { error?: string };
 
@@ -3149,7 +4016,7 @@ describe("createSessionToolHandler", () => {
   it("allows nested delegation from sub-agent sessions in unsafe benchmark mode", async () => {
     const subAgentManager = {
       spawn: vi.fn(async () => "subagent:grandchild-1"),
-      getResult: vi.fn(() => ({
+      getResult: vi.fn(() => makeCompletedChildResult({
         sessionId: "subagent:grandchild-1",
         output: '{"summary":"grandchild completed"}',
         success: true,
@@ -3189,6 +4056,10 @@ describe("createSessionToolHandler", () => {
     const result = await handler("execute_with_agent", {
       task: "expand scope",
       tools: ["system.readFile"],
+      executionContext: {
+        workspaceRoot: "/tmp/unsafe-benchmark-nested",
+        allowedReadRoots: ["/tmp/unsafe-benchmark-nested"],
+      },
     });
     const parsed = JSON.parse(result) as { success?: boolean };
 
@@ -3236,5 +4107,203 @@ describe("createSessionToolHandler", () => {
     expect(parsed.error).not.toContain("below threshold");
     expect(sentMessages.some((msg) => msg.type === "tools.executing")).toBe(true);
     expect(sentMessages.some((msg) => msg.type === "tools.result")).toBe(true);
+  });
+
+  it("records pre/post mutation state in the effect ledger for managed file writes", async () => {
+    const workspace = createTempDir("agenc-effect-ledger-");
+    const targetPath = join(workspace, "AGENC.md");
+    writeFileSync(targetPath, "old content", "utf8");
+    const sentMessages: ControlResponse[] = [];
+    const ledger = EffectLedger.fromMemoryBackend(createMockMemoryBackend());
+
+    const handler = createSessionToolHandler({
+      sessionId: "session-effect-write",
+      baseHandler: vi.fn(async (_toolName, args) => {
+        writeFileSync(String(args.path), String(args.content), "utf8");
+        return JSON.stringify({ path: args.path, written: true });
+      }),
+      routerId: "router-a",
+      send: (message) => {
+        sentMessages.push(message);
+      },
+      effectLedger: ledger,
+      effectChannel: "test",
+    });
+
+    await handler("system.writeFile", {
+      path: targetPath,
+      content: "new content",
+    });
+
+    const [effect] = await ledger.listSessionEffects("session-effect-write");
+    expect(effect).toBeDefined();
+    expect(effect?.status).toBe("succeeded");
+    expect(effect?.preExecutionSnapshots?.[0]?.utf8Text).toBe("old content");
+    expect(effect?.postExecutionSnapshots?.[0]?.utf8Text).toBe("new content");
+    expect(effect?.compensation.status).toBe("available");
+
+    const executing = sentMessages.find((message) => message.type === "tools.executing");
+    const result = sentMessages.find((message) => message.type === "tools.result");
+    expect(executing?.payload).toMatchObject({
+      effectId: effect?.id,
+      effectIdempotencyKey: effect?.idempotencyKey,
+    });
+    expect(result?.payload).toMatchObject({
+      effectId: effect?.id,
+      effectIdempotencyKey: effect?.idempotencyKey,
+    });
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  it("embeds effect metadata in successful shell tool results when target artifacts are tracked", async () => {
+    const workspace = createTempDir("agenc-effect-shell-");
+    const targetPath = join(workspace, "AGENC.md");
+    writeFileSync(targetPath, "old shell content", "utf8");
+    const ledger = EffectLedger.fromMemoryBackend(createMockMemoryBackend());
+    const subAgentManager = {
+      getInfo: vi.fn(() => ({
+        sessionId: "subagent:shell-1",
+        parentSessionId: "session-parent",
+        depth: 1,
+        status: "running",
+        startedAt: Date.now() - 100,
+        task: "Patch the guide with shell",
+      })),
+      getExecutionContext: vi.fn(() => ({
+        version: "v1",
+        workspaceRoot: workspace,
+        allowedReadRoots: [workspace],
+        allowedWriteRoots: [workspace],
+        targetArtifacts: [targetPath],
+        effectClass: "shell",
+      })),
+    };
+    const handler = createSessionToolHandler({
+      sessionId: "subagent:shell-1",
+      baseHandler: vi.fn(async () => {
+        writeFileSync(targetPath, "new shell content", "utf8");
+        return JSON.stringify({ stdout: "ok", exitCode: 0 });
+      }),
+      availableToolNames: ["system.bash"],
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: workspace,
+      effectLedger: ledger,
+      effectChannel: "test",
+      delegation: () => ({
+        subAgentManager: subAgentManager as any,
+        policyEngine: null,
+        verifier: null,
+        lifecycleEmitter: null,
+      }),
+    });
+
+    const result = await handler("system.bash", {
+      command: `printf 'new shell content' > "${targetPath}"`,
+      cwd: workspace,
+    });
+    const parsed = JSON.parse(result) as {
+      __agencEffect?: {
+        targets?: Array<{ path?: string }>;
+        postExecutionSnapshots?: Array<{ path?: string; sha256?: string }>;
+      };
+    };
+
+    expect(parsed.__agencEffect?.targets).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: targetPath }),
+      ]),
+    );
+    expect(parsed.__agencEffect?.postExecutionSnapshots).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: targetPath }),
+      ]),
+    );
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  it("embeds repo-local behavior verification metadata in successful test commands", async () => {
+    const workspace = createTempDir("agenc-verification-shell-");
+    const handler = createSessionToolHandler({
+      sessionId: "session-verification",
+      baseHandler: vi.fn(async () => JSON.stringify({ stdout: "3 passed", exitCode: 0 })),
+      availableToolNames: ["system.bash"],
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: workspace,
+    });
+
+    const result = await handler("system.bash", {
+      command: "npm",
+      args: ["test"],
+      cwd: workspace,
+    });
+    const parsed = JSON.parse(result) as {
+      __agencVerification?: {
+        category?: string;
+        repoLocal?: boolean;
+        command?: string;
+        cwd?: string;
+      };
+    };
+
+    expect(parsed.__agencVerification).toMatchObject({
+      category: "behavior",
+      repoLocal: true,
+      cwd: workspace,
+      command: "npm test",
+    });
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  it("marks an effect denied when approval rejects a mutating tool before execution", async () => {
+    const workspace = createTempDir("agenc-effect-denied-");
+    const targetPath = join(workspace, "AGENC.md");
+    writeFileSync(targetPath, "old content", "utf8");
+    const approvalEngine = new ApprovalEngineImpl({
+      rules: [{ tool: "system.writeFile" }],
+    });
+    const ledger = EffectLedger.fromMemoryBackend(createMockMemoryBackend());
+    const baseHandler = vi.fn(async () => JSON.stringify({ written: true }));
+    const handler = createSessionToolHandler({
+      sessionId: "session-effect-denied",
+      baseHandler,
+      routerId: "router-a",
+      send: vi.fn(),
+      approvalEngine,
+      effectLedger: ledger,
+      effectChannel: "test",
+    });
+
+    const run = handler("system.writeFile", {
+      path: targetPath,
+      content: "new content",
+    });
+    await waitForPendingApproval(approvalEngine);
+    const [request] = approvalEngine.getPending();
+    expect(request).toBeDefined();
+    expect(request?.effect).toMatchObject({
+      effectId: expect.any(String),
+      effectKind: "filesystem_write",
+      compensationAvailable: true,
+    });
+    await approvalEngine.resolve(request!.id, {
+      requestId: request!.id,
+      disposition: "no",
+    });
+    const result = await run;
+
+    expect(baseHandler).not.toHaveBeenCalled();
+    expect(JSON.parse(result)).toEqual({
+      error: 'Tool "system.writeFile" denied by user',
+    });
+    const [effect] = await ledger.listSessionEffects("session-effect-denied");
+    expect(effect?.status).toBe("denied");
+    expect(effect?.approval?.requestId).toBe(request?.id);
+
+    rmSync(workspace, { recursive: true, force: true });
   });
 });

@@ -17,6 +17,8 @@ function makeActiveSnapshot(
     sessionId: "session-1",
     objective: "Monitor the process.",
     state: "working",
+    completionState: undefined,
+    remainingRequirements: undefined,
     cycleCount: 3,
     createdAt: 1_000,
     updatedAt: 11_000,
@@ -77,6 +79,20 @@ describe("background-run-control", () => {
     expect(message).toContain("Next check: ~3s");
   });
 
+  it("formats active status replies from completion truth when richer state exists", () => {
+    const message = formatBackgroundRunStatus(
+      makeActiveSnapshot({
+        completionState: "needs_verification",
+        remainingRequirements: ["workflow_verifier_pass"],
+      }),
+      12_000,
+    );
+
+    expect(message).toContain("Background run: needs_verification");
+    expect(message).toContain("Supervisor state: working");
+    expect(message).toContain("Remaining requirements: workflow_verifier_pass");
+  });
+
   it("formats inactive status replies from the recent snapshot", () => {
     const message = formatInactiveBackgroundRunStatus(makeRecentSnapshot(), 15_000);
 
@@ -99,6 +115,21 @@ describe("background-run-control", () => {
     expect(message).toContain("No active background run to stop.");
     expect(message).toContain("Last run: failed");
     expect(message).toContain("Last changed: ~4s ago");
+  });
+
+  it("formats inactive replies from completion truth when richer state exists", () => {
+    const message = formatInactiveBackgroundRunStatus(
+      makeRecentSnapshot({
+        state: "failed",
+        completionState: "blocked",
+        remainingRequirements: ["review_verification"],
+      }),
+      15_000,
+    );
+
+    expect(message).toContain("Last run: blocked");
+    expect(message).toContain("Supervisor state: failed");
+    expect(message).toContain("Remaining requirements: review_verification");
   });
 
   it("formats explicit admission denial replies for supervised runs", () => {

@@ -19,8 +19,13 @@ export function normalizePlannerResponse(params: {
   readonly content: string;
   readonly toolCalls: readonly LLMToolCall[];
   readonly repairRequirements?: ExplicitSubagentOrchestrationRequirements;
+  readonly plannerWorkspaceRoot?: string;
 }): PlannerParseResult {
-  const parsed = parsePlannerPlan(params.content, params.repairRequirements);
+  const parsed = parsePlannerPlan(
+    params.content,
+    params.repairRequirements,
+    { plannerWorkspaceRoot: params.plannerWorkspaceRoot },
+  );
   if (parsed.plan || params.toolCalls.length === 0) {
     return parsed;
   }

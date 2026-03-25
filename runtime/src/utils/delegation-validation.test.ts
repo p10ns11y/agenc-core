@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   contentHasExplicitFileArtifact,
+  extractDelegationTokens,
   getAcceptanceVerificationCategories,
   hasUnsupportedNarrativeFileClaims,
   isDefinitionOnlyVerificationText,
@@ -16,6 +17,14 @@ import {
 import { PROVIDER_NATIVE_WEB_SEARCH_TOOL } from "../llm/provider-native-search.js";
 
 describe("delegation-validation", () => {
+  it("normalizes prose punctuation off delegation tokens while preserving file-like artifacts", () => {
+    expect(
+      extractDelegationTokens("State that AGENC.md was updated."),
+    ).toEqual(
+      expect.arrayContaining(["state", "that", "agenc.md", "updated"]),
+    );
+  });
+
   it("does not treat script-definition criteria as build or test verification", () => {
     expect(
       getAcceptanceVerificationCategories("scripts for build/test/dev set"),
@@ -257,6 +266,77 @@ describe("delegation-validation", () => {
     expect(result.code).toBe("contradictory_completion_claim");
     expect(result.error).toContain("claimed completion");
     expect(result.error).toContain("unresolved work");
+  });
+
+  it("accepts read-only review findings that call out unresolved gaps", () => {
+    const result = validateDelegatedOutputContract({
+      spec: {
+        task: "review_plan",
+        objective:
+          "Review PLAN.md and identify gaps in shell job-control coverage",
+        inputContract:
+          "Read-only critique only; do not edit files in this phase",
+        acceptanceCriteria: [
+          "List the missing process-group, terminal handoff, and signal-handling details",
+          "Call out any risky omissions in the current plan",
+        ],
+        tools: ["system.readFile", "system.bash"],
+      },
+      output:
+        "**review_plan complete** Findings: missing `setpgid`, `tcsetpgrp`, `WUNTRACED`, and foreground signal restoration. " +
+        "The plan still has unresolved gaps around background job bookkeeping and pipe fd closure.",
+      toolCalls: [
+        {
+          name: "system.readFile",
+          args: {
+            path: "/workspace/agenc-shell/PLAN.md",
+          },
+          result:
+            '{"path":"/workspace/agenc-shell/PLAN.md","content":"# Plan\\n\\n## Execution\\n- pipelines\\n"}',
+        },
+        {
+          name: "system.bash",
+          args: {
+            command: "rg",
+            args: ["-n", "tcsetpgrp|setpgid|WUNTRACED", "/workspace/agenc-shell"],
+          },
+          result: '{"stdout":"","stderr":"","exitCode":1}',
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
+  });
+
+  it("accepts read-only review findings that describe blockers instead of implementation completion", () => {
+    const result = validateDelegatedOutputContract({
+      spec: {
+        task: "audit_shell_plan",
+        objective:
+          "Inspect the shell implementation plan and report missing operational details",
+        inputContract:
+          "Review only. No file mutation or implementation work is allowed in this phase.",
+        acceptanceCriteria: [
+          "Report blocking omissions before implementation begins",
+        ],
+        tools: ["system.readFile"],
+      },
+      output:
+        "Review findings: blocked on missing sections for terminal foreground handoff, SIGTSTP/SIGINT forwarding, and resumed-job state transitions. " +
+        "These are blockers for correct shell job control, not completed implementation.",
+      toolCalls: [
+        {
+          name: "system.readFile",
+          args: {
+            path: "/workspace/agenc-shell/PLAN.md",
+          },
+          result:
+            '{"path":"/workspace/agenc-shell/PLAN.md","content":"# Plan\\n\\n## Parser\\n- tokenize input\\n"}',
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
   });
 
   it("rejects completion claims that explicitly report an unmet acceptance criterion", () => {
@@ -777,6 +857,41 @@ describe("delegation-validation", () => {
     expect(result.ok).toBe(false);
     expect(result.code).toBe("blocked_phase_output");
     expect(result.error).toContain("Blocked on full verification");
+  });
+
+  it("does not reject completed phases that mention sibling work as out of scope", () => {
+    const result = validateDelegatedOutputContract({
+      spec: {
+        task: "explore_repository",
+        objective:
+          "List all files in the repo and summarize key project structure and guidance",
+        acceptanceCriteria: [
+          "Full directory listing obtained",
+          "Key files summarized",
+        ],
+        requiredToolCapabilities: ["system.listDir", "system.readFile"],
+      },
+      output:
+        "**explore_repository phase completed (tool-grounded).** " +
+        "Directory listing captured and PLAN.md summarized. " +
+        "Blocked from writing the guide per phase scope; that belongs to the next phase.",
+      toolCalls: [
+        {
+          name: "system.listDir",
+          args: { path: "/workspace/agenc-shell" },
+          result:
+            '{"path":"/workspace/agenc-shell","entries":[{"name":"PLAN.md","type":"file","size":5088}]}',
+        },
+        {
+          name: "system.readFile",
+          args: { path: "/workspace/agenc-shell/PLAN.md" },
+          result:
+            '{"path":"/workspace/agenc-shell/PLAN.md","size":5088,"encoding":"utf-8","content":"# Plan"}',
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
   });
 
   it("rejects completion claims that describe an implementation as stubbed", () => {
@@ -1494,6 +1609,178 @@ describe("delegation-validation", () => {
           args: ["-i", "s/broken/fixed/", "src/index.ts"],
         },
         result: '{"stdout":"","stderr":"","exitCode":0}',
+      }],
+    });
+
+    expect(result.ok).toBe(true);
+  });
+
+  it("accepts explicit file-authoring tasks when the target already exists and the child proves no mutation is needed", () => {
+    const result = validateDelegatedOutputContract({
+      spec: {
+        task: "generate_agenc_md",
+        objective:
+          "Create /home/tetsuo/git/stream-test/agenc-shell/AGENC.md with repository guidelines sections.",
+        inputContract: "Exploration results with PLAN.md and repo structure",
+        acceptanceCriteria: [
+          "AGENC.md written with all required sections",
+        ],
+      },
+      output:
+        "AGENC.md already exists with all required sections. No mutation needed.",
+      toolCalls: [{
+        name: "system.readFile",
+        args: {
+          path: "/home/tetsuo/git/stream-test/agenc-shell/AGENC.md",
+        },
+        result: JSON.stringify({
+          path: "/home/tetsuo/git/stream-test/agenc-shell/AGENC.md",
+          content:
+            "# Repository Guidelines\n\n## Project Structure\n\n## Build Commands\n",
+        }),
+      }],
+    });
+
+    expect(result.ok).toBe(true);
+  });
+
+  it("still rejects no-op file-authoring claims when the explicit target file was not evidenced", () => {
+    const result = validateDelegatedOutputContract({
+      spec: {
+        task: "generate_docs",
+        objective: "Create README.md and docs/architecture.md for the game",
+        inputContract: "Local docs only",
+        acceptanceCriteria: [
+          "Create README.md",
+          "Create docs/architecture.md",
+        ],
+      },
+      output:
+        "README.md already exists and no mutation is needed.",
+      toolCalls: [{
+        name: "system.readFile",
+        args: {
+          path: "/workspace/game/README.md",
+        },
+        result: JSON.stringify({
+          path: "/workspace/game/README.md",
+          content: "# README\n",
+        }),
+      }],
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe("missing_file_mutation_evidence");
+  });
+
+  it("requires named source artifact reads before derived file writes", () => {
+    const result = validateDelegatedOutputContract({
+      spec: {
+        task: "generate_agenc_md",
+        objective:
+          "Create /home/tetsuo/git/stream-test/agenc-shell/AGENC.md with repository guidelines sections.",
+        inputContract:
+          "Use PLAN.md and the current workspace state as the source of truth for the guide.",
+        contextRequirements: [
+          "cwd=/home/tetsuo/git/stream-test/agenc-shell",
+        ],
+        acceptanceCriteria: [
+          "AGENC.md written with all required sections",
+        ],
+      },
+      output:
+        "Wrote /home/tetsuo/git/stream-test/agenc-shell/AGENC.md with repository guidelines.",
+      toolCalls: [{
+        name: "system.writeFile",
+        args: {
+          path: "/home/tetsuo/git/stream-test/agenc-shell/AGENC.md",
+          content: "# Repository Guidelines\n",
+        },
+        result: JSON.stringify({
+          path: "/home/tetsuo/git/stream-test/agenc-shell/AGENC.md",
+          written: true,
+        }),
+      }],
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe("missing_required_source_evidence");
+  });
+
+  it("accepts derived file writes once the named source artifact was read first", () => {
+    const result = validateDelegatedOutputContract({
+      spec: {
+        task: "generate_agenc_md",
+        objective:
+          "Create /home/tetsuo/git/stream-test/agenc-shell/AGENC.md with repository guidelines sections.",
+        inputContract:
+          "Use PLAN.md as the source of truth for the guide.",
+        contextRequirements: [
+          "cwd=/home/tetsuo/git/stream-test/agenc-shell",
+        ],
+        acceptanceCriteria: [
+          "AGENC.md written with all required sections",
+        ],
+      },
+      output:
+        "Wrote /home/tetsuo/git/stream-test/agenc-shell/AGENC.md with repository guidelines derived from PLAN.md.",
+      toolCalls: [
+        {
+          name: "system.readFile",
+          args: {
+            path: "/home/tetsuo/git/stream-test/agenc-shell/PLAN.md",
+          },
+          result: JSON.stringify({
+            path: "/home/tetsuo/git/stream-test/agenc-shell/PLAN.md",
+            content: "# Plan\n\n## Directory Structure\n",
+          }),
+        },
+        {
+          name: "system.writeFile",
+          args: {
+            path: "/home/tetsuo/git/stream-test/agenc-shell/AGENC.md",
+            content: "# Repository Guidelines\n",
+          },
+          result: JSON.stringify({
+            path: "/home/tetsuo/git/stream-test/agenc-shell/AGENC.md",
+            written: true,
+          }),
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
+  });
+
+  it("accepts grounded no-op success from typed required source artifacts without relying on prompt file extraction", () => {
+    const result = validateDelegatedOutputContract({
+      spec: {
+        task: "review_agenc_md",
+        objective: "Verify that AGENC.md already satisfies the requested sections.",
+        inputContract: "Review the existing guide and report whether it already satisfies the request.",
+        acceptanceCriteria: ["Ground the review on the current guide before claiming no changes are needed."],
+        executionContext: {
+          version: "v1",
+          workspaceRoot: "/home/tetsuo/git/stream-test/agenc-shell",
+          requiredSourceArtifacts: [
+            "/home/tetsuo/git/stream-test/agenc-shell/AGENC.md",
+          ],
+          targetArtifacts: [
+            "/home/tetsuo/git/stream-test/agenc-shell/AGENC.md",
+          ],
+        },
+      },
+      output:
+        "AGENC.md already satisfies the requested guide sections. No mutation needed.",
+      toolCalls: [{
+        name: "system.readFile",
+        args: {
+          path: "/home/tetsuo/git/stream-test/agenc-shell/AGENC.md",
+        },
+        result: JSON.stringify({
+          path: "/home/tetsuo/git/stream-test/agenc-shell/AGENC.md",
+          content: "# Repository Guidelines\n",
+        }),
       }],
     });
 
@@ -3212,6 +3499,59 @@ Project is functional for core/pathfinding; CLI/web assumed usable per authored 
       "system.bash",
       "system.listDir",
       "system.writeFile",
+    ]);
+  });
+
+  it("keeps both listDir and readFile available for local exploratory research phases", () => {
+    const toolNames = resolveDelegatedInitialToolChoiceToolNames(
+      {
+        task: "explore_repository",
+        objective:
+          "List all files in /workspace/agenc-shell and read key files to summarize project structure and guidance",
+        inputContract: "No input - initial exploration",
+        acceptanceCriteria: [
+          "Full directory listing obtained",
+          "Key file contents read and reported",
+        ],
+      },
+      [
+        "system.readFile",
+        "system.listDir",
+      ],
+    );
+
+    expect(toolNames).toEqual([
+      "system.readFile",
+      "system.listDir",
+    ]);
+  });
+
+  it("prioritizes inspection tools after missing source-grounding evidence", () => {
+    const toolNames = resolveDelegatedInitialToolChoiceToolNames(
+      {
+        task: "generate_agenc_md",
+        objective:
+          "Create /home/tetsuo/git/stream-test/agenc-shell/AGENC.md with repository guidelines sections.",
+        inputContract:
+          "Use PLAN.md and the current workspace state as the source of truth for the guide.",
+        contextRequirements: [
+          "cwd=/home/tetsuo/git/stream-test/agenc-shell",
+        ],
+        acceptanceCriteria: [
+          "AGENC.md written with all required sections",
+        ],
+        lastValidationCode: "missing_required_source_evidence",
+      },
+      [
+        "system.readFile",
+        "system.listDir",
+        "system.writeFile",
+      ],
+    );
+
+    expect(toolNames).toEqual([
+      "system.listDir",
+      "system.readFile",
     ]);
   });
 

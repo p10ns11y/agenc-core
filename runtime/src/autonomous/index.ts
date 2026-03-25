@@ -122,6 +122,15 @@ export {
   type ExecutionStep,
 } from "./desktop-executor.js";
 export {
+  GoalStore,
+  type GoalStoreInput,
+  type StrategicGoalRecord,
+  type StrategicGoalStatus,
+  type StrategicExecutionSummary,
+  type StrategicWorkingNote,
+} from "./goal-store.js";
+export { StrategicMemory } from "./strategic-memory.js";
+export {
   GoalManager,
   type GoalManagerConfig,
   type ManagedGoal,

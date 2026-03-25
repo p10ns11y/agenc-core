@@ -11,11 +11,18 @@ import type { ChatExecutor, ChatExecutorResult } from "../llm/chat-executor.js";
 import type { LLMMessage, LLMProvider, ToolHandler } from "../llm/types.js";
 import type { GatewayMessage } from "./message.js";
 import type { Logger } from "../utils/logger.js";
+import type {
+  WorkflowProgressRequirement,
+  WorkflowProgressSnapshot,
+} from "../workflow/completion-progress.js";
 import type { ToolRoutingDecision } from "./tool-routing.js";
 import type { ProgressTracker } from "./progress.js";
 import type { PolicyEvaluationScope, PolicyEngine } from "../policy/index.js";
 import type { TelemetryCollector } from "../telemetry/types.js";
+import type { RuntimeIncidentDiagnostics } from "../telemetry/incident-diagnostics.js";
 import type { BackgroundRunNotifier } from "./background-run-notifier.js";
+import type { EffectLedger } from "../workflow/effect-ledger.js";
+import type { RuntimeFaultInjector } from "../eval/fault-injection.js";
 import {
   AGENT_RUN_SCHEMA_VERSION,
 } from "./agent-run-contract.js";
@@ -48,6 +55,8 @@ export interface BackgroundRunStatusSnapshot {
   readonly sessionId: string;
   readonly objective: string;
   readonly state: BackgroundRunState;
+  readonly completionState?: WorkflowProgressSnapshot["completionState"];
+  readonly remainingRequirements?: readonly WorkflowProgressRequirement[];
   readonly cycleCount: number;
   readonly lastVerifiedAt?: number;
   readonly createdAt: number;
@@ -109,6 +118,7 @@ export interface ActiveBackgroundRun {
   lastToolEvidence?: string;
   lastHeartbeatContent?: string;
   lastWakeReason?: BackgroundRunWakeReason;
+  completionProgress?: WorkflowProgressSnapshot;
   carryForward?: BackgroundRunCarryForwardState;
   blocker?: BackgroundRunBlockerState;
   approvalState: BackgroundRunApprovalState;
@@ -164,6 +174,9 @@ export interface BackgroundRunSupervisorConfig {
   readonly workerMaxConcurrentRuns?: number;
   readonly notifier?: BackgroundRunNotifier;
   readonly traceProviderPayloads?: boolean;
+  readonly effectLedger?: EffectLedger;
+  readonly incidentDiagnostics?: RuntimeIncidentDiagnostics;
+  readonly faultInjector?: RuntimeFaultInjector;
 }
 
 export interface StartBackgroundRunParams {
@@ -214,6 +227,34 @@ export function trimHistory(history: LLMMessage[]): LLMMessage[] {
   return history.slice(history.length - MAX_RUN_HISTORY_MESSAGES);
 }
 
+export function toStatusSnapshot(params: {
+  readonly run: ActiveBackgroundRun;
+  readonly pendingSignals: number;
+}): BackgroundRunStatusSnapshot {
+  const { run, pendingSignals } = params;
+  return {
+    id: run.id,
+    sessionId: run.sessionId,
+    objective: run.objective,
+    state: run.state,
+    completionState: run.completionProgress?.completionState,
+    remainingRequirements: run.completionProgress?.remainingRequirements,
+    cycleCount: run.cycleCount,
+    lastVerifiedAt: run.lastVerifiedAt,
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+    nextCheckAt: run.nextCheckAt,
+    nextHeartbeatAt: run.nextHeartbeatAt,
+    lastUserUpdate: run.lastUserUpdate,
+    lastWakeReason: run.lastWakeReason,
+    pendingSignals,
+    carryForwardSummary: run.carryForward?.summary,
+    blockerSummary: run.blocker?.summary,
+    watchCount: run.watchRegistrations.length,
+    fenceToken: run.fenceToken,
+  };
+}
+
 export function toPersistedRun(run: ActiveBackgroundRun): PersistedBackgroundRun {
   return {
     version: AGENT_RUN_SCHEMA_VERSION,
@@ -236,6 +277,7 @@ export function toPersistedRun(run: ActiveBackgroundRun): PersistedBackgroundRun
     lastToolEvidence: run.lastToolEvidence,
     lastHeartbeatContent: run.lastHeartbeatContent,
     lastWakeReason: run.lastWakeReason,
+    completionProgress: run.completionProgress,
     carryForward: run.carryForward,
     blocker: run.blocker,
     approvalState: run.approvalState,
@@ -278,6 +320,8 @@ export function toRecentSnapshot(
     pendingSignals: run.pendingSignals.length + queuedWakeCount,
     carryForwardSummary: run.carryForward?.summary,
     blockerSummary: run.blocker?.summary,
+    completionState: run.completionProgress?.completionState,
+    remainingRequirements: run.completionProgress?.remainingRequirements,
     watchCount: run.watchRegistrations.length,
     fenceToken: run.fenceToken,
     preferredWorkerId: run.preferredWorkerId,
@@ -307,6 +351,7 @@ export function toActiveRun(run: PersistedBackgroundRun): ActiveBackgroundRun {
     lastToolEvidence: run.lastToolEvidence,
     lastHeartbeatContent: run.lastHeartbeatContent,
     lastWakeReason: run.lastWakeReason,
+    completionProgress: run.completionProgress,
     carryForward: run.carryForward,
     blocker: run.blocker,
     approvalState: run.approvalState,

@@ -1467,15 +1467,25 @@ describe("buildDesktopContext", () => {
 });
 
 describe("project init", () => {
-  it("routes slash /init through a synthetic user message injection", async () => {
+  it("acks slash /init immediately and completes in the background", async () => {
     const dm = new DaemonManager({ configPath: "/tmp/config.json" });
-    const injectSyntheticUserMessage = vi.fn();
     (dm as any)._webChatChannel = {
       loadSessionWorkspaceRoot: vi.fn(async () => "/repo"),
-      injectSyntheticUserMessage,
     };
     (dm as any)._hostWorkspacePath = "/repo";
     (dm as any).gateway = { config: {} };
+    vi.spyOn(dm as any, "runProjectInitOperation").mockResolvedValue({
+      status: "updated",
+      filePath: "/repo/AGENC.md",
+      content: "# Repository Guidelines",
+      attempts: 1,
+      delegatedInvestigations: 2,
+      result: {
+        provider: "grok",
+        model: "grok-code-fast-1",
+        usedFallback: false,
+      },
+    });
 
     const registry = (dm as any).createCommandRegistry(
       {} as any,
@@ -1500,11 +1510,132 @@ describe("project init", () => {
     );
 
     expect(handled).toBe(true);
-    expect(injectSyntheticUserMessage).toHaveBeenCalledWith(
+    expect((dm as any).runProjectInitOperation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceRoot: "/repo",
+        force: true,
+        sessionId: expect.stringMatching(/^slash-init:session-init:/),
+        channel: "webchat",
+        traceLabel: "slash.init",
+      }),
+    );
+    expect(reply).toHaveBeenCalledWith(
+      "Starting /init for /repo/AGENC.md. I'll reply when it finishes.",
+    );
+    await Promise.resolve();
+    expect(reply).toHaveBeenCalledWith(
+      expect.stringContaining("AGENC.md updated at /repo/AGENC.md"),
+    );
+  });
+
+  it("dedupes concurrent slash /init runs per session", async () => {
+    const dm = new DaemonManager({ configPath: "/tmp/config.json" });
+    (dm as any)._webChatChannel = {
+      loadSessionWorkspaceRoot: vi.fn(async () => "/repo"),
+    };
+    (dm as any)._hostWorkspacePath = "/repo";
+    (dm as any).gateway = { config: {} };
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.spyOn(dm as any, "runProjectInitOperation").mockImplementation(async () => {
+      await gate;
+      return {
+        status: "updated",
+        filePath: "/repo/AGENC.md",
+        content: "# Repository Guidelines",
+        attempts: 1,
+        delegatedInvestigations: 1,
+        result: null,
+      };
+    });
+
+    const registry = (dm as any).createCommandRegistry(
+      {} as any,
+      (sessionKey: string) => sessionKey,
+      [],
+      {} as any,
+      {} as any,
+      [],
+      [],
+      { dispatch: vi.fn() } as any,
+      vi.fn(),
+      null,
+    );
+
+    const reply = vi.fn(async () => undefined);
+    const first = registry.dispatch(
+      "/init --force",
       "session-init",
       "sender-init",
-      expect.stringContaining("Repository Guidelines"),
+      "webchat",
+      reply,
     );
+    await Promise.resolve();
+    const second = await registry.dispatch(
+      "/init --force",
+      "session-init",
+      "sender-init",
+      "webchat",
+      reply,
+    );
+
+    expect(second).toBe(true);
+    expect(reply).toHaveBeenCalledWith(
+      "Starting /init for /repo/AGENC.md. I'll reply when it finishes.",
+    );
+    expect(reply).toHaveBeenCalledWith(
+      "Init already running for /repo/AGENC.md.",
+    );
+
+    release();
+    await first;
+  });
+
+  it("isolates slash /init execution from the parent chat session", async () => {
+    const dm = new DaemonManager({ configPath: "/tmp/config.json" });
+    (dm as any)._webChatChannel = {
+      loadSessionWorkspaceRoot: vi.fn(async () => "/repo"),
+    };
+    (dm as any)._hostWorkspacePath = "/repo";
+    (dm as any).gateway = { config: {} };
+    const runProjectInitOperation = vi
+      .spyOn(dm as any, "runProjectInitOperation")
+      .mockResolvedValue({
+        status: "created",
+        filePath: "/repo/AGENC.md",
+        content: "# Repository Guidelines",
+        attempts: 1,
+        delegatedInvestigations: 0,
+        result: null,
+      });
+
+    const registry = (dm as any).createCommandRegistry(
+      {} as any,
+      (sessionKey: string) => sessionKey,
+      [],
+      {} as any,
+      {} as any,
+      [],
+      [],
+      { dispatch: vi.fn() } as any,
+      vi.fn(),
+      null,
+    );
+
+    const reply = vi.fn(async () => undefined);
+    await registry.dispatch(
+      "/init",
+      "session-parent",
+      "sender-parent",
+      "webchat",
+      reply,
+    );
+
+    const initCall = runProjectInitOperation.mock.calls[0]?.[0];
+    expect(initCall.sessionId).toMatch(/^slash-init:session-parent:/);
+    expect(initCall.sessionId).not.toBe("session-parent");
   });
 
   it("returns a structured payload for init.run control messages", async () => {
@@ -2959,10 +3090,13 @@ describe("DaemonManager", () => {
       content: "export const pinned = true;\n",
     });
 
-    expect(baseToolHandler).toHaveBeenCalledWith("system.writeFile", {
-      path: "/tmp/pinned-workspace/src/app.ts",
-      content: "export const pinned = true;\n",
-    });
+    expect(baseToolHandler).toHaveBeenCalledWith(
+      "system.writeFile",
+      expect.objectContaining({
+        path: "/tmp/pinned-workspace/src/app.ts",
+        content: "export const pinned = true;\n",
+      }),
+    );
     expect(webChat.loadSessionWorkspaceRoot).not.toHaveBeenCalled();
   });
 

@@ -70,6 +70,32 @@ describe("chat-executor-planner explicit orchestration requirements", () => {
     );
   });
 
+  it("grounds planner schema examples to the known workspace root", () => {
+    const messages = buildPlannerMessages(
+      "Go through PLAN.md and implement it.",
+      [],
+      512,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "/home/tetsuo/git/AgenC",
+    );
+
+    expect(messages[0]).toMatchObject({
+      role: "system",
+      content: expect.stringContaining(
+        '"workspaceRoot": "/home/tetsuo/git/AgenC"',
+      ),
+    });
+    expect(messages[0]?.content).not.toContain(
+      '"workspaceRoot": "/abs/path"',
+    );
+    expect(messages[0]?.content).not.toContain(
+      '"requiredSourceArtifacts": ["/abs/path/PLAN.md"]',
+    );
+  });
+
   it("extracts explicit request-level verification requirements from verification directives", () => {
     expect(
       extractPlannerVerificationRequirements(
@@ -175,7 +201,11 @@ describe("chat-executor-planner explicit orchestration requirements", () => {
               "system.readFile",
               "system.listDir",
             ],
-            context_requirements: ["cwd=/tmp/freight-flow-ts"],
+            execution_context: {
+              workspaceRoot: "/tmp/freight-flow-ts",
+              allowedReadRoots: ["/tmp/freight-flow-ts"],
+              allowedWriteRoots: ["/tmp/freight-flow-ts"],
+            },
             max_budget_hint: "4m",
           },
           {
@@ -203,7 +233,11 @@ describe("chat-executor-planner explicit orchestration requirements", () => {
               "system.readFile",
               "system.writeFile",
             ],
-            context_requirements: ["cwd=/tmp/freight-flow-ts"],
+            execution_context: {
+              workspaceRoot: "/tmp/freight-flow-ts",
+              allowedReadRoots: ["/tmp/freight-flow-ts"],
+              allowedWriteRoots: ["/tmp/freight-flow-ts"],
+            },
             max_budget_hint: "5m",
           },
           {
@@ -264,7 +298,11 @@ describe("chat-executor-planner explicit orchestration requirements", () => {
               "system.readFile",
               "system.listDir",
             ],
-            context_requirements: ["cwd=/tmp/agenc-codegen/regexkit"],
+            execution_context: {
+              workspaceRoot: "/tmp/agenc-codegen/regexkit",
+              allowedReadRoots: ["/tmp/agenc-codegen/regexkit"],
+              allowedWriteRoots: ["/tmp/agenc-codegen/regexkit"],
+            },
             max_budget_hint: "4m",
           },
           {
@@ -509,6 +547,17 @@ describe("chat-executor-planner explicit orchestration requirements", () => {
     expect(decision.reason).toContain("delegation_cue");
   });
 
+  it("forces planner routing for grounded plan-artifact expansion requests", () => {
+    const decision = assessPlannerDecision(
+      true,
+      "i want you to read @TODO.md and turn it into a complete plan for making a shell in the c-programming language.",
+      [],
+    );
+
+    expect(decision.shouldPlan).toBe(true);
+    expect(decision.reason).toContain("plan_artifact_request");
+  });
+
   it("extracts required subagent steps from the compact 'plan required' prompt shape", () => {
     const requirements = extractExplicitSubagentOrchestrationRequirements(
       "Subagent context audit SG3. Sub-agent orchestration plan required: " +
@@ -558,7 +607,11 @@ describe("chat-executor-planner explicit orchestration requirements", () => {
               "system.readFile",
               "system.listDir",
             ],
-            context_requirements: ["cwd=/tmp/freight-flow-ts"],
+            execution_context: {
+              workspaceRoot: "/tmp/freight-flow-ts",
+              allowedReadRoots: ["/tmp/freight-flow-ts"],
+              allowedWriteRoots: ["/tmp/freight-flow-ts"],
+            },
             max_budget_hint: "3m",
           },
         ],
@@ -607,7 +660,11 @@ describe("chat-executor-planner explicit orchestration requirements", () => {
               "Only file authoring completed",
             ],
             required_tool_capabilities: ["filesystem", "code_generation"],
-            context_requirements: ["cwd=/tmp/freight-flow-ts"],
+            execution_context: {
+              workspaceRoot: "/tmp/freight-flow-ts",
+              allowedReadRoots: ["/tmp/freight-flow-ts"],
+              allowedWriteRoots: ["/tmp/freight-flow-ts"],
+            },
             max_budget_hint: "12m",
           },
         ],
@@ -816,7 +873,11 @@ describe("chat-executor-planner explicit orchestration requirements", () => {
                 "system.writeFile",
                 "system.readFile",
               ],
-              context_requirements: ["cwd:/tmp/grid-router-ts"],
+              execution_context: {
+                workspaceRoot: "/tmp/grid-router-ts",
+                allowedReadRoots: ["/tmp/grid-router-ts"],
+                allowedWriteRoots: ["/tmp/grid-router-ts"],
+              },
               max_budget_hint: "12m",
             },
           },
@@ -835,11 +896,185 @@ describe("chat-executor-planner explicit orchestration requirements", () => {
           "Core parser+algorithms in src/grid.ts and src/algorithms.ts",
         ],
         requiredToolCapabilities: ["system.writeFile", "system.readFile"],
-        contextRequirements: ["cwd:/tmp/grid-router-ts"],
+        executionContext: expect.objectContaining({
+          workspaceRoot: "/tmp/grid-router-ts",
+        }),
         maxBudgetHint: "12m",
         canRunParallel: false,
       }),
     ]);
+  });
+
+  it("parses typed execution envelopes for subagent steps and does not require cwd text inference", () => {
+    const result = parsePlannerPlan(
+      JSON.stringify({
+        reason: "delegate_doc_write",
+        requiresSynthesis: true,
+        steps: [
+          {
+            name: "write_agenc_md",
+            step_type: "subagent_task",
+            objective: "Write the repository guide",
+            input_contract: "Use the current PLAN.md as the source of truth.",
+            acceptance_criteria: [
+              "AGENC.md written under the repo root",
+            ],
+            required_tool_capabilities: ["system.writeFile", "system.readFile"],
+            execution_context: {
+              workspaceRoot: "/tmp/agenc-shell",
+              allowedReadRoots: ["/tmp/agenc-shell"],
+              allowedWriteRoots: ["/tmp/agenc-shell"],
+              requiredSourceArtifacts: ["/tmp/agenc-shell/PLAN.md"],
+              targetArtifacts: ["/tmp/agenc-shell/AGENC.md"],
+              allowedTools: ["system.readFile", "system.writeFile"],
+              effectClass: "filesystem_write",
+              verificationMode: "mutation_required",
+              stepKind: "delegated_write",
+            },
+            max_budget_hint: "6m",
+          },
+        ],
+      }),
+    );
+
+    expect(result.diagnostics).toEqual([]);
+    expect(result.plan?.steps).toEqual([
+      expect.objectContaining({
+        name: "write_agenc_md",
+        stepType: "subagent_task",
+        executionContext: expect.objectContaining({
+          version: "v1",
+          workspaceRoot: "/tmp/agenc-shell",
+          requiredSourceArtifacts: ["/tmp/agenc-shell/PLAN.md"],
+          targetArtifacts: ["/tmp/agenc-shell/AGENC.md"],
+          allowedTools: ["system.readFile", "system.writeFile"],
+          effectClass: "filesystem_write",
+          verificationMode: "mutation_required",
+          stepKind: "delegated_write",
+        }),
+      }),
+    ]);
+  });
+
+  it("rejects subagent execution envelopes that still use /workspace placeholder roots", () => {
+    const result = parsePlannerPlan(
+      JSON.stringify({
+        reason: "delegate_write",
+        requiresSynthesis: true,
+        steps: [
+          {
+            name: "write_agenc_md",
+            step_type: "subagent_task",
+            objective: "Write the repository guide",
+            input_contract: "Use PLAN.md as source of truth.",
+            acceptance_criteria: ["AGENC.md written under the repo root"],
+            required_tool_capabilities: ["system.writeFile", "system.readFile"],
+            execution_context: {
+              workspaceRoot: "/workspace/project-a",
+              allowedReadRoots: ["/workspace/project-a"],
+              allowedWriteRoots: ["/workspace/project-a"],
+              requiredSourceArtifacts: ["/workspace/project-a/PLAN.md"],
+              targetArtifacts: ["/workspace/project-a/AGENC.md"],
+            },
+            max_budget_hint: "6m",
+          },
+        ],
+      }),
+    );
+
+    expect(result.plan).toBeUndefined();
+    expect(result.diagnostics).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          category: "parse",
+          code: "planner_execution_context_placeholder_root",
+        }),
+      ]),
+    );
+  });
+
+  it("rejects planner placeholder paths instead of repairing them into live scope", () => {
+    const result = parsePlannerPlan(
+      JSON.stringify({
+        reason: "implement_plan",
+        requiresSynthesis: true,
+        steps: [
+          {
+            name: "read_plan",
+            step_type: "deterministic_tool",
+            tool: "system.readFile",
+            args: {
+              path: "/abs/path/PLAN.md",
+            },
+          },
+          {
+            name: "implement_core",
+            step_type: "subagent_task",
+            objective: "Implement the plan",
+            input_contract: "Use PLAN.md as the source of truth.",
+            acceptance_criteria: ["Write src/index.ts"],
+            required_tool_capabilities: ["system.readFile", "system.writeFile"],
+            execution_context: {
+              workspaceRoot: "/abs/path",
+              allowedReadRoots: ["/abs/path"],
+              allowedWriteRoots: ["/abs/path"],
+              requiredSourceArtifacts: ["/abs/path/PLAN.md"],
+              targetArtifacts: ["/abs/path/src/index.ts"],
+              allowedTools: ["system.readFile", "system.writeFile"],
+              effectClass: "filesystem_write",
+              verificationMode: "mutation_required",
+              stepKind: "delegated_write",
+            },
+            max_budget_hint: "6m",
+          },
+        ],
+      }),
+      undefined,
+      { plannerWorkspaceRoot: "/home/tetsuo/git/AgenC" },
+    );
+
+    expect(result.plan).toBeUndefined();
+    expect(result.diagnostics).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          category: "parse",
+          code: "planner_deterministic_tool_placeholder_path",
+        }),
+      ]),
+    );
+  });
+
+  it("rejects legacy planner cwd requirements instead of promoting them into execution context", () => {
+    const result = parsePlannerPlan(
+      JSON.stringify({
+        reason: "legacy_cwd",
+        requiresSynthesis: true,
+        steps: [
+          {
+            name: "write_plan",
+            step_type: "subagent_task",
+            objective: "Review the plan",
+            input_contract: "Use PLAN.md as the source of truth.",
+            acceptance_criteria: ["Return one grounded finding"],
+            required_tool_capabilities: ["system.readFile"],
+            context_requirements: ["cwd=/workspace/project-a"],
+            max_budget_hint: "2m",
+          },
+        ],
+      }),
+      undefined,
+      { plannerWorkspaceRoot: "/home/tetsuo/agent-test" },
+    );
+
+    expect(result.plan).toBeUndefined();
+    expect(result.diagnostics).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          category: "parse",
+          code: "planner_legacy_runtime_scope_channel",
+        }),
+      ]),
+    );
   });
 
   it("promotes deterministic tool parameters from the step root into args", () => {
@@ -1160,6 +1395,72 @@ describe("chat-executor-planner explicit orchestration requirements", () => {
     ]);
   });
 
+  it("rejects substantial software plan-doc requests that collapse directly to a single writeFile step", () => {
+    const diagnostics = validatePlannerStepContracts(
+      {
+        reason: "write_todo_plan",
+        requiresSynthesis: false,
+        confidence: 0.7,
+        steps: [
+          {
+            name: "create_todo_md",
+            stepType: "deterministic_tool",
+            dependsOn: [],
+            tool: "system.writeFile",
+            args: {
+              path: "TODO.md",
+              content: "# TODO\n",
+            },
+          },
+        ],
+        edges: [],
+      },
+      "Write a TODO.md with a complete plan for building a C shell with jobs, fork(), argv parsing, and pipes.",
+    );
+
+    expect(diagnostics).toEqual([
+      expect.objectContaining({
+        category: "validation",
+        code: "planner_plan_artifact_single_write_collapse",
+      }),
+    ]);
+  });
+
+  it("allows substantial software plan-doc requests when the plan grounds before the final artifact write", () => {
+    const diagnostics = validatePlannerStepContracts(
+      {
+        reason: "write_todo_plan",
+        requiresSynthesis: false,
+        confidence: 0.76,
+        steps: [
+          {
+            name: "inspect_workspace",
+            stepType: "deterministic_tool",
+            dependsOn: [],
+            tool: "system.listDir",
+            args: {
+              path: "/tmp/agenc-shell",
+            },
+          },
+          {
+            name: "create_todo_md",
+            stepType: "deterministic_tool",
+            dependsOn: ["inspect_workspace"],
+            tool: "system.writeFile",
+            args: {
+              path: "/tmp/agenc-shell/TODO.md",
+              content: "# TODO\n",
+            },
+          },
+        ],
+        edges: [{ from: "inspect_workspace", to: "create_todo_md" }],
+      },
+      "Write a TODO.md with a complete plan for building a C shell with jobs, fork(), argv parsing, and pipes.",
+    );
+
+    expect(diagnostics).toEqual([]);
+  });
+
   it("rejects deterministic bash steps that embed shell separators in direct args", () => {
     const diagnostics = validatePlannerStepContracts({
       reason: "bad_direct_bash_args",
@@ -1250,7 +1551,11 @@ describe("chat-executor-planner explicit orchestration requirements", () => {
             input_contract: "All packages done",
             acceptance_criteria: ["README.md present with instructions"],
             required_tool_capabilities: ["system.writeFile"],
-            context_requirements: ["cwd=/tmp/maze-forge-ts"],
+            execution_context: {
+              workspaceRoot: "/tmp/maze-forge-ts",
+              allowedReadRoots: ["/tmp/maze-forge-ts"],
+              allowedWriteRoots: ["/tmp/maze-forge-ts"],
+            },
             max_budget_hint: "30s",
           },
         ],

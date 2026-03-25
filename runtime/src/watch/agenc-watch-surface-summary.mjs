@@ -76,6 +76,8 @@ function stateTone(value) {
     case "disabled":
     case "reconnecting":
     case "paused":
+    case "partial":
+    case "needs_verification":
     case "blocked":
     case "limited":
     case "warming":

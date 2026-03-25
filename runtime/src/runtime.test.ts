@@ -16,6 +16,7 @@ import { AgentRuntime } from "./runtime.js";
 import { EventMonitor } from "./events/index.js";
 import { AgentManager } from "./agent/manager.js";
 import { TaskExecutor } from "./task/index.js";
+import { SqliteDeadLetterQueue } from "./task/sqlite-dlq.js";
 import { AgentStatus } from "./agent/types.js";
 import { ValidationError } from "./types/errors.js";
 import { ReplayEventBridge, type ReplayBridgeHandle } from "./replay/bridge.js";
@@ -421,6 +422,9 @@ describe("AgentRuntime", () => {
       });
 
       expect(executor).toBeInstanceOf(TaskExecutor);
+      expect(executor.getDeadLetterQueue()).toBeInstanceOf(
+        SqliteDeadLetterQueue,
+      );
     });
 
     it("returns a new instance on each call", () => {
@@ -523,6 +527,25 @@ describe("AgentRuntime", () => {
       executors.forEach((e) => expect(e).toBeInstanceOf(TaskExecutor));
       // All distinct instances
       expect(new Set(executors).size).toBe(3);
+    });
+
+    it("allows explicit memory-only task persistence mode", () => {
+      const keypair = Keypair.generate();
+      const runtime = new AgentRuntime({
+        connection: mockConnection,
+        wallet: keypair,
+        capabilities: 1n,
+      });
+
+      const executor = runtime.createTaskExecutor({
+        operations: mockOperations,
+        handler: mockHandler,
+        persistence: { mode: "memory" },
+      });
+
+      expect(executor.getDeadLetterQueue()).not.toBeInstanceOf(
+        SqliteDeadLetterQueue,
+      );
     });
 
     it("returns executor with zeroed metrics", () => {

@@ -48,7 +48,11 @@ export interface SubrunBudget {
 
 export interface SubrunScope {
   readonly allowedTools: readonly string[];
+  readonly workspaceRoot?: string;
+  readonly allowedReadRoots?: readonly string[];
   readonly allowedWriteRoots?: readonly string[];
+  readonly requiredSourceArtifacts?: readonly string[];
+  readonly targetArtifacts?: readonly string[];
   readonly allowedHosts?: readonly string[];
 }
 
@@ -122,6 +126,12 @@ export function assertValidSubrunScope(
   scope: SubrunScope,
   context = "subrun scope",
 ): void {
+  if (
+    scope.workspaceRoot !== undefined &&
+    (typeof scope.workspaceRoot !== "string" || scope.workspaceRoot.trim().length === 0)
+  ) {
+    throw new Error(`${context}: workspaceRoot must be a non-empty string when provided`);
+  }
   if (!Array.isArray(scope.allowedTools) || scope.allowedTools.length === 0) {
     throw new Error(`${context}: allowedTools must be a non-empty array`);
   }
@@ -129,10 +139,34 @@ export function assertValidSubrunScope(
     throw new Error(`${context}: allowedTools must only contain non-empty strings`);
   }
   if (
+    scope.allowedReadRoots !== undefined &&
+    scope.allowedReadRoots.some((path) => typeof path !== "string" || path.trim().length === 0)
+  ) {
+    throw new Error(`${context}: allowedReadRoots must only contain non-empty strings`);
+  }
+  if (
     scope.allowedWriteRoots !== undefined &&
     scope.allowedWriteRoots.some((path) => typeof path !== "string" || path.trim().length === 0)
   ) {
     throw new Error(`${context}: allowedWriteRoots must only contain non-empty strings`);
+  }
+  if (
+    scope.requiredSourceArtifacts !== undefined &&
+    scope.requiredSourceArtifacts.some(
+      (path) => typeof path !== "string" || path.trim().length === 0,
+    )
+  ) {
+    throw new Error(
+      `${context}: requiredSourceArtifacts must only contain non-empty strings`,
+    );
+  }
+  if (
+    scope.targetArtifacts !== undefined &&
+    scope.targetArtifacts.some(
+      (path) => typeof path !== "string" || path.trim().length === 0,
+    )
+  ) {
+    throw new Error(`${context}: targetArtifacts must only contain non-empty strings`);
   }
   if (
     scope.allowedHosts !== undefined &&

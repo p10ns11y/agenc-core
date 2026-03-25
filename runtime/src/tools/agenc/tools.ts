@@ -16,7 +16,7 @@
  */
 
 import { PublicKey, SystemProgram } from '@solana/web3.js';
-import { BN, type Program } from '@coral-xyz/anchor';
+import anchor, { type Program } from '@coral-xyz/anchor';
 import { getAssociatedTokenAddressSync } from '@tetsuo-ai/sdk';
 import type { AgencCoordination } from '../../types/agenc_coordination.js';
 import type { Tool, ToolResult } from '../types.js';
@@ -742,10 +742,10 @@ export function createRegisterAgentTool(
         const txSignature = await program.methods
           .registerAgent(
             Array.from(agentId),
-            new BN(capabilities.toString()),
+            new anchor.BN(capabilities.toString()),
             endpoint,
             metadataUri,
-            new BN(stakeAmount.toString()),
+            new anchor.BN(stakeAmount.toString()),
           )
           .accountsPartial({
             agent: agentPda,
@@ -922,11 +922,11 @@ export function createCreateTaskTool(
         const txSignature = await (program.methods as any)
           .createTask(
             toAnchorBytes(taskId),
-            new BN(requiredCapabilities.toString()),
+            new anchor.BN(requiredCapabilities.toString()),
             toAnchorBytes(descBytes),
-            new BN(reward.toString()),
+            new anchor.BN(reward.toString()),
             maxWorkers,
-            new BN(deadline),
+            new anchor.BN(deadline),
             taskType,
             null,
             0,

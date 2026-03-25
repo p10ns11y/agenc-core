@@ -15,6 +15,7 @@ import type {
   PipelinePlannerStep,
   PipelineResult,
 } from "../workflow/pipeline.js";
+import type { ContextArtifactRef } from "../memory/artifact-store.js";
 import type { WorkflowGraphEdge } from "../workflow/types.js";
 import type {
   PlannerDecision,
@@ -78,6 +79,14 @@ import {
 } from "../gateway/delegation-timeout.js";
 import type { HostToolingProfile } from "../gateway/host-tooling.js";
 import { collectDirectModeShellControlTokens } from "../tools/system/command-line.js";
+import {
+  buildDelegationExecutionContext,
+} from "../utils/delegation-execution-context.js";
+import {
+  isConcreteExecutableEnvelopeRoot,
+  isNonExecutableEnvelopePath,
+  normalizeWorkspaceRoot,
+} from "../workflow/path-normalization.js";
 
 // ============================================================================
 // Planner decision
@@ -95,6 +104,94 @@ interface PlannerRequestSignals {
   readonly structuredBulletCount: number;
   readonly priorToolMessages: number;
   readonly hasPriorNoProgressSignal: boolean;
+}
+
+const EXPLICIT_DELEGATION_REQUEST_RE =
+  /\b(?:spawn|use|run|launch|start|delegate(?:\s+to)?|hand\s+off\s+to)\b[\s\S]{0,48}\b(?:sub[\s-]?agents?|child\s+agents?|another\s+agent|execute_with_agent)\b/i;
+const PLANNER_PATH_PLACEHOLDER_ROOTS = [
+  "/workspace",
+  "/abs/path",
+  "/absolute/path",
+  "<workspace-root>",
+  "<workspace_root>",
+  "<actual-workspace-root>",
+  "<actual_workspace_root>",
+] as const;
+const PLANNER_FILESYSTEM_ARG_KEYS: Readonly<Record<string, readonly string[]>> = {
+  "desktop.text_editor": ["path"],
+  "system.readFile": ["path"],
+  "system.writeFile": ["path"],
+  "system.appendFile": ["path"],
+  "system.listDir": ["path"],
+  "system.stat": ["path"],
+  "system.mkdir": ["path"],
+  "system.delete": ["path"],
+  "system.move": ["source", "destination"],
+  "system.pdfInfo": ["path"],
+  "system.pdfExtractText": ["path"],
+  "system.officeDocumentInfo": ["path"],
+  "system.officeDocumentExtractText": ["path"],
+  "system.emailMessageInfo": ["path"],
+  "system.emailMessageExtractText": ["path"],
+  "system.calendarInfo": ["path"],
+  "system.calendarRead": ["path"],
+  "system.sqliteSchema": ["path"],
+  "system.sqliteQuery": ["path"],
+  "system.spreadsheetInfo": ["path"],
+  "system.spreadsheetRead": ["path"],
+  "system.bash": ["cwd"],
+  "desktop.bash": ["cwd"],
+};
+
+function isPlannerPathPlaceholderLiteral(value: string): boolean {
+  const trimmed = value.trim();
+  return PLANNER_PATH_PLACEHOLDER_ROOTS.some((root) =>
+    trimmed === root || trimmed.startsWith(`${root}/`)
+  );
+}
+
+function parsePlannerPathLiteral(
+  rawPath: string | undefined,
+): string | undefined {
+  if (typeof rawPath !== "string") return rawPath;
+  const trimmed = rawPath.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function findPlannerPlaceholderPath(
+  rawPath: string | undefined,
+): string | undefined {
+  const parsed = parsePlannerPathLiteral(rawPath);
+  if (!parsed) return undefined;
+  return isPlannerPathPlaceholderLiteral(parsed) || isNonExecutableEnvelopePath(parsed)
+    ? parsed
+    : undefined;
+}
+
+function findPlannerPlaceholderPaths(
+  paths: readonly string[] | undefined,
+): readonly string[] {
+  return (paths ?? []).filter((path) =>
+    findPlannerPlaceholderPath(path) !== undefined
+  );
+}
+
+function findPlannerDeterministicToolArgPlaceholder(params: {
+  readonly toolName: string;
+  readonly args: Readonly<Record<string, unknown>>;
+}): { readonly key: string; readonly value: string } | undefined {
+  const pathKeys = PLANNER_FILESYSTEM_ARG_KEYS[params.toolName] ?? [];
+  for (const key of pathKeys) {
+    const rawValue = params.args[key];
+    if (typeof rawValue !== "string") {
+      continue;
+    }
+    const placeholderPath = findPlannerPlaceholderPath(rawValue);
+    if (placeholderPath) {
+      return { key, value: placeholderPath };
+    }
+  }
+  return undefined;
 }
 
 function countStructuredBulletLines(messageText: string): number {
@@ -127,7 +224,7 @@ function collectPlannerRequestSignals(
         messageText,
       ),
     hasImplementationScopeCue:
-      /\b(build|implement|create|scaffold|generate|refactor|migrate|api|endpoint|service|integration|unit tests?|e2e|makefile|project)\b/i.test(
+      /\b(build(?:ing)?|implement|create|scaffold|generate|refactor|migrate|api|endpoint|service|integration|unit tests?|e2e|makefile|project|shell|cli|daemon|crawler|parser|compiler|database|library|program)\b/i.test(
         messageText,
       ) ||
       /\b(add|write|create|run)\s+(?:unit\s+)?tests?\b/i.test(messageText),
@@ -233,6 +330,17 @@ export function assessPlannerDecision(
     };
   }
 
+  if (plannerRequestNeedsGroundedPlanArtifact(messageText)) {
+    return {
+      score: Math.max(score, 3),
+      shouldPlan: true,
+      reason:
+        reasons.length > 0
+          ? `${reasons.join("+")}+plan_artifact_request`
+          : "plan_artifact_request",
+    };
+  }
+
   const directFastPath =
     score < 3 ||
     signals.normalized.trim().length < 20 ||
@@ -292,6 +400,12 @@ export function requestRequiresToolGroundedExecution(
     (EXECUTION_ARTIFACT_OR_PATH_CUE_RE.test(messageText) ||
       EXECUTION_SCOPE_BOUNDARY_CUE_RE.test(messageText))
   );
+}
+
+export function requestExplicitlyRequestsDelegation(
+  messageText: string,
+): boolean {
+  return EXPLICIT_DELEGATION_REQUEST_RE.test(messageText);
 }
 
 function deriveMinimumExpectedSalvagedSteps(
@@ -467,6 +581,7 @@ export function buildPlannerMessages(
   refinementHint?: string,
   hostToolingProfile?: HostToolingProfile | null,
   runtimeConstraints?: PlannerRuntimeConstraints,
+  plannerWorkspaceRoot?: string,
 ): readonly LLMMessage[] {
   const explicitOrchestration =
     extractExplicitSubagentOrchestrationRequirements(messageText);
@@ -496,6 +611,18 @@ export function buildPlannerMessages(
     MAX_PLANNER_STEPS,
     Math.max(1, Math.floor(plannerMaxTokens / 8)),
   );
+  const canonicalPlannerWorkspaceRoot =
+    normalizeWorkspaceRoot(plannerWorkspaceRoot);
+  const schemaWorkspaceRoot =
+    canonicalPlannerWorkspaceRoot ?? "<actual-workspace-root>";
+  const schemaPlanArtifact =
+    canonicalPlannerWorkspaceRoot
+      ? `${canonicalPlannerWorkspaceRoot}/PLAN.md`
+      : "<actual-workspace-root>/PLAN.md";
+  const schemaTargetArtifact =
+    canonicalPlannerWorkspaceRoot
+      ? `${canonicalPlannerWorkspaceRoot}/AGENC.md`
+      : "<actual-workspace-root>/AGENC.md";
 
   const messages: LLMMessage[] = [
     {
@@ -519,7 +646,21 @@ export function buildPlannerMessages(
         '      "input_contract": "required for subagent_task",\n' +
         '      "acceptance_criteria": ["required for subagent_task"],\n' +
         '      "required_tool_capabilities": ["required for subagent_task"],\n' +
-        '      "context_requirements": ["required for subagent_task"],\n' +
+        '      "context_requirements": ["optional human-readable notes for subagent_task"],\n' +
+        '      "execution_context": {\n' +
+        `        "workspaceRoot": "${schemaWorkspaceRoot}",\n` +
+        `        "allowedReadRoots": ["${schemaWorkspaceRoot}"],\n` +
+        `        "allowedWriteRoots": ["${schemaWorkspaceRoot}"],\n` +
+        '        "allowedTools": ["system.readFile"],\n' +
+        `        "requiredSourceArtifacts": ["${schemaPlanArtifact}"],\n` +
+        `        "targetArtifacts": ["${schemaTargetArtifact}"],\n` +
+        '        "effectClass": "read_only|filesystem_write|filesystem_scaffold|shell|mixed",\n' +
+        '        "verificationMode": "none|grounded_read|mutation_required|deterministic_followup",\n' +
+        '        "stepKind": "delegated_research|delegated_review|delegated_write|delegated_scaffold|delegated_validation",\n' +
+        '        "fallbackPolicy": "continue_without_delegation|fail_request",\n' +
+        '        "resumePolicy": "stateless_retry|checkpoint_resume",\n' +
+        '        "approvalProfile": "inherit|read_only|filesystem_write|shell"\n' +
+        "      },\n" +
         '      "max_budget_hint": "required for subagent_task",\n' +
         '      "can_run_parallel": true\n' +
         "    }\n" +
@@ -529,7 +670,11 @@ export function buildPlannerMessages(
         "- deterministic_tool steps are executable by the deterministic pipeline.\n" +
         "- subagent_task steps MUST include all required subagent fields.\n" +
         "- `can_run_parallel` is optional; omit it when unknown and the runtime will default it to false.\n" +
-        "- When a subagent step needs a workspace, encode it in `context_requirements` as `cwd=/absolute/path`.\n" +
+        "- For subagent_task steps, put workspace, artifact, and tool scope truth inside `execution_context`; do not rely on `context_requirements` for authority.\n" +
+        "- `execution_context.workspaceRoot` must be the canonical workspace root when the child touches local files.\n" +
+        "- `execution_context.requiredSourceArtifacts` names the exact source artifacts the child must ground on before writing derived files.\n" +
+        "- `execution_context.targetArtifacts` names the only files or directories the child may mutate in this phase.\n" +
+        "- Never emit placeholder literals like `/abs/path` or `<actual-workspace-root>` in executable steps. Use the real canonical workspace root for this turn.\n" +
         "- For deterministic_tool steps, put all tool parameters inside `args`. Do not place tool parameters like `cwd` or `timeoutMs` at the step root.\n" +
         "- Each subagent_task must stay narrowly scoped to one phase of work. Do not combine research, setup, implementation, and validation into one delegated step.\n" +
         "- Prefer multiple smaller subagent_task steps with explicit dependencies over one large delegated objective.\n" +
@@ -681,6 +826,10 @@ const REQUIRED_SUBAGENT_STEP_NAME_RE =
   /(?:^|\s)(\d+)[\).:]\s*(?:`([^`]+)`|([A-Za-z0-9_-]+))/g;
 const REQUIRED_DELIVERABLE_CUE_RE =
   /\b(final deliverables|how to play|known limitations|architecture summary)\b/i;
+const PLANNER_PLAN_ARTIFACT_REQUEST_RE =
+  /\b(?:write|create|draft|generate|produce|make)\b[\s\S]{0,120}\b(?:todo(?:\.md)?|implementation plan|project plan|plan doc(?:ument)?|roadmap|checklist|spec(?:ification)?)\b/i;
+const PLANNER_PLAN_ARTIFACT_FILE_RE =
+  /\b(?:todo(?:\.md)?|plan\.(?:md|txt|rst)|implementation[-_ ]plan(?:\.md)?|project[-_ ]plan(?:\.md)?|roadmap(?:\.md)?|checklist(?:\.md)?|spec(?:ification)?(?:\.md)?)\b/i;
 const REQUEST_VERIFICATION_DIRECTIVE_RE =
   /\b(?:verify|verification|validated?|before\s+finish(?:ing)?|before\s+returning|before\s+completion|browser-grounded checks?)\b/i;
 const REQUEST_INSTALL_VERIFICATION_RE =
@@ -1124,6 +1273,8 @@ export function buildPlannerExecutionContext(
   history: readonly LLMMessage[],
   messages: readonly LLMMessage[],
   sections: readonly PromptBudgetSection[],
+  artifactContext: readonly ContextArtifactRef[] | undefined,
+  workspaceRoot?: string,
   parentAllowedTools?: readonly string[],
 ): PipelinePlannerContext {
   const normalizedHist = normalizeHistory(history);
@@ -1185,6 +1336,12 @@ export function buildPlannerExecutionContext(
     history: historySlice,
     memory,
     toolOutputs,
+    ...(artifactContext && artifactContext.length > 0
+      ? { artifactContext }
+      : {}),
+    ...(typeof workspaceRoot === "string" && workspaceRoot.trim().length > 0
+      ? { workspaceRoot: workspaceRoot.trim() }
+      : {}),
     ...(parentAllowedTools && parentAllowedTools.length > 0
       ? { parentAllowedTools: [...new Set(parentAllowedTools)] }
       : {}),
@@ -1590,7 +1747,11 @@ function normalizePlannerShellModeToken(token: string): string {
 export function parsePlannerPlan(
   content: string,
   repairRequirements?: ExplicitSubagentOrchestrationRequirements,
+  options: {
+    readonly plannerWorkspaceRoot?: string;
+  } = {},
 ): PlannerParseResult {
+  void options;
   const diagnostics: PlannerDiagnostic[] = [];
   const parsed = parseJsonObjectFromText(content);
   if (!parsed) {
@@ -1713,6 +1874,26 @@ export function parsePlannerPlan(
       if (!args) {
         return { diagnostics };
       }
+      const placeholderArg = findPlannerDeterministicToolArgPlaceholder({
+        toolName: step.tool.trim(),
+        args,
+      });
+      if (placeholderArg) {
+        diagnostics.push(
+          createPlannerDiagnostic(
+            "parse",
+            "planner_deterministic_tool_placeholder_path",
+            `Deterministic planner step "${safeName}" uses placeholder path "${placeholderArg.value}" for ${placeholderArg.key}; live runtime execution requires a concrete host path.`,
+            {
+              stepIndex: index,
+              stepName: safeName,
+              field: placeholderArg.key,
+              value: placeholderArg.value,
+            },
+          ),
+        );
+        return { diagnostics };
+      }
       const onError =
         step.onError === "retry" ||
         step.onError === "skip" ||
@@ -1785,10 +1966,50 @@ export function parsePlannerPlan(
         ) ??
         plannerContextRequirements ??
         buildDefaultPlannerContextRequirements(dependsOn);
+      const legacyRuntimeScopeDirective =
+        findLegacyPlannerRuntimeScopeDirective(contextRequirements);
+      if (legacyRuntimeScopeDirective) {
+        diagnostics.push(
+          createPlannerDiagnostic(
+            "parse",
+            "planner_legacy_runtime_scope_channel",
+            `Planner subagent step "${safeName}" still uses deprecated runtime scope channel "${legacyRuntimeScopeDirective}". Structured execution_context is required instead of raw cwd/context requirement repair.`,
+            {
+              stepIndex: index,
+              stepName: safeName,
+              field: "context_requirements",
+              value: legacyRuntimeScopeDirective,
+            },
+          ),
+        );
+        return { diagnostics };
+      }
       const maxBudgetHint =
         parsePlannerRequiredString(step.max_budget_hint) ??
         parsePlannerStringFromKeys(subagentArgs, ["max_budget_hint"]) ??
         explicitDefaults?.maxBudgetHint;
+      const executionContextParse = parsePlannerExecutionContext(
+        step.execution_context ??
+          subagentArgs?.execution_context ??
+          subagentArgs?.executionContext,
+      );
+      if (executionContextParse.errorCode) {
+        diagnostics.push(
+          createPlannerDiagnostic(
+            "parse",
+            executionContextParse.errorCode,
+            executionContextParse.errorMessage ??
+              `Planner subagent step "${safeName}" has invalid execution_context`,
+            {
+              stepIndex: index,
+              stepName: safeName,
+              ...(executionContextParse.errorDetails ?? {}),
+            },
+          ),
+        );
+        return { diagnostics };
+      }
+      const executionContext = executionContextParse.value;
       if (
         step.can_run_parallel !== undefined &&
         typeof step.can_run_parallel !== "boolean"
@@ -1863,16 +2084,19 @@ export function parsePlannerPlan(
         );
         return { diagnostics };
       }
-      if (!contextRequirements || contextRequirements.length === 0) {
+      if (
+        (!contextRequirements || contextRequirements.length === 0) &&
+        !executionContext
+      ) {
         diagnostics.push(
           createPlannerDiagnostic(
             "parse",
             "missing_subagent_field",
-            `Planner subagent step "${safeName}" is missing context_requirements`,
+            `Planner subagent step "${safeName}" is missing both context_requirements and execution_context`,
             {
               stepIndex: index,
               stepName: safeName,
-              field: "context_requirements",
+              field: "execution_context",
             },
           ),
         );
@@ -1907,6 +2131,7 @@ export function parsePlannerPlan(
         acceptanceCriteria,
         requiredToolCapabilities,
         contextRequirements,
+        ...(executionContext ? { executionContext } : {}),
         maxBudgetHint: normalizedBudgetHint,
         canRunParallel,
       });
@@ -2853,8 +3078,13 @@ function extractPlannerStepShellText(
 
 export function validatePlannerStepContracts(
   plannerPlan: PlannerPlan,
+  messageText?: string,
 ): readonly PlannerDiagnostic[] {
   const diagnostics: PlannerDiagnostic[] = [];
+
+  if (typeof messageText === "string" && plannerRequestNeedsGroundedPlanArtifact(messageText)) {
+    diagnostics.push(...validatePlannerPlanArtifactSteps(plannerPlan));
+  }
 
   for (const step of plannerPlan.steps) {
     if (step.stepType === "deterministic_tool") {
@@ -2992,6 +3222,91 @@ export function validatePlannerStepContracts(
   return diagnostics;
 }
 
+function plannerRequestNeedsGroundedPlanArtifact(messageText: string): boolean {
+  const normalized = messageText.trim();
+  if (normalized.length === 0) {
+    return false;
+  }
+  if (
+    !PLANNER_PLAN_ARTIFACT_REQUEST_RE.test(normalized) &&
+    !PLANNER_PLAN_ARTIFACT_FILE_RE.test(normalized)
+  ) {
+    return false;
+  }
+  const signals = collectPlannerRequestSignals(normalized, []);
+  const explicitPlanExpansionCue =
+    /\b(?:read|expand|turn|convert|rewrite|flesh\s+out|promote)\b[\s\S]{0,80}\b(?:into|to)\b[\s\S]{0,80}\b(?:complete|full|detailed)?\s*(?:implementation\s+)?plan\b/i.test(
+      normalized,
+    );
+  return (
+    (signals.hasImplementationScopeCue || explicitPlanExpansionCue) &&
+    (
+      signals.hasDocumentationCue ||
+      signals.hasMultiStepCue ||
+      signals.longTask ||
+      signals.hasVerificationCue ||
+      /\b(?:complete|full|detailed)\s+plan\b/i.test(normalized) ||
+      explicitPlanExpansionCue
+    )
+  );
+}
+
+function isPlannerFileWriteStep(step: PlannerStepIntent): boolean {
+  return (
+    step.stepType === "deterministic_tool" &&
+    (step.tool === "system.writeFile" || step.tool === "system.appendFile")
+  );
+}
+
+function validatePlannerPlanArtifactSteps(
+  plannerPlan: PlannerPlan,
+): readonly PlannerDiagnostic[] {
+  const writeSteps = plannerPlan.steps.filter(isPlannerFileWriteStep);
+  if (writeSteps.length === 0) {
+    return [
+      createPlannerDiagnostic(
+        "validation",
+        "planner_plan_artifact_missing_write_step",
+        "Planner did not include a final file-write step for the requested planning artifact",
+      ),
+    ];
+  }
+
+  if (plannerPlan.steps.length === 1 && isPlannerFileWriteStep(plannerPlan.steps[0]!)) {
+    return [
+      createPlannerDiagnostic(
+        "validation",
+        "planner_plan_artifact_single_write_collapse",
+        "Planner collapsed a substantial software planning-document request into a single writeFile step without prior grounding or decomposition",
+        {
+          stepName: plannerPlan.steps[0]!.name,
+          tool: (plannerPlan.steps[0] as PlannerDeterministicToolStepIntent).tool,
+        },
+      ),
+    ];
+  }
+
+  const lastWriteIndex = plannerPlan.steps.reduce((index, step, currentIndex) =>
+    isPlannerFileWriteStep(step) ? currentIndex : index, -1);
+  const hasGroundingBeforeWrite = plannerPlan.steps.some(
+    (step, index) => index < lastWriteIndex && !isPlannerFileWriteStep(step),
+  );
+  if (lastWriteIndex >= 0 && !hasGroundingBeforeWrite) {
+    return [
+      createPlannerDiagnostic(
+        "validation",
+        "planner_plan_artifact_needs_grounding_step",
+        "Planner must include at least one non-write grounding or decomposition step before materializing a substantial software planning document",
+        {
+          finalWriteStep: plannerPlan.steps[lastWriteIndex]!.name,
+        },
+      ),
+    ];
+  }
+
+  return [];
+}
+
 export function buildPlannerStepContractRefinementHint(
   diagnostics: readonly PlannerDiagnostic[],
 ): string {
@@ -3019,6 +3334,15 @@ export function buildPlannerStepContractRefinementHint(
         diagnostic.code === "planner_subagent_budget_hint_too_small"
       ) {
         return `give subagent steps at least ${readDiagnosticDetail(diagnostic, "minimumSeconds") ?? "60"}s with an explicit unit`;
+      }
+      if (
+        diagnostic.code === "planner_plan_artifact_single_write_collapse" ||
+        diagnostic.code === "planner_plan_artifact_needs_grounding_step"
+      ) {
+        return "for substantial software plan/TODO requests, do not jump straight to writeFile; add at least one grounding or decomposition step before the final artifact write";
+      }
+      if (diagnostic.code === "planner_plan_artifact_missing_write_step") {
+        return "include a final file-write step for the requested planning artifact";
       }
       return diagnostic.message;
     })
@@ -3802,6 +4126,165 @@ function parsePlannerStringArrayFromKeys(
   return undefined;
 }
 
+function isLegacyPlannerRuntimeScopeDirective(value: string): boolean {
+  return /^(?:cwd|working(?:[_ -]?directory))\s*(?:=|:)\s*/i.test(value.trim());
+}
+
+function findLegacyPlannerRuntimeScopeDirective(
+  values: readonly string[] | undefined,
+): string | undefined {
+  return values?.find((value) => isLegacyPlannerRuntimeScopeDirective(value));
+}
+
+interface PlannerExecutionContextParseResult {
+  readonly value?: ReturnType<typeof buildDelegationExecutionContext>;
+  readonly errorCode?: string;
+  readonly errorMessage?: string;
+  readonly errorDetails?: Readonly<Record<string, unknown>>;
+}
+
+function parsePlannerExecutionContext(
+  source: unknown,
+): PlannerExecutionContextParseResult {
+  const record = parsePlannerArgsRecord(source);
+  if (!record) {
+    return { value: undefined };
+  }
+
+  const explicitWorkspaceRoot = parsePlannerPathLiteral(
+    parsePlannerStringFromKeys(record, [
+      "workspaceRoot",
+      "workspace_root",
+    ]),
+  );
+  if (explicitWorkspaceRoot) {
+    const placeholderRoot = findPlannerPlaceholderPath(explicitWorkspaceRoot);
+    if (placeholderRoot) {
+      return {
+        errorCode: "planner_execution_context_placeholder_root",
+        errorMessage:
+          "Planner execution_context.workspaceRoot must be a concrete host path; placeholder roots are not executable runtime truth.",
+        errorDetails: {
+          field: "workspaceRoot",
+          value: placeholderRoot,
+        },
+      };
+    }
+    if (!isConcreteExecutableEnvelopeRoot(explicitWorkspaceRoot)) {
+      return {
+        errorCode: "planner_execution_context_non_concrete_root",
+        errorMessage:
+          "Planner execution_context.workspaceRoot must be an absolute concrete host path.",
+        errorDetails: {
+          field: "workspaceRoot",
+          value: explicitWorkspaceRoot,
+        },
+      };
+    }
+  }
+
+  const allowedReadRoots = parsePlannerStringArrayFromKeys(record, [
+    "allowedReadRoots",
+    "allowed_read_roots",
+  ]);
+  const allowedWriteRoots = parsePlannerStringArrayFromKeys(record, [
+    "allowedWriteRoots",
+    "allowed_write_roots",
+  ]);
+  const inputArtifacts = parsePlannerStringArrayFromKeys(record, [
+    "inputArtifacts",
+    "input_artifacts",
+  ]);
+  const requiredSourceArtifacts = parsePlannerStringArrayFromKeys(record, [
+    "requiredSourceArtifacts",
+    "required_source_artifacts",
+  ]);
+  const targetArtifacts = parsePlannerStringArrayFromKeys(record, [
+    "targetArtifacts",
+    "target_artifacts",
+  ]);
+
+  const placeholderPath =
+    findPlannerPlaceholderPaths(allowedReadRoots)[0] ??
+    findPlannerPlaceholderPaths(allowedWriteRoots)[0] ??
+    findPlannerPlaceholderPaths(inputArtifacts)[0] ??
+    findPlannerPlaceholderPaths(requiredSourceArtifacts)[0] ??
+    findPlannerPlaceholderPaths(targetArtifacts)[0];
+  if (placeholderPath) {
+    return {
+      errorCode: "planner_execution_context_placeholder_path",
+      errorMessage:
+        "Planner execution_context paths must be concrete host paths or workspace-root-relative entries; placeholder aliases are not executable runtime truth.",
+      errorDetails: {
+        value: placeholderPath,
+      },
+    };
+  }
+
+  if (
+    !explicitWorkspaceRoot &&
+    (
+      (allowedReadRoots?.length ?? 0) > 0 ||
+      (allowedWriteRoots?.length ?? 0) > 0 ||
+      (inputArtifacts?.length ?? 0) > 0 ||
+      (requiredSourceArtifacts?.length ?? 0) > 0 ||
+      (targetArtifacts?.length ?? 0) > 0
+    )
+  ) {
+    return {
+      errorCode: "planner_execution_context_missing_workspace_root",
+      errorMessage:
+        "Planner execution_context must include a concrete workspaceRoot before relative delegated-scope paths can become live runtime authority.",
+    };
+  }
+
+  if (
+    parsePlannerStringFromKeys(record, [
+      "compatibilitySource",
+      "compatibility_source",
+    ])
+  ) {
+    return {
+      errorCode: "planner_execution_context_compatibility_source_forbidden",
+      errorMessage:
+        "Planner execution_context may not declare compatibilitySource on the live planner path.",
+    };
+  }
+
+  return {
+    value: buildDelegationExecutionContext({
+      workspaceRoot: explicitWorkspaceRoot,
+      allowedReadRoots,
+      allowedWriteRoots,
+    allowedTools: parsePlannerStringArrayFromKeys(record, [
+      "allowedTools",
+      "allowed_tools",
+    ]),
+      inputArtifacts,
+      requiredSourceArtifacts,
+      targetArtifacts,
+      effectClass: parsePlannerStringFromKeys(record, ["effectClass", "effect_class"]) as any,
+      verificationMode: parsePlannerStringFromKeys(record, [
+        "verificationMode",
+        "verification_mode",
+      ]) as any,
+      stepKind: parsePlannerStringFromKeys(record, ["stepKind", "step_kind"]) as any,
+      fallbackPolicy: parsePlannerStringFromKeys(record, [
+        "fallbackPolicy",
+        "fallback_policy",
+      ]) as any,
+      resumePolicy: parsePlannerStringFromKeys(record, [
+        "resumePolicy",
+        "resume_policy",
+      ]) as any,
+      approvalProfile: parsePlannerStringFromKeys(record, [
+        "approvalProfile",
+        "approval_profile",
+      ]) as any,
+    }),
+  };
+}
+
 export function parsePlannerDependsOn(
   value: unknown,
 ): readonly string[] | undefined {
@@ -4172,6 +4655,7 @@ export interface DelegationAssessmentInput {
   readonly subagentSteps: readonly PlannerSubAgentTaskStepIntent[];
   readonly complexityScore: number;
   readonly tunedThreshold: number;
+  readonly budgetSnapshot?: import("./run-budget.js").DelegationBudgetSnapshot;
   readonly delegationConfig: {
     readonly enabled: boolean;
     readonly mode: string;
@@ -4209,6 +4693,8 @@ export function assessAndRecordDelegationDecision(
 
   const delegationDecision = assessDelegationDecision({
     messageText: input.messageText,
+    explicitDelegationRequested:
+      requestExplicitlyRequestsDelegation(input.messageText),
     plannerConfidence: input.plannerPlan.confidence,
     complexityScore: input.complexityScore,
     totalSteps: input.plannerPlan.steps.length,
@@ -4216,14 +4702,18 @@ export function assessAndRecordDelegationDecision(
     edges: input.plannerPlan.edges,
     subagentSteps: input.subagentSteps.map((step) => ({
       name: step.name,
+      objective: step.objective,
+      inputContract: step.inputContract,
       dependsOn: step.dependsOn,
       acceptanceCriteria: step.acceptanceCriteria,
       requiredToolCapabilities: step.requiredToolCapabilities,
       contextRequirements: step.contextRequirements,
+      executionContext: step.executionContext,
       maxBudgetHint: step.maxBudgetHint,
       canRunParallel: step.canRunParallel,
     })),
     config: tunedDecisionConfig,
+    budgetSnapshot: input.budgetSnapshot,
   });
 
   summaryState.delegationDecision = delegationDecision;
@@ -4254,7 +4744,7 @@ export function assessAndRecordDelegationDecision(
       category: "policy",
       code: "delegation_veto",
       message:
-        `Delegation vetoed by policy scorer: ${delegationDecision.reason}`,
+        `Delegation vetoed by runtime admission policy: ${delegationDecision.reason}`,
       details: vetoDetails,
     });
   }
@@ -4294,6 +4784,7 @@ export function mapPlannerStepsToPipelineSteps(
         acceptanceCriteria: step.acceptanceCriteria,
         requiredToolCapabilities: step.requiredToolCapabilities,
         contextRequirements: step.contextRequirements,
+        executionContext: step.executionContext,
         maxBudgetHint: step.maxBudgetHint,
         canRunParallel: step.canRunParallel,
       };

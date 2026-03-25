@@ -2,6 +2,13 @@ import type { ChatExecuteParams, ChatExecutorResult } from "../llm/chat-executor
 import type { LLMStatefulResumeAnchor } from "../llm/types.js";
 import type { MemoryBackend } from "../memory/types.js";
 import {
+  MemoryArtifactStore,
+  type ContextArtifactRecord,
+  type ArtifactCompactionState,
+} from "../memory/artifact-store.js";
+import {
+  SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY,
+  SESSION_STATEFUL_ARTIFACT_RECORDS_METADATA_KEY,
   SESSION_STATEFUL_HISTORY_COMPACTED_METADATA_KEY,
   SESSION_STATEFUL_RESUME_ANCHOR_METADATA_KEY,
   type Session,
@@ -10,9 +17,11 @@ import {
 const WEB_SESSION_RUNTIME_STATE_KEY_PREFIX = "webchat:runtime-state:";
 
 interface PersistedWebSessionRuntimeState {
-  readonly version: 1;
+  readonly version: 2;
   readonly statefulResumeAnchor?: LLMStatefulResumeAnchor;
   readonly statefulHistoryCompacted?: boolean;
+  readonly artifactSnapshotId?: string;
+  readonly artifactSessionId?: string;
 }
 
 const SESSION_STATEFUL_LINEAGE_PHASES = new Set([
@@ -62,11 +71,21 @@ function buildPersistedWebSessionRuntimeState(
     : undefined;
   const historyCompacted =
     session.metadata[SESSION_STATEFUL_HISTORY_COMPACTED_METADATA_KEY] === true;
-  if (!resumeAnchor && !historyCompacted) return undefined;
+  const artifactContext =
+    session.metadata[SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY];
+  const artifactSnapshotId =
+    typeof artifactContext === "object" &&
+    artifactContext !== null &&
+    typeof (artifactContext as Record<string, unknown>).snapshotId === "string"
+      ? String((artifactContext as Record<string, unknown>).snapshotId)
+      : undefined;
+  if (!resumeAnchor && !historyCompacted && !artifactSnapshotId) return undefined;
   return {
-    version: 1,
+    version: 2,
     ...(resumeAnchor ? { statefulResumeAnchor: resumeAnchor } : {}),
     ...(historyCompacted ? { statefulHistoryCompacted: true } : {}),
+    ...(artifactSnapshotId ? { artifactSnapshotId } : {}),
+    ...(artifactSnapshotId ? { artifactSessionId: session.id } : {}),
   };
 }
 
@@ -75,16 +94,28 @@ function coercePersistedWebSessionRuntimeState(
 ): PersistedWebSessionRuntimeState | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   const candidate = value as Record<string, unknown>;
-  if (candidate.version !== 1) return undefined;
+  if (candidate.version !== 1 && candidate.version !== 2) return undefined;
   const resumeAnchor = isStatefulResumeAnchor(candidate.statefulResumeAnchor)
     ? cloneResumeAnchor(candidate.statefulResumeAnchor)
     : undefined;
   const historyCompacted = candidate.statefulHistoryCompacted === true;
-  if (!resumeAnchor && !historyCompacted) return undefined;
+  const artifactSnapshotId =
+    typeof candidate.artifactSnapshotId === "string" &&
+    candidate.artifactSnapshotId.trim().length > 0
+      ? candidate.artifactSnapshotId.trim()
+      : undefined;
+  const artifactSessionId =
+    typeof candidate.artifactSessionId === "string" &&
+    candidate.artifactSessionId.trim().length > 0
+      ? candidate.artifactSessionId.trim()
+      : undefined;
+  if (!resumeAnchor && !historyCompacted && !artifactSnapshotId) return undefined;
   return {
-    version: 1,
+    version: 2,
     ...(resumeAnchor ? { statefulResumeAnchor: resumeAnchor } : {}),
     ...(historyCompacted ? { statefulHistoryCompacted: true } : {}),
+    ...(artifactSnapshotId ? { artifactSnapshotId } : {}),
+    ...(artifactSessionId ? { artifactSessionId } : {}),
   };
 }
 
@@ -98,10 +129,14 @@ export function buildSessionStatefulOptions(
     : undefined;
   const historyCompacted =
     session.metadata[SESSION_STATEFUL_HISTORY_COMPACTED_METADATA_KEY] === true;
-  if (!resumeAnchor && !historyCompacted) return undefined;
+  const artifactContext = session.metadata[
+    SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY
+  ] as ArtifactCompactionState | undefined;
+  if (!resumeAnchor && !historyCompacted && !artifactContext) return undefined;
   return {
     ...(resumeAnchor ? { resumeAnchor } : {}),
     ...(historyCompacted ? { historyCompacted: true } : {}),
+    ...(artifactContext ? { artifactContext } : {}),
   };
 }
 
@@ -110,9 +145,27 @@ export async function persistWebSessionRuntimeState(
   webSessionId: string,
   session: Session,
 ): Promise<void> {
+  const artifactStore = new MemoryArtifactStore(memoryBackend);
+  const artifactContext = session.metadata[
+    SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY
+  ] as ArtifactCompactionState | undefined;
+  const artifactRecords = Array.isArray(
+    session.metadata[SESSION_STATEFUL_ARTIFACT_RECORDS_METADATA_KEY],
+  )
+    ? (session.metadata[
+        SESSION_STATEFUL_ARTIFACT_RECORDS_METADATA_KEY
+      ] as readonly ContextArtifactRecord[])
+    : [];
+  if (artifactContext) {
+    await artifactStore.persistSnapshot({
+      state: artifactContext,
+      records: artifactRecords,
+    });
+  }
   const persisted = buildPersistedWebSessionRuntimeState(session);
   const key = webSessionRuntimeStateKey(webSessionId);
   if (!persisted) {
+    await artifactStore.clearSession(session.id);
     await memoryBackend.delete(key);
     return;
   }
@@ -123,6 +176,13 @@ export async function clearWebSessionRuntimeState(
   memoryBackend: MemoryBackend,
   webSessionId: string,
 ): Promise<void> {
+  const artifactStore = new MemoryArtifactStore(memoryBackend);
+  const persisted = coercePersistedWebSessionRuntimeState(
+    await memoryBackend.get(webSessionRuntimeStateKey(webSessionId)),
+  );
+  if (persisted?.artifactSessionId) {
+    await artifactStore.clearSession(persisted.artifactSessionId);
+  }
   await memoryBackend.delete(webSessionRuntimeStateKey(webSessionId));
 }
 
@@ -131,6 +191,7 @@ export async function hydrateWebSessionRuntimeState(
   webSessionId: string,
   session: Session,
 ): Promise<void> {
+  const artifactStore = new MemoryArtifactStore(memoryBackend);
   const persisted = coercePersistedWebSessionRuntimeState(
     await memoryBackend.get(webSessionRuntimeStateKey(webSessionId)),
   );
@@ -141,6 +202,17 @@ export async function hydrateWebSessionRuntimeState(
   }
   if (persisted.statefulHistoryCompacted) {
     session.metadata[SESSION_STATEFUL_HISTORY_COMPACTED_METADATA_KEY] = true;
+  }
+  if (persisted.artifactSnapshotId) {
+    const snapshot = await artifactStore.loadSnapshot(
+      persisted.artifactSessionId ?? session.id,
+    );
+    if (snapshot?.state) {
+      session.metadata[SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY] =
+        snapshot.state;
+      session.metadata[SESSION_STATEFUL_ARTIFACT_RECORDS_METADATA_KEY] =
+        snapshot.records;
+    }
   }
 }
 
@@ -208,10 +280,17 @@ export function persistSessionStatefulContinuation(
       session.metadata[SESSION_STATEFUL_HISTORY_COMPACTED_METADATA_KEY] = true;
       return;
     }
-    delete session.metadata[SESSION_STATEFUL_HISTORY_COMPACTED_METADATA_KEY];
+    if (
+      session.metadata[SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY] ===
+      undefined
+    ) {
+      delete session.metadata[SESSION_STATEFUL_HISTORY_COMPACTED_METADATA_KEY];
+    }
     return;
   }
 
   delete session.metadata[SESSION_STATEFUL_RESUME_ANCHOR_METADATA_KEY];
   delete session.metadata[SESSION_STATEFUL_HISTORY_COMPACTED_METADATA_KEY];
+  delete session.metadata[SESSION_STATEFUL_ARTIFACT_CONTEXT_METADATA_KEY];
+  delete session.metadata[SESSION_STATEFUL_ARTIFACT_RECORDS_METADATA_KEY];
 }

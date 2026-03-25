@@ -264,7 +264,7 @@ describe("delegation-learning", () => {
     });
     const proxy = computeUsefulDelegationProxy({
       delegated: true,
-      stopReason: "completed",
+      completionState: "completed",
       failedToolCalls: 0,
       estimatedRecallsAvoided: 3,
       verifier: {
@@ -288,7 +288,7 @@ describe("delegation-learning", () => {
     });
     const proxy = computeUsefulDelegationProxy({
       delegated: true,
-      stopReason: "tool_error",
+      completionState: "blocked",
       failedToolCalls: 2,
       estimatedRecallsAvoided: 1,
       verifier: {

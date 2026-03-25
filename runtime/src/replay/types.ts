@@ -10,6 +10,7 @@ import type { ProjectedTimelineEvent } from "../eval/projector.js";
 import type { ReplayTraceContext } from "./trace.js";
 
 export interface ReplayEventCursor {
+  schemaVersion?: 1;
   slot: number;
   signature: string;
   eventName?: string;
@@ -21,6 +22,7 @@ export interface ReplayTimelineRecord extends Omit<
   ProjectedTimelineEvent,
   "payload"
 > {
+  schemaVersion?: 1;
   sourceEventName: string;
   sourceEventType: string;
   disputePda?: string;

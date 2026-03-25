@@ -8,6 +8,7 @@
  */
 
 import type { LLMProviderEvidence } from "../llm/types.js";
+import type { DelegationExecutionContext } from "./delegation-execution-context.js";
 import {
   PROVIDER_NATIVE_WEB_SEARCH_TOOL,
   isResearchLikeText,
@@ -27,6 +28,11 @@ import {
   PREFERRED_RESEARCH_BROWSER_TOOL_NAMES,
   PREFERRED_VALIDATION_BROWSER_TOOL_NAMES,
 } from "./browser-tool-taxonomy.js";
+import {
+  hasDelegationRuntimeVerificationContext,
+  toDelegationOutputValidationResult,
+  validateRuntimeVerificationContract,
+} from "../workflow/index.js";
 
 export interface DelegationContractSpec {
   readonly task?: string;
@@ -44,6 +50,11 @@ export interface DelegationContractSpec {
   readonly tools?: readonly string[];
   readonly requiredToolCapabilities?: readonly string[];
   readonly contextRequirements?: readonly string[];
+  readonly executionContext?: DelegationExecutionContext;
+  readonly delegationShape?: string;
+  readonly isolationReason?: string;
+  readonly ownedArtifacts?: readonly string[];
+  readonly verifierObligations?: readonly string[];
   readonly lastValidationCode?: DelegationOutputValidationCode;
 }
 
@@ -64,12 +75,14 @@ export type DelegationOutputValidationCode =
   | "acceptance_count_mismatch"
   | "acceptance_evidence_missing"
   | "acceptance_probe_failed"
+  | "missing_behavior_harness"
   | "forbidden_phase_action"
   | "blocked_phase_output"
   | "contradictory_completion_claim"
   | "missing_successful_tool_evidence"
   | "low_signal_browser_evidence"
   | "missing_file_mutation_evidence"
+  | "missing_required_source_evidence"
   | "missing_file_artifact_evidence";
 
 export interface DelegationOutputValidationResult {
@@ -103,12 +116,18 @@ const DELEGATION_CODE_TARGET_RE =
   /\b(?:game loop|rendering|movement|collision|scoring|score|hud|player|enemy|powerup|pathfinding|save\/load|settings|input|audio|map mutation|system|feature|module|component|class|function|logic|scene|entity|entities)\b/i;
 const NARRATIVE_FILE_CLAIM_RE =
   /\b(created|wrote|saved|updated|implemented|scaffolded|generated)\b/i;
+const FILE_MUTATION_CLAIM_RE =
+  /\b(?:created|wrote|written|saved|updated|modified|edited|patched|generated|implemented|scaffolded)\b/i;
 const FILE_ARTIFACT_RE =
   /(?:^|[\s`'"])(?:\/[^\s`'"]+|\.{1,2}\/[^\s`'"]+|[a-z0-9_.-]+\.[a-z0-9]{1,10})(?=$|[\s`'"])/i;
 const EXPLICIT_FILE_ARTIFACT_RE =
   /(?:^|[\s`'"])(?:\/[^\s`'"]*?\.[a-z0-9]{1,10}|\.{1,2}\/[^\s`'"]*?\.[a-z0-9]{1,10}|[a-z0-9_.-]+\.[a-z0-9]{1,10})(?=$|[\s`'"])/i;
+const EXPLICIT_FILE_ARTIFACT_GLOBAL_RE =
+  /(?:^|[\s`'"])(?:\/[^\s`'"]*?\.[a-z0-9]{1,10}|\.{1,2}\/[^\s`'"]*?\.[a-z0-9]{1,10}|(?:[a-z0-9_.-]+\/)+[a-z0-9_.-]+\.[a-z0-9]{1,10}|[a-z0-9_.-]+\.[a-z0-9]{1,10})(?=$|[\s`'"])/gi;
 const LOCAL_FILE_REFERENCE_RE =
   /(?:^|[\s`'"])(?:\/[^\s`'"]+|\.{1,2}\/[^\s`'"]+|(?:[a-z0-9_.-]+\/)+[a-z0-9_.-]+|(?:ag(?:ent)?s|readme)\.md|[a-z0-9_.-]+\.(?:md|txt|json|js|jsx|ts|tsx|py|rs|go|toml|ya?ml|html?|css))(?=$|[\s`'"])/i;
+const FILE_ALREADY_SATISFIED_NOOP_RE =
+  /\b(?:already exists?|already present|already satisfies?|already satisfied|no mutation needed|no changes needed|no edit(?:s)? needed|nothing to change|up[- ]to[- ]date|required sections present|all required sections present)\b/i;
 const EXPLICIT_BROWSER_ENVIRONMENT_CUE_RE =
   /\b(?:localhost|127\.0\.0\.1|about:blank|browser(?:-grounded)?|playwright|mcp\.browser|chromium|playtest|url|website|web\s+site|webpage|web\s+page)\b/i;
 const BROWSER_ACTION_CUE_RE =
@@ -135,6 +154,10 @@ const NON_BLANK_BROWSER_TARGET_RE =
   /\b(?:https?:\/\/|file:\/\/|localhost(?::\d+)?|127\.0\.0\.1(?::\d+)?)\S*/i;
 const DOCUMENTATION_TASK_RE =
   /\b(?:readme|documentation|how[-\s]?to[-\s]?play|architecture summary|architecture docs?|playbook|writeup|guide)\b/i;
+const REVIEW_FINDINGS_TASK_RE =
+  /\b(?:review|critique|audit|inspect|analy[sz]e|assess|evaluate)\b/i;
+const REVIEW_FINDINGS_OUTPUT_RE =
+  /\b(?:gap|gaps|missing|issue|issues|risk|risks|problem|problems|weakness|weaknesses|addition|additions|improvement|improvements|feedback|findings?)\b/i;
 const IMPLEMENTATION_TASK_RE =
   /\b(?:implement|implementation|build|scaffold|create|edit|code|render|rendering|collision|score|hud|player|enemy|powerup|pathfinding|save\/load|settings|input|polish|ux|audio|movement|dash|map mutation)\b/i;
 const VALIDATION_STRONG_TASK_RE =
@@ -269,6 +292,8 @@ const DELEGATED_BLOCKED_PHASE_RE = new RegExp(
 );
 const DELEGATED_BENIGN_PHASE_TRANSITION_RE =
   /\bready for next phase\b|\bno sibling steps?\b|\bfinal deliverable synthesized\b/gi;
+const DELEGATED_SCOPED_EXCLUSION_RE =
+  /\b(?:blocked|cannot|can't|unable)\b[^.\n]{0,80}\b(?:because|since|per)\b[^.\n]{0,80}\b(?:phase scope|scope of this phase|this phase only|current phase only|out of scope|outside the scope|next phase|sibling phase|sibling step|another phase|separate phase)\b|\b(?:out of scope|outside the scope|next phase|sibling phase|sibling step|separate phase)\b[^.\n]{0,80}\b(?:not part of|belongs to|deferred from)\b/i;
 const DELEGATION_EXPECTED_PLACEHOLDER_RE =
   /\b(?:placeholder(?:s)?|stub(?:s)?|scaffold(?:ing)?|skeleton|boilerplate)\b/i;
 const DELEGATED_ALLOWABLE_PLACEHOLDER_RE =
@@ -495,6 +520,27 @@ function collectDelegationPrimaryText(spec: DelegationContractSpec): string {
     .join(" ");
 }
 
+function hasReviewFindingsIntent(spec: DelegationContractSpec): boolean {
+  const text = normalizeDelegationClassifierText(collectDelegationStepText(spec));
+  if (text.length === 0) {
+    return false;
+  }
+  return REVIEW_FINDINGS_TASK_RE.test(text) && REVIEW_FINDINGS_OUTPUT_RE.test(text);
+}
+
+function isReviewFindingsDelegatedTask(spec: DelegationContractSpec): boolean {
+  if (!hasReviewFindingsIntent(spec)) {
+    return false;
+  }
+  const capabilityProfile = getDelegatedCapabilityProfile(spec);
+  if (capabilityProfile.hasFileWrite) {
+    return false;
+  }
+  return ![...(spec.requiredToolCapabilities ?? []), ...(spec.tools ?? [])].some(
+    (toolName) => EXPLICIT_FILE_MUTATION_TOOL_NAMES.has(toolName.trim())
+  );
+}
+
 function normalizeDelegationClassifierText(value: string): string {
   return value.replace(/[_-]+/g, " ");
 }
@@ -630,6 +676,13 @@ function isHostBrowserToolName(toolName: string): boolean {
 }
 
 function specTargetsLocalFiles(spec: DelegationContractSpec): boolean {
+  if (
+    (spec.executionContext?.requiredSourceArtifacts?.length ?? 0) > 0 ||
+    (spec.executionContext?.inputArtifacts?.length ?? 0) > 0 ||
+    (spec.executionContext?.targetArtifacts?.length ?? 0) > 0
+  ) {
+    return true;
+  }
   const combined = collectDelegationStepText(spec);
   if (!LOCAL_FILE_REFERENCE_RE.test(combined)) return false;
   return !NON_BLANK_BROWSER_TARGET_RE.test(combined);
@@ -724,8 +777,9 @@ export function extractDelegationTokens(value: string): string[] {
   const matches = value.toLowerCase().match(/[a-z0-9_.-]+/g) ?? [];
   const deduped = new Set<string>();
   for (const match of matches) {
-    if (match.length < 4) continue;
-    deduped.add(match);
+    const normalized = match.replace(/^\.+|\.+$/g, "");
+    if (normalized.length < 4) continue;
+    deduped.add(normalized);
   }
   return [...deduped];
 }
@@ -747,12 +801,15 @@ export function specRequiresFileMutationEvidence(
   if (capabilityProfile.isReadOnlyContract) {
     return false;
   }
-  if (
+  const hasExplicitFileMutationTool =
     [...(spec.requiredToolCapabilities ?? []), ...(spec.tools ?? [])].some((toolName) =>
       EXPLICIT_FILE_MUTATION_TOOL_NAMES.has(toolName.trim())
-    )
-  ) {
+    );
+  if (hasExplicitFileMutationTool) {
     return true;
+  }
+  if (hasReviewFindingsIntent(spec) && !capabilityProfile.hasFileWrite) {
+    return false;
   }
 
   const primary = collectDelegationPrimaryText(spec);
@@ -1165,6 +1222,180 @@ function collectLatestObservedFileStateEvidence(
   ];
 }
 
+function normalizeExplicitArtifactPath(value: string): string {
+  return value
+    .trim()
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/[),.;:!?]+$/g, "")
+    .replace(/\\/g, "/");
+}
+
+function getNormalizedPathBasename(value: string): string {
+  const normalized = normalizeExplicitArtifactPath(value);
+  const parts = normalized.split("/");
+  return parts[parts.length - 1] ?? normalized;
+}
+
+function collectExplicitSpecFileArtifacts(
+  spec: DelegationContractSpec,
+): readonly string[] {
+  if ((spec.executionContext?.targetArtifacts?.length ?? 0) > 0) {
+    return spec.executionContext?.targetArtifacts ?? [];
+  }
+  return collectExplicitFileArtifactsFromSegments([
+    spec.task,
+    spec.objective,
+    ...(spec.acceptanceCriteria ?? []),
+  ]);
+}
+
+function collectExplicitFileArtifactsFromSegments(
+  segments: readonly (string | undefined)[],
+): readonly string[] {
+  const matches = new Set<string>();
+  for (const segment of segments) {
+    if (typeof segment !== "string" || segment.trim().length === 0) {
+      continue;
+    }
+    for (const match of segment.matchAll(EXPLICIT_FILE_ARTIFACT_GLOBAL_RE)) {
+      const candidate = normalizeExplicitArtifactPath(match[0] ?? "");
+      if (candidate.length > 0) {
+        matches.add(candidate);
+      }
+    }
+  }
+  return [...matches];
+}
+
+function collectExplicitSourceSpecFileArtifacts(
+  spec: DelegationContractSpec,
+): readonly string[] {
+  if ((spec.executionContext?.requiredSourceArtifacts?.length ?? 0) > 0) {
+    return spec.executionContext?.requiredSourceArtifacts ?? [];
+  }
+  if ((spec.executionContext?.inputArtifacts?.length ?? 0) > 0) {
+    return spec.executionContext?.inputArtifacts ?? [];
+  }
+  return collectExplicitFileArtifactsFromSegments([
+    spec.inputContract,
+    ...(spec.contextRequirements ?? []),
+  ]);
+}
+
+function outputClaimsAlreadySatisfiedWithoutMutation(output: string): boolean {
+  return FILE_ALREADY_SATISFIED_NOOP_RE.test(output) &&
+    !FILE_MUTATION_CLAIM_RE.test(output);
+}
+
+function hasExplicitTargetFileNoopSatisfactionEvidence(
+  spec: DelegationContractSpec,
+  output: string,
+  toolCalls: readonly DelegationValidationToolCall[],
+): boolean {
+  if (!outputClaimsAlreadySatisfiedWithoutMutation(output)) {
+    return false;
+  }
+
+  const explicitTargets = collectExplicitSpecFileArtifacts(spec);
+  if (explicitTargets.length === 0) {
+    return false;
+  }
+
+  const observedEvidence = collectLatestObservedFileStateEvidence(toolCalls)
+    .filter((entry) => typeof entry.path === "string" && entry.path.trim().length > 0);
+  if (observedEvidence.length === 0) {
+    return false;
+  }
+
+  return explicitTargets.every((target) => {
+    const normalizedTarget = normalizeExplicitArtifactPath(target);
+    const targetBasename = getNormalizedPathBasename(normalizedTarget);
+    return observedEvidence.some((entry) => {
+      const normalizedPath = normalizeExplicitArtifactPath(entry.path ?? "");
+      if (normalizedPath.length === 0) {
+        return false;
+      }
+      return pathsMatchByTarget(normalizedPath, normalizedTarget) ||
+        getNormalizedPathBasename(normalizedPath) === targetBasename;
+    });
+  });
+}
+
+function pathsMatchByTarget(candidatePath: string, targetPath: string): boolean {
+  const normalizedCandidate = normalizeExplicitArtifactPath(candidatePath);
+  const normalizedTarget = normalizeExplicitArtifactPath(targetPath);
+  if (normalizedCandidate.length === 0 || normalizedTarget.length === 0) {
+    return false;
+  }
+  return normalizedCandidate === normalizedTarget ||
+    normalizedCandidate.endsWith(`/${normalizedTarget}`) ||
+    normalizedTarget.endsWith(`/${normalizedCandidate}`);
+}
+
+function collectLatestReadFileStateEvidence(
+  toolCalls: readonly DelegationValidationToolCall[],
+): readonly {
+  path?: string;
+  content: string;
+}[] {
+  return collectLatestObservedFileStateEvidence(toolCalls).filter((entry) =>
+    typeof entry.path === "string" && entry.path.trim().length > 0
+  );
+}
+
+function validateRequiredSourceArtifactEvidence(
+  spec: DelegationContractSpec,
+  output: string,
+  parsedOutput: Record<string, unknown> | undefined,
+  toolCalls: readonly DelegationValidationToolCall[] | undefined,
+): DelegationOutputValidationResult | undefined {
+  if (!specRequiresFileMutationEvidence(spec) || !Array.isArray(toolCalls)) {
+    return undefined;
+  }
+
+  if (hasExplicitTargetFileNoopSatisfactionEvidence(spec, output, toolCalls)) {
+    return undefined;
+  }
+
+  const sourceArtifacts = collectExplicitSourceSpecFileArtifacts(spec);
+  if (sourceArtifacts.length === 0) {
+    return undefined;
+  }
+
+  const observedReadEvidence = collectLatestReadFileStateEvidence(toolCalls);
+  if (observedReadEvidence.length === 0) {
+    return validationFailure(
+      "missing_required_source_evidence",
+      "Delegated task named source file artifacts in its input contract or context requirements, but the child did not read any of them before writing.",
+      parsedOutput,
+    );
+  }
+
+  const missingTargets = sourceArtifacts.filter((target) => {
+    const normalizedTarget = normalizeExplicitArtifactPath(target);
+    const targetBasename = getNormalizedPathBasename(normalizedTarget);
+    return !observedReadEvidence.some((entry) => {
+      const normalizedPath = normalizeExplicitArtifactPath(entry.path ?? "");
+      if (normalizedPath.length === 0) {
+        return false;
+      }
+      return pathsMatchByTarget(normalizedPath, normalizedTarget) ||
+        getNormalizedPathBasename(normalizedPath) === targetBasename;
+    });
+  });
+
+  if (missingTargets.length === 0) {
+    return undefined;
+  }
+
+  return validationFailure(
+    "missing_required_source_evidence",
+    "Delegated task named source artifacts that were not inspected before file mutation: " +
+      missingTargets.slice(0, 3).join(", "),
+    parsedOutput,
+  );
+}
+
 function hasToolCallFileArtifactEvidence(
   toolCall: DelegationValidationToolCall,
 ): boolean {
@@ -1554,7 +1785,9 @@ export function resolveDelegatedChildToolScope(params: {
   unsafeBenchmarkMode?: boolean;
 }): ResolvedDelegatedChildToolScope {
   const requestedSource = normalizeToolNames(
-    params.requestedTools ?? params.spec.requiredToolCapabilities,
+    params.requestedTools ??
+      params.spec.executionContext?.allowedTools ??
+      params.spec.requiredToolCapabilities,
   );
   const requested = extractExplicitDelegatedToolNames(requestedSource);
   const semanticCapabilities = requestedSource
@@ -1819,6 +2052,10 @@ export function resolveDelegatedInitialToolChoiceToolName(
   const requireFileMutation = specRequiresFileMutationEvidence(spec);
   const setupHeavy = isSetupHeavyDelegatedTask(spec);
   const localFileInspectionTask = specTargetsLocalFiles(spec);
+  const shouldPrioritizeSourceGroundingRetry =
+    spec.lastValidationCode === "missing_required_source_evidence" &&
+    localFileInspectionTask &&
+    !requireBrowser;
   const shouldPrioritizeVerificationRetry =
     spec.lastValidationCode === "acceptance_evidence_missing" &&
     !requireBrowser &&
@@ -1828,6 +2065,12 @@ export function resolveDelegatedInitialToolChoiceToolName(
       taskIntent === "validation" ||
       requireFileMutation
     );
+
+  if (shouldPrioritizeSourceGroundingRetry) {
+    return INITIAL_FILE_INSPECTION_TOOL_NAMES.find((toolName) =>
+      normalizedTools.includes(toolName)
+    );
+  }
 
   if (shouldPrioritizeVerificationRetry) {
     const preferredVerificationTool = INITIAL_SETUP_TOOL_NAMES.find((toolName) =>
@@ -1910,6 +2153,10 @@ export function resolveDelegatedInitialToolChoiceToolNames(
   const hasSystemTooling = normalizedTools.some((toolName) =>
     toolName.startsWith("system.")
   );
+  const shouldPrioritizeSourceGroundingRetry =
+    spec.lastValidationCode === "missing_required_source_evidence" &&
+    localFileInspectionTask &&
+    !requireBrowser;
   const shouldPrioritizeVerificationRetry =
     spec.lastValidationCode === "acceptance_evidence_missing" &&
     !requireBrowser &&
@@ -1919,15 +2166,41 @@ export function resolveDelegatedInitialToolChoiceToolNames(
       taskIntent === "validation" ||
       requireFileMutation
     );
+  const researchLikeButLocalInspectionOnly =
+    taskIntent === "research" &&
+    localFileInspectionTask &&
+    !requireBrowser;
+  const shouldUseFullInspectionCoverage =
+    localFileInspectionTask &&
+    !requireBrowser &&
+    !requireFileMutation &&
+    (taskIntent === "research" || taskIntent === "other");
 
-  if (requireBrowser || taskIntent === "research") {
+  if (requireBrowser || (taskIntent === "research" && !researchLikeButLocalInspectionOnly)) {
     return [preferredToolName];
+  }
+
+  if (shouldPrioritizeSourceGroundingRetry) {
+    const correctionTools: string[] = [];
+    const pushFirstAvailable = (candidates: readonly string[]) => {
+      const toolName = candidates.find((candidate) =>
+        normalizedTools.includes(candidate)
+      );
+      if (toolName && !correctionTools.includes(toolName)) {
+        correctionTools.push(toolName);
+      }
+    };
+    pushFirstAvailable(["system.listDir"]);
+    pushFirstAvailable(INITIAL_FILE_INSPECTION_TOOL_NAMES);
+    return correctionTools.length > 0 ? correctionTools : [preferredToolName];
   }
 
   const shouldUseFlexibleInitialSubset =
     hasSystemTooling &&
     (
       setupHeavy ||
+      researchLikeButLocalInspectionOnly ||
+      shouldUseFullInspectionCoverage ||
       verificationCue ||
       taskIntent === "validation" ||
       taskIntent === "implementation"
@@ -1945,10 +2218,22 @@ export function resolveDelegatedInitialToolChoiceToolNames(
       routedToolNames.push(toolName);
     }
   };
+  const pushAllAvailable = (candidates: readonly string[]) => {
+    for (const candidate of candidates) {
+      const toolName = normalizedTools.find((tool) => tool === candidate);
+      if (toolName && !routedToolNames.includes(toolName)) {
+        routedToolNames.push(toolName);
+      }
+    }
+  };
 
   const inspectionCandidates = setupHeavy
     ? (["system.listDir", ...INITIAL_FILE_INSPECTION_TOOL_NAMES] as const)
     : INITIAL_FILE_INSPECTION_TOOL_NAMES;
+  const fullInspectionCandidates = [
+    "system.readFile",
+    "system.listDir",
+  ] as const;
 
   if (shouldPrioritizeVerificationRetry) {
     pushFirstAvailable(INITIAL_SETUP_TOOL_NAMES);
@@ -1965,7 +2250,11 @@ export function resolveDelegatedInitialToolChoiceToolNames(
       localFileInspectionTask ||
       setupHeavy
     ) {
-      pushFirstAvailable(inspectionCandidates);
+      if (shouldUseFullInspectionCoverage) {
+        pushAllAvailable(fullInspectionCandidates);
+      } else {
+        pushFirstAvailable(inspectionCandidates);
+      }
     }
     if (requireFileMutation || taskIntent === "implementation") {
       pushFirstAvailable(INITIAL_FILE_MUTATION_TOOL_NAMES);
@@ -2085,6 +2374,23 @@ export function resolveDelegatedCorrectionToolChoiceToolNames(
     );
     if (shellTools.length > 0) {
       return shellTools;
+    }
+  }
+
+  if (validationCode === "missing_required_source_evidence") {
+    const correctionTools: string[] = [];
+    const pushFirstAvailable = (candidates: readonly string[]) => {
+      const toolName = candidates.find((candidate) =>
+        normalizedTools.includes(candidate)
+      );
+      if (toolName && !correctionTools.includes(toolName)) {
+        correctionTools.push(toolName);
+      }
+    };
+    pushFirstAvailable(["system.listDir"]);
+    pushFirstAvailable(INITIAL_FILE_INSPECTION_TOOL_NAMES);
+    if (correctionTools.length > 0) {
+      return correctionTools;
     }
   }
 
@@ -3251,6 +3557,9 @@ function validateContradictoryCompletionClaim(
   parsedOutput: Record<string, unknown> | undefined,
   toolCalls: readonly DelegationValidationToolCall[] | undefined,
 ): DelegationOutputValidationResult | undefined {
+  if (isReviewFindingsDelegatedTask(spec)) {
+    return undefined;
+  }
   const stringValues = [
     output,
     ...collectStringValues(parsedOutput),
@@ -3310,12 +3619,18 @@ function validateBlockedPhaseOutput(
   output: string,
   parsedOutput: Record<string, unknown> | undefined,
 ): DelegationOutputValidationResult | undefined {
+  if (isReviewFindingsDelegatedTask(spec)) {
+    return undefined;
+  }
   const stringValues = [
     output,
     ...collectStringValues(parsedOutput),
   ]
     .map((value) => value.trim())
     .filter((value, index, values) => value.length > 0 && values.indexOf(value) === index);
+  const reportsCompletion = stringValues.some((value) =>
+    DELEGATED_COMPLETION_CLAIM_RE.test(value)
+  );
 
   const allowsExpectedPlaceholders = specAllowsExpectedPlaceholders(spec);
 
@@ -3330,6 +3645,9 @@ function validateBlockedPhaseOutput(
         allowsExpectedPlaceholders ? DELEGATED_ALLOWABLE_PLACEHOLDER_RE : /$^/,
         " ",
       );
+      if (reportsCompletion && DELEGATED_SCOPED_EXCLUSION_RE.test(normalized)) {
+        return false;
+      }
       return normalized.length > 0 && DELEGATED_BLOCKED_PHASE_RE.test(normalized);
     });
   });
@@ -3392,6 +3710,9 @@ function validateFileMutationEvidence(
   }
 
   if (!hasAnyToolCallFileMutationEvidence(toolCalls)) {
+    if (hasExplicitTargetFileNoopSatisfactionEvidence(spec, output, toolCalls)) {
+      return undefined;
+    }
     return validationFailure(
       "missing_file_mutation_evidence",
       "Delegated task required file creation/edit evidence but child used no file mutation tools",
@@ -3419,6 +3740,7 @@ export function validateDelegatedOutputContract(params: {
   toolCalls?: readonly DelegationValidationToolCall[];
   providerEvidence?: DelegationValidationProviderEvidence;
   enforceAcceptanceEvidence?: boolean;
+  deferExecutableOutcomeValidation?: boolean;
   unsafeBenchmarkMode?: boolean;
 }): DelegationOutputValidationResult {
   const {
@@ -3427,6 +3749,7 @@ export function validateDelegatedOutputContract(params: {
     toolCalls,
     providerEvidence,
     enforceAcceptanceEvidence = true,
+    deferExecutableOutcomeValidation = false,
     unsafeBenchmarkMode = false,
   } = params;
   const baseValidation = validateBasicOutputContract({
@@ -3453,11 +3776,6 @@ export function validateDelegatedOutputContract(params: {
   );
   if (forbiddenPhaseActionFailure) return forbiddenPhaseActionFailure;
 
-  const acceptanceVerificationFailure = validateAcceptanceVerificationToolEvidence(
-    spec,
-    parsedOutput,
-    toolCalls,
-  );
   const blockedPhaseFailure = validateBlockedPhaseOutput(
     spec,
     output,
@@ -3473,15 +3791,54 @@ export function validateDelegatedOutputContract(params: {
   );
   if (contradictoryCompletionFailure) return contradictoryCompletionFailure;
 
-  if (acceptanceVerificationFailure) return acceptanceVerificationFailure;
+  const runtimeVerificationFailure = toDelegationOutputValidationResult({
+    decision:
+      validateRuntimeVerificationContract({
+        spec,
+        output,
+        parsedOutput,
+        toolCalls,
+        providerEvidence,
+      }) ?? { ok: true, compatibilityFallbackSuggested: true, channels: [] },
+    parsedOutput,
+  });
+  if (
+    runtimeVerificationFailure &&
+    !(
+      deferExecutableOutcomeValidation &&
+      (
+        runtimeVerificationFailure.code === "missing_behavior_harness" ||
+        runtimeVerificationFailure.code === "acceptance_probe_failed"
+      )
+    )
+  ) {
+    return runtimeVerificationFailure;
+  }
 
-  const fileEvidenceFailure = validateFileMutationEvidence(
+  const acceptanceVerificationFailure = validateAcceptanceVerificationToolEvidence(
     spec,
-    output,
     parsedOutput,
     toolCalls,
   );
-  if (fileEvidenceFailure) return fileEvidenceFailure;
+  if (acceptanceVerificationFailure) return acceptanceVerificationFailure;
+
+  if (!hasDelegationRuntimeVerificationContext(spec)) {
+    const fileEvidenceFailure = validateFileMutationEvidence(
+      spec,
+      output,
+      parsedOutput,
+      toolCalls,
+    );
+    if (fileEvidenceFailure) return fileEvidenceFailure;
+
+    const requiredSourceFailure = validateRequiredSourceArtifactEvidence(
+      spec,
+      output,
+      parsedOutput,
+      toolCalls,
+    );
+    if (requiredSourceFailure) return requiredSourceFailure;
+  }
 
   const acceptanceFailure = validateAcceptanceCriteriaEvidence(
     spec,

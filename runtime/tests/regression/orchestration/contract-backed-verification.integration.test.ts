@@ -1,0 +1,211 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
+
+import { createSessionToolHandler } from "../../../src/gateway/tool-handler-factory.js";
+import { EffectLedger } from "../../../src/workflow/effect-ledger.js";
+import { createMockMemoryBackend } from "../../../src/memory/test-utils.js";
+import { validateDelegatedOutputContract } from "../../../src/utils/delegation-validation.js";
+
+function createTempDir(prefix: string): string {
+  return mkdtempSync(join(tmpdir(), prefix));
+}
+
+describe("contract-backed verification integration", () => {
+  it("accepts grounded no-op success when the target artifact was read and no mutation was needed", () => {
+    const workspace = "/tmp/agenc-verification-noop";
+    const targetPath = `${workspace}/AGENC.md`;
+    const result = validateDelegatedOutputContract({
+      spec: {
+        task: "review_agenc_md",
+        objective: "Verify AGENC.md already satisfies the requested sections.",
+        inputContract: "Inspect the current guide before deciding whether edits are needed.",
+        acceptanceCriteria: ["State that AGENC.md already satisfies the requested sections."],
+        executionContext: {
+          version: "v1",
+          workspaceRoot: workspace,
+          requiredSourceArtifacts: [targetPath],
+          targetArtifacts: [targetPath],
+          stepKind: "delegated_review",
+          verificationMode: "grounded_read",
+        },
+      },
+      output: "AGENC.md already satisfies the requested sections. No mutation needed.",
+      toolCalls: [{
+        name: "system.readFile",
+        args: { path: targetPath },
+        result: JSON.stringify({
+          path: targetPath,
+          content: "# Repository Guidelines\n",
+        }),
+        isError: false,
+      }],
+    });
+
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects fake no-op success when the target artifact was never grounded", () => {
+    const workspace = "/tmp/agenc-verification-noop-missing";
+    const targetPath = `${workspace}/AGENC.md`;
+    const result = validateDelegatedOutputContract({
+      spec: {
+        task: "write_agenc_md",
+        objective: "Update AGENC.md to match the requested guide sections.",
+        inputContract: "Edit the guide if needed.",
+        acceptanceCriteria: ["State that AGENC.md already satisfies the request if no edits are needed."],
+        executionContext: {
+          version: "v1",
+          workspaceRoot: workspace,
+          requiredSourceArtifacts: [targetPath],
+          targetArtifacts: [targetPath],
+          stepKind: "delegated_write",
+          verificationMode: "mutation_required",
+        },
+      },
+      output: "AGENC.md already satisfies the request. No mutation needed.",
+      toolCalls: [],
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe("missing_required_source_evidence");
+  });
+
+  it("accepts real mutation evidence from runtime artifact records even when the prose does not name files", () => {
+    const workspace = "/tmp/agenc-verification-write";
+    const targetPath = `${workspace}/AGENC.md`;
+    const result = validateDelegatedOutputContract({
+      spec: {
+        task: "write_agenc_md",
+        objective: "Update the guide with the finalized repository rules.",
+        inputContract: "Inspect the current guide before editing it.",
+        acceptanceCriteria: ["State that the requested guide update completed."],
+        executionContext: {
+          version: "v1",
+          workspaceRoot: workspace,
+          requiredSourceArtifacts: [targetPath],
+          targetArtifacts: [targetPath],
+          stepKind: "delegated_write",
+          verificationMode: "mutation_required",
+        },
+      },
+      output: "Completed the requested guide update.",
+      toolCalls: [
+        {
+          name: "system.readFile",
+          args: { path: targetPath },
+          result: JSON.stringify({
+            path: targetPath,
+            content: "old content",
+          }),
+          isError: false,
+        },
+        {
+          name: "system.writeFile",
+          args: { path: targetPath, content: "new content" },
+          result: JSON.stringify({
+            path: targetPath,
+            written: true,
+          }),
+          isError: false,
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
+  });
+
+  it("accepts shell-based mutation evidence when effect records prove the target artifact changed", async () => {
+    const workspace = createTempDir("agenc-verification-shell-");
+    const targetPath = join(workspace, "AGENC.md");
+    writeFileSync(targetPath, "old shell content", "utf8");
+    const ledger = EffectLedger.fromMemoryBackend(createMockMemoryBackend());
+    const subAgentManager = {
+      getInfo: vi.fn(() => ({
+        sessionId: "subagent:verify-shell",
+        parentSessionId: "session-parent",
+        depth: 1,
+        status: "running",
+        startedAt: Date.now() - 100,
+        task: "Patch the guide with shell",
+      })),
+      getExecutionContext: vi.fn(() => ({
+        version: "v1",
+        workspaceRoot: workspace,
+        allowedReadRoots: [workspace],
+        allowedWriteRoots: [workspace],
+        targetArtifacts: [targetPath],
+        requiredSourceArtifacts: [targetPath],
+        effectClass: "shell",
+      })),
+    };
+    const handler = createSessionToolHandler({
+      sessionId: "subagent:verify-shell",
+      baseHandler: vi.fn(async () => {
+        writeFileSync(targetPath, "new shell content", "utf8");
+        return JSON.stringify({ stdout: "ok", exitCode: 0 });
+      }),
+      availableToolNames: ["system.bash"],
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: workspace,
+      effectLedger: ledger,
+      effectChannel: "test",
+      delegation: () => ({
+        subAgentManager: subAgentManager as any,
+        policyEngine: null,
+        verifier: null,
+        lifecycleEmitter: null,
+      }),
+    });
+
+    const shellResult = await handler("system.bash", {
+      command: `printf 'new shell content' > "${targetPath}"`,
+      cwd: workspace,
+    });
+
+    const validation = validateDelegatedOutputContract({
+      spec: {
+        task: "write_agenc_md",
+        objective: "Update AGENC.md with the finalized repository guide.",
+        inputContract: "Use the existing guide as the source of truth before modifying it.",
+        acceptanceCriteria: ["State that AGENC.md was updated."],
+        executionContext: {
+          version: "v1",
+          workspaceRoot: workspace,
+          requiredSourceArtifacts: [targetPath],
+          targetArtifacts: [targetPath],
+          stepKind: "delegated_write",
+          verificationMode: "mutation_required",
+          effectClass: "shell",
+        },
+      },
+      output: "Updated AGENC.md via shell after inspecting the existing guide.",
+      toolCalls: [
+        {
+          name: "system.readFile",
+          args: { path: targetPath },
+          result: JSON.stringify({
+            path: targetPath,
+            content: "old shell content",
+          }),
+          isError: false,
+        },
+        {
+          name: "system.bash",
+          args: {
+            command: `printf 'new shell content' > "${targetPath}"`,
+            cwd: workspace,
+          },
+          result: shellResult,
+          isError: false,
+        },
+      ],
+    });
+
+    expect(validation.ok).toBe(true);
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+});

@@ -11,7 +11,7 @@ import type {
 } from "./types.js";
 import type {
   PlannerPipelineVerifierLoopInput,
-  PlannerSubAgentTaskStepIntent,
+  PlannerVerifierWorkItem,
   PlannerPlan,
   ResolvedSubagentVerifierConfig,
   PlannerDiagnostic,
@@ -25,7 +25,8 @@ import type {
 import { pipelineResultToToolCalls } from "./chat-executor-planner.js";
 import {
   buildSubagentVerifierMessages,
-  evaluateSubagentDeterministicChecks,
+  buildMandatoryPlannerVerificationFailureDecision,
+  evaluatePlannerDeterministicChecks,
   mergeSubagentVerifierDecisions,
   parseSubagentVerifierDecision,
 } from "./chat-executor-verifier.js";
@@ -43,10 +44,12 @@ export async function runSubagentVerifierRound(params: {
   };
   readonly plannerDiagnostics: PlannerDiagnostic[];
   readonly plannerPlan: PlannerPlan;
-  readonly subagentSteps: readonly PlannerSubAgentTaskStepIntent[];
+  readonly verifierWorkItems: readonly PlannerVerifierWorkItem[];
   readonly pipelineResult: PipelineResult;
+  readonly plannerToolCalls: readonly import("./chat-executor-types.js").ToolCallRecord[];
   readonly plannerContext: PipelinePlannerContext;
   readonly round: number;
+  readonly requiresMandatoryImplementationVerification: boolean;
   readonly callModelForPhase: (input: {
     phase: "planner_verifier";
     callMessages: readonly LLMMessage[];
@@ -59,16 +62,17 @@ export async function runSubagentVerifierRound(params: {
     budgetReason: string;
   }) => Promise<CallModelForPhaseResult | undefined>;
 }): Promise<SubagentVerifierDecision> {
-  const deterministic = evaluateSubagentDeterministicChecks(
-    params.subagentSteps,
+  const deterministic = evaluatePlannerDeterministicChecks(
+    params.verifierWorkItems,
     params.pipelineResult,
     params.plannerContext,
+    params.plannerToolCalls,
   );
   const verifierMessages = buildSubagentVerifierMessages(
     params.systemPrompt,
     params.messageText,
     params.plannerPlan,
-    params.subagentSteps,
+    params.verifierWorkItems,
     params.pipelineResult,
     params.plannerContext,
     deterministic,
@@ -91,11 +95,17 @@ export async function runSubagentVerifierRound(params: {
       "Planner verifier blocked by max model recalls per request budget",
   });
   if (!verifierResponse) {
+    if (params.requiresMandatoryImplementationVerification) {
+      return buildMandatoryPlannerVerificationFailureDecision({
+        verifierWorkItems: params.verifierWorkItems,
+        reason: "planner_verifier_unavailable",
+      });
+    }
     return deterministic;
   }
   const modelDecision = parseSubagentVerifierDecision(
     verifierResponse.content,
-    params.subagentSteps,
+    params.verifierWorkItems,
   );
   if (!modelDecision) {
     params.plannerDiagnostics.push({
@@ -109,6 +119,12 @@ export async function runSubagentVerifierRound(params: {
         toolCallCount: verifierResponse.toolCalls.length,
       },
     });
+    if (params.requiresMandatoryImplementationVerification) {
+      return buildMandatoryPlannerVerificationFailureDecision({
+        verifierWorkItems: params.verifierWorkItems,
+        reason: "planner_verifier_parse_failed",
+      });
+    }
     return deterministic;
   }
   return mergeSubagentVerifierDecisions(
@@ -140,10 +156,11 @@ export async function executePlannerPipelineWithVerifierLoop(
     if (!nextPipelineResult) break;
     pipelineResult = nextPipelineResult;
 
-    for (const record of pipelineResultToToolCalls(
+    const plannerToolCalls = pipelineResultToToolCalls(
       input.plannerPlan.steps,
       nextPipelineResult,
-    )) {
+    );
+    for (const record of plannerToolCalls) {
       input.appendToolRecord(record);
     }
     input.plannerSummaryState.deterministicStepsExecuted =
@@ -151,20 +168,59 @@ export async function executePlannerPipelineWithVerifierLoop(
         typeof nextPipelineResult.context.results[step.name] === "string"
       ).length;
 
-    if (
-      !input.shouldRunSubagentVerifier ||
-      nextPipelineResult.status !== "completed"
-    ) {
+    if (nextPipelineResult.status !== "completed") {
+      break;
+    }
+
+    if (input.verifierWorkItems.length === 0) {
+      break;
+    }
+
+    if (!input.shouldRunPlannerVerifier) {
+      if (!input.requiresMandatoryImplementationVerification) {
+        break;
+      }
+      const deterministicDecision = evaluatePlannerDeterministicChecks(
+        input.verifierWorkItems,
+        nextPipelineResult,
+        input.plannerExecutionContext,
+        plannerToolCalls,
+      );
+      verificationDecision = deterministicDecision;
+      input.plannerSummaryState.subagentVerification = {
+        enabled: true,
+        performed: true,
+        rounds: 0,
+        overall: deterministicDecision.overall,
+        confidence: deterministicDecision.confidence,
+        unresolvedItems: [...deterministicDecision.unresolvedItems],
+      };
+      if (
+        deterministicDecision.overall !== "pass" ||
+        deterministicDecision.confidence < input.verifierConfig.minConfidence
+      ) {
+        const unresolvedPreview =
+          deterministicDecision.unresolvedItems.slice(0, 3).join("; ");
+        input.setStopReason(
+          "validation_error",
+          unresolvedPreview.length > 0
+            ? `Sub-agent verifier rejected child outputs: ${unresolvedPreview}`
+            : "Sub-agent verifier rejected child outputs",
+        );
+      }
       break;
     }
 
     verifierRounds++;
-    verificationDecision = await input.runSubagentVerifierRound({
+    verificationDecision = await input.runPlannerVerifierRound({
       plannerPlan: input.plannerPlan,
-      subagentSteps: input.subagentSteps,
+      verifierWorkItems: input.verifierWorkItems,
       pipelineResult: nextPipelineResult,
+      plannerToolCalls,
       plannerContext: input.plannerExecutionContext,
       round: verifierRounds,
+      requiresMandatoryImplementationVerification:
+        input.requiresMandatoryImplementationVerification,
     });
     input.plannerSummaryState.subagentVerification = {
       enabled: true,

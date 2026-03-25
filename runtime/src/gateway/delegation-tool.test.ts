@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   createExecuteWithAgentTool,
   EXECUTE_WITH_AGENT_TOOL_NAME,
-  extractDelegatedWorkingDirectory,
   parseExecuteWithAgentInput,
   resolveDelegatedWorkingDirectory,
 } from "./delegation-tool.js";
@@ -70,7 +69,7 @@ describe("delegation-tool", () => {
     expect(parsed.value.continuationSessionId).toBe("subagent:child-7");
   });
 
-  it("parses delegated context requirements and extracts a cwd directive", () => {
+  it("ignores legacy context requirements on the direct execute_with_agent path", () => {
     const parsed = parseExecuteWithAgentInput({
       task: "implement files in the project workspace",
       context_requirements: [
@@ -81,13 +80,7 @@ describe("delegation-tool", () => {
 
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
-    expect(parsed.value.contextRequirements).toEqual([
-      "repo_context",
-      "cwd = /home/tetsuo/agent-test/grid-router-ts",
-    ]);
-    expect(extractDelegatedWorkingDirectory(parsed.value.contextRequirements)).toBe(
-      "/home/tetsuo/agent-test/grid-router-ts",
-    );
+    expect(parsed.value.executionContext).toBeUndefined();
   });
 
   it("accepts snake_case delegation fields from planner-shaped payloads", () => {
@@ -110,60 +103,97 @@ describe("delegation-tool", () => {
       "system.writeFile",
       "system.readFile",
     ]);
-    expect(parsed.value.contextRequirements).toEqual(["cwd:/tmp/grid-router-ts"]);
+    expect(parsed.value.executionContext).toBeUndefined();
     expect(parsed.value.spawnDecisionScore).toBe(0.42);
   });
 
-  it("extracts delegated working directories from working_directory context requirements", () => {
-    expect(
-      extractDelegatedWorkingDirectory([
-        "repo_context",
-        "working_directory:/home/tetsuo/agent-test/grid-router-ts",
-      ]),
-    ).toBe("/home/tetsuo/agent-test/grid-router-ts");
-    expect(
-      extractDelegatedWorkingDirectory([
-        "working-directory = /tmp/project-root",
-      ]),
-    ).toBe("/tmp/project-root");
+  it("parses structured execution envelopes from planner-shaped payloads", () => {
+    const parsed = parseExecuteWithAgentInput({
+      task: "write_agenc_md",
+      execution_context: {
+        workspace_root: "/tmp/agenc-shell",
+        allowed_read_roots: ["/tmp/agenc-shell"],
+        allowed_write_roots: ["/tmp/agenc-shell"],
+        required_source_artifacts: ["/tmp/agenc-shell/PLAN.md"],
+        target_artifacts: ["/tmp/agenc-shell/AGENC.md"],
+        allowed_tools: ["system.readFile", "system.writeFile"],
+        effect_class: "filesystem_write",
+        verification_mode: "mutation_required",
+        step_kind: "delegated_write",
+      },
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.executionContext).toEqual(
+      expect.objectContaining({
+        workspaceRoot: "/tmp/agenc-shell",
+        allowedReadRoots: ["/tmp/agenc-shell"],
+        allowedWriteRoots: ["/tmp/agenc-shell"],
+        requiredSourceArtifacts: ["/tmp/agenc-shell/PLAN.md"],
+        targetArtifacts: ["/tmp/agenc-shell/AGENC.md"],
+        allowedTools: ["system.readFile", "system.writeFile"],
+        effectClass: "filesystem_write",
+        verificationMode: "mutation_required",
+        stepKind: "delegated_write",
+      }),
+    );
   });
 
-  it("infers a delegated working directory from workspace-oriented objective text", () => {
+  it("does not infer a delegated working directory from objective text", () => {
     expect(
       resolveDelegatedWorkingDirectory({
         task: "scaffold",
         objective:
           "Create the npm workspace structure in /home/tetsuo/agent-test/terrain-router-ts-1 from scratch.",
       }),
-    ).toEqual({
-      path: "/home/tetsuo/agent-test/terrain-router-ts-1",
-      source: "task_text",
-    });
+    ).toBeUndefined();
   });
 
-  it("infers a delegated working directory from change-directory phrasing", () => {
+  it("does not infer a delegated working directory from change-directory phrasing", () => {
     expect(
       resolveDelegatedWorkingDirectory({
         task: "run",
         objective:
           "Change to /home/tetsuo/agent-test/terrain-router-ts-1 directory and execute npm run build.",
       }),
-    ).toEqual({
-      path: "/home/tetsuo/agent-test/terrain-router-ts-1",
-      source: "task_text",
-    });
+    ).toBeUndefined();
   });
 
-  it("normalizes file-oriented path mentions to their parent directory", () => {
+  it("uses executionContext.workspaceRoot when present", () => {
     expect(
       resolveDelegatedWorkingDirectory({
         task: "inspect doc",
-        objective:
-          "Read docs from /workspace/docs/RUNTIME_API.md and extract one risk with a citation.",
+        executionContext: {
+          version: "v1",
+          workspaceRoot: "/workspace/docs",
+        },
       }),
     ).toEqual({
       path: "/workspace/docs",
-      source: "task_text",
+      source: "execution_envelope",
+    });
+  });
+
+  it("uses only executionContext as runtime working-directory truth", () => {
+    const parsed = parseExecuteWithAgentInput({
+      task: "inspect doc",
+      contextRequirements: ["cwd=/tmp/legacy-only"],
+      executionContext: {
+        workspaceRoot: "/tmp/canonical-root",
+      },
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(
+      resolveDelegatedWorkingDirectory({
+        task: parsed.value.task,
+        executionContext: parsed.value.executionContext,
+      }),
+    ).toEqual({
+      path: "/tmp/canonical-root",
+      source: "execution_envelope",
     });
   });
 
@@ -179,6 +209,9 @@ describe("delegation-tool", () => {
     expect(tool.name).toBe(EXECUTE_WITH_AGENT_TOOL_NAME);
     expect(tool.inputSchema.properties).not.toHaveProperty(
       "continuationSessionId",
+    );
+    expect(tool.inputSchema.properties).not.toHaveProperty(
+      "contextRequirements",
     );
     const direct = await tool.execute({ task: "do work" });
     expect(direct.isError).toBe(true);

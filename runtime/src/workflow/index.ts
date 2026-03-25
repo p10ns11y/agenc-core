@@ -148,3 +148,91 @@ export {
   type PipelineCheckpoint,
   type PipelineExecutorConfig,
 } from "./pipeline.js";
+
+export {
+  CanonicalExecutionKernel,
+  type ExecutionKernelConfig,
+} from "./execution-kernel.js";
+
+export type {
+  ExecutionKernel,
+  ExecutionKernelPlannerDelegate,
+  ExecutionKernelStepState,
+  ExecutionKernelStepStateChange,
+  ExecutionKernelNodeOutcome,
+  ExecutionKernelFallbackResolution,
+  ExecutionKernelDependencyState,
+} from "./execution-kernel-types.js";
+
+export type {
+  ExecutionEnvelope,
+  ExecutionEnvelopeVersion,
+  ExecutionEffectClass,
+  ExecutionVerificationMode,
+  ExecutionStepKind,
+  ExecutionFallbackPolicy,
+  ExecutionResumePolicy,
+  ExecutionApprovalProfile,
+} from "./execution-envelope.js";
+
+export { createExecutionEnvelope } from "./execution-envelope.js";
+export type {
+  ImplementationCompletionTaskClass,
+  ImplementationCompletionContract,
+} from "./completion-contract.js";
+export type { ArtifactContract, ArtifactAccessMode } from "./artifact-contract.js";
+export { buildArtifactContract, isArtifactAccessAllowed } from "./artifact-contract.js";
+export type {
+  WorkflowVerificationContract,
+  VerificationObligations,
+} from "./verification-obligations.js";
+export {
+  deriveVerificationObligations,
+  hasDelegationRuntimeVerificationContext,
+} from "./verification-obligations.js";
+export type {
+  RuntimeVerificationDiagnostic,
+  RuntimeVerificationDecision,
+} from "./verification-results.js";
+export {
+  verificationFail,
+  verificationPass,
+  toDelegationOutputValidationResult,
+} from "./verification-results.js";
+export { validateRuntimeVerificationContract } from "./verification-contract.js";
+export type {
+  EffectLedgerVersion,
+  EffectStatus,
+  EffectKind,
+  EffectScope,
+  EffectTarget,
+  EffectApprovalRef,
+  EffectFilesystemSnapshot,
+  EffectCompensationAction,
+  EffectCompensationState,
+  EffectAttemptRecord,
+  EffectResultSummary,
+  EffectRecord,
+} from "./effects.js";
+export {
+  inferEffectClass,
+  inferEffectKind,
+  isMutatingTool,
+  buildEffectIntentSummary,
+} from "./effects.js";
+export { EffectLedger } from "./effect-ledger.js";
+export { MemoryBackendEffectStorage } from "./effect-storage.js";
+export {
+  runWithEffectExecutionContext,
+  getCurrentEffectExecutionContext,
+  deriveEffectIdempotencyKey,
+  buildPipelineEffectIdempotencyKey,
+  type EffectExecutionContext,
+} from "./idempotency.js";
+export {
+  captureFilesystemSnapshot,
+  capturePreExecutionSnapshots,
+  capturePostExecutionSnapshots,
+  buildCompensationState,
+  executeCompensation,
+} from "./compensation.js";

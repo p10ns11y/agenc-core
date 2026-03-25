@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   approvalsEnabled,
+  resolveGatewayApprovalEngineConfig,
   resolveGatewayApprovalRules,
 } from './approval-runtime.js';
 
@@ -86,6 +87,27 @@ describe("approval-runtime", () => {
           ],
         }),
       ).toEqual([]);
+    });
+  });
+
+  describe("resolveGatewayApprovalEngineConfig", () => {
+    it("returns an effect-centric policy config when approvals are enabled", () => {
+      const config = resolveGatewayApprovalEngineConfig({
+        approvals: { enabled: true, mode: "trusted_operator" },
+        workspaceRoot: "/tmp/workspace",
+      });
+
+      expect(config).not.toBeNull();
+      expect(config?.rules).toBeDefined();
+      expect(config?.effectPolicy?.mode).toBe("trusted_operator");
+    });
+
+    it("returns null when approvals are disabled", () => {
+      expect(
+        resolveGatewayApprovalEngineConfig({
+          approvals: { enabled: false, mode: "safe_local_dev" },
+        }),
+      ).toBeNull();
     });
   });
 });

@@ -26,7 +26,11 @@ import {
   type ReplayBridgeHandle,
 } from "./replay/bridge.js";
 import type { BackfillResult } from "./replay/types.js";
-import { TaskExecutor } from "./task/index.js";
+import {
+  TaskExecutor,
+  SqliteCheckpointStore,
+  SqliteDeadLetterQueue,
+} from "./task/index.js";
 import type { TaskExecutorConfig } from "./task/types.js";
 import type {
   AgentRuntimeConfig,
@@ -38,6 +42,7 @@ import { ensureWallet } from "./types/wallet.js";
 import { Logger, createLogger, silentLogger } from "./utils/logger.js";
 import { generateAgentId, agentIdToShortString } from "./utils/encoding.js";
 import { ValidationError } from "./types/errors.js";
+import { resolveTaskExecutorPersistencePaths } from "./gateway/runtime-persistence.js";
 
 /**
  * High-level agent runtime with automatic lifecycle management.
@@ -535,8 +540,27 @@ export class AgentRuntime {
     },
   ): TaskExecutor {
     const agentPda = findAgentPda(this.agentId, this.programId);
+    const persistence =
+      config.persistence?.mode === "memory"
+        ? undefined
+        : resolveTaskExecutorPersistencePaths({
+            rootDir: config.persistence?.rootDir,
+            agentId: this.agentId,
+            checkpointDbPath: config.persistence?.checkpointDbPath,
+            deadLetterDbPath: config.persistence?.deadLetterDbPath,
+          });
     return new TaskExecutor({
       ...config,
+      checkpointStore:
+        config.checkpointStore ??
+        (persistence
+          ? new SqliteCheckpointStore(persistence.checkpointDbPath)
+          : undefined),
+      deadLetterStore:
+        config.deadLetterStore ??
+        (persistence
+          ? new SqliteDeadLetterQueue(persistence.deadLetterDbPath, config.deadLetterQueue)
+          : undefined),
       agentId: new Uint8Array(this.agentId),
       agentPda,
       logger: config.logger ?? this.logger,

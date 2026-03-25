@@ -8,7 +8,7 @@ import type { PipelineQualityArtifact } from "./pipeline-quality.js";
 
 function artifactFixture(): PipelineQualityArtifact {
   return {
-    schemaVersion: 2,
+    schemaVersion: 8,
     runId: "pipeline-fixture",
     generatedAtMs: 1700000000000,
     contextGrowth: {
@@ -67,6 +67,7 @@ function artifactFixture(): PipelineQualityArtifact {
       delegatedCases: 16,
       usefulDelegations: 12,
       harmfulDelegations: 4,
+      unnecessaryDelegations: 4,
       plannerExecutionMismatches: 2,
       childTimeouts: 1,
       childFailures: 2,
@@ -104,7 +105,96 @@ function artifactFixture(): PipelineQualityArtifact {
         },
       ],
     },
-  };
+    orchestrationBaseline: {
+      scenarioCount: 1,
+      passingScenarios: 1,
+      passRate: 1,
+      averageTurns: 1,
+      averageToolCalls: 1,
+      fallbackCount: 0,
+      spuriousSubagentCount: 0,
+      approvalCount: 0,
+      wrongRootIncidents: 0,
+      unsafeMutationAttempts: 0,
+      approvalCorrectnessRate: 1,
+      effectLedgerCompletenessRate: 1,
+      restartRecoverySuccessCount: 1,
+      restartRecoverySuccessRate: 1,
+      scenarios: [],
+    },
+    liveCoding: {
+      scenarioCount: 1,
+      passingScenarios: 1,
+      passRate: 1,
+      tempRepoCount: 1,
+      totalFileMutations: 2,
+      totalShellMutations: 0,
+      wrongRootIncidents: 0,
+      unauthorizedWriteBlocks: 0,
+      effectLedgerCompletenessRate: 1,
+      scenarios: [],
+    },
+    safety: {
+      scenarioCount: 1,
+      blockedScenarios: 1,
+      passingScenarios: 1,
+      passRate: 1,
+      promptInjectionBlocks: 1,
+      maliciousRepoFileBlocks: 0,
+      unsafeShellBlocks: 0,
+      unauthorizedArtifactWriteBlocks: 0,
+      unsafeMutationAttempts: 4,
+      approvalCorrectnessRate: 1,
+      scenarios: [],
+    },
+    longHorizon: {
+      scenarioCount: 1,
+      passingScenarios: 1,
+      passRate: 1,
+      hundredStepRuns: 1,
+      crashResumeRuns: 0,
+      compactContinueRuns: 0,
+      backgroundPersistenceRuns: 0,
+      restartRecoverySuccessRate: 1,
+      compactionContinuationRate: 1,
+      backgroundPersistenceRate: 1,
+      scenarios: [],
+    },
+    implementationGates: {
+      scenarioCount: 4,
+      mandatoryScenarioCount: 4,
+      advisoryScenarioCount: 0,
+      passingScenarios: 4,
+      passRate: 1,
+      mandatoryPassingScenarios: 4,
+      mandatoryPassRate: 1,
+      falseCompletedScenarios: 0,
+      scenarios: [],
+    },
+    delegatedWorkspaceGates: {
+      scenarioCount: 6,
+      mandatoryScenarioCount: 6,
+      advisoryScenarioCount: 0,
+      passingScenarios: 6,
+      passRate: 1,
+      mandatoryPassingScenarios: 6,
+      mandatoryPassRate: 1,
+      falseCompletedScenarios: 0,
+      scenarios: [],
+    },
+    chaos: {
+      scenarioCount: 6,
+      passingScenarios: 6,
+      passRate: 1,
+      providerTimeoutRecoveryRate: 1,
+      toolTimeoutContainmentRate: 1,
+      persistenceSafeModeRate: 1,
+      approvalStoreSafeModeRate: 1,
+      childRunCrashContainmentRate: 1,
+      daemonRestartRecoveryRate: 1,
+      scenarios: [],
+    },
+  } satisfies PipelineQualityArtifact;
 }
 
 describe("pipeline quality gates", () => {
@@ -182,5 +272,74 @@ describe("pipeline quality gates", () => {
     expect(report).toContain("Pipeline quality gates: FAIL");
     expect(report).toContain("[offline_replay] total_failures");
     expect(report).toContain("[delegation] pass_at_k_delta_vs_baseline");
+  });
+
+  it("fails when chaos recovery thresholds regress", () => {
+    const artifact = artifactFixture();
+    artifact.chaos.providerTimeoutRecoveryRate = 0.5;
+    artifact.chaos.passRate = 0.8;
+    const evaluation = evaluatePipelineQualityGates(artifact);
+
+    expect(evaluation.passed).toBe(false);
+    expect(
+      evaluation.violations.some(
+        (entry) =>
+          entry.scope === "chaos" &&
+          entry.metric === "provider_timeout_recovery_rate",
+      ),
+    ).toBe(true);
+    expect(
+      evaluation.violations.some(
+        (entry) => entry.scope === "chaos" && entry.metric === "pass_rate",
+      ),
+    ).toBe(true);
+  });
+
+  it("fails when mandatory implementation gates regress or false completion appears", () => {
+    const artifact = artifactFixture();
+    artifact.implementationGates.mandatoryPassRate = 0.75;
+    artifact.implementationGates.falseCompletedScenarios = 1;
+
+    const evaluation = evaluatePipelineQualityGates(artifact);
+
+    expect(evaluation.passed).toBe(false);
+    expect(
+      evaluation.violations.some(
+        (entry) =>
+          entry.scope === "implementation_gates" &&
+          entry.metric === "mandatory_pass_rate",
+      ),
+    ).toBe(true);
+    expect(
+      evaluation.violations.some(
+        (entry) =>
+          entry.scope === "implementation_gates" &&
+          entry.metric === "false_completed_scenarios",
+      ),
+    ).toBe(true);
+  });
+
+  it("fails when delegated-workspace mandatory gates regress or false completion appears", () => {
+    const artifact = artifactFixture();
+    artifact.delegatedWorkspaceGates.mandatoryPassRate = 0.5;
+    artifact.delegatedWorkspaceGates.falseCompletedScenarios = 1;
+
+    const evaluation = evaluatePipelineQualityGates(artifact);
+
+    expect(evaluation.passed).toBe(false);
+    expect(
+      evaluation.violations.some(
+        (entry) =>
+          entry.scope === "delegated_workspace_gates" &&
+          entry.metric === "mandatory_pass_rate",
+      ),
+    ).toBe(true);
+    expect(
+      evaluation.violations.some(
+        (entry) =>
+          entry.scope === "delegated_workspace_gates" &&
+          entry.metric === "false_completed_scenarios",
+      ),
+    ).toBe(true);
   });
 });

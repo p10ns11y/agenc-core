@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { BN, type Program } from '@coral-xyz/anchor';
+import anchor, { type Program } from '@coral-xyz/anchor';
 import { PublicKey, SystemProgram } from '@solana/web3.js';
 import {
   getAssociatedTokenAddressSync,
@@ -712,7 +712,7 @@ export function createRegisterSkillTool(
             Array.from(skillId),
             Array.from(name),
             Array.from(contentHash),
-            new BN(price.toString()),
+            new anchor.BN(price.toString()),
             priceMint,
             Array.from(tags),
           )
@@ -812,7 +812,7 @@ export function createPurchaseSkillTool(
         );
 
         const transactionSignature = await (program.methods as any)
-          .purchaseSkill(new BN(price.toString()))
+          .purchaseSkill(new anchor.BN(price.toString()))
           .accountsPartial({
             skill: skillPda,
             purchaseRecord: purchaseRecordPda,

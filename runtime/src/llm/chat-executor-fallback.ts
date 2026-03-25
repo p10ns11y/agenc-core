@@ -35,10 +35,12 @@ import {
   computeProviderCooldownMs,
   buildActiveCooldownSnapshot,
   emitProviderTraceEvent,
+  maybeInjectProviderFault,
 } from "./chat-executor-provider-retry.js";
 import {
   estimatePromptShape,
 } from "./chat-executor-text.js";
+import type { RuntimeFaultInjector } from "../eval/fault-injection.js";
 
 // ============================================================================
 // Helper
@@ -86,6 +88,7 @@ export interface CallWithFallbackOptions {
   trace?: ChatExecuteParams["trace"];
   callIndex?: number;
   callPhase?: ChatCallUsageRecord["phase"];
+  faultInjector?: RuntimeFaultInjector;
 }
 
 // ============================================================================
@@ -102,6 +105,7 @@ export async function callWithFallback(
   messageSections?: readonly PromptBudgetSection[],
   options?: CallWithFallbackOptions,
 ): Promise<FallbackResult> {
+  const callStartedAt = Date.now();
   const beforeBudget = estimatePromptShape(messages);
   const budgeted = applyPromptBudget(
     messages.map((message, index) => ({
@@ -217,6 +221,10 @@ export async function callWithFallback(
                 : {}),
             }
             : undefined;
+        maybeInjectProviderFault(options?.faultInjector, {
+          provider: provider.name,
+          stage: transport,
+        });
         const response = shouldStream
           ? await provider.chatStream(
             boundedMessages,
@@ -256,6 +264,7 @@ export async function callWithFallback(
           response,
           providerName: provider.name,
           usedFallback: i > 0,
+          durationMs: Math.max(1, Date.now() - callStartedAt),
           beforeBudget,
           afterBudget,
           budgetDiagnostics,

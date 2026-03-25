@@ -1186,6 +1186,7 @@ export function groundDecision(
   decision: BackgroundRunDecision,
   domainDecision?: BackgroundRunDecision,
 ): BackgroundRunDecision {
+  const completionProgress = actorResult.completionProgress ?? run.completionProgress;
   if (domainDecision?.state === "working") {
     if (decision.state !== "working") {
       return domainDecision;
@@ -1260,6 +1261,46 @@ export function groundDecision(
     };
   }
 
+  if (
+    completionProgress &&
+    (decision.state === "completed" || decision.state === "working")
+  ) {
+    if (completionProgress.completionState === "blocked") {
+      return {
+        state: "blocked",
+        userUpdate: truncate(
+          completionProgress.stopReasonDetail ||
+            "Background run is blocked until the remaining verification blocker is resolved.",
+          MAX_USER_UPDATE_CHARS,
+        ),
+        internalSummary:
+          "Preserved blocked completion progress instead of continuing the run optimistically.",
+        shouldNotifyUser: true,
+      };
+    }
+    if (
+      decision.state === "completed" &&
+      completionProgress.completionState !== "completed"
+    ) {
+      const remaining = completionProgress.remainingRequirements.slice(0, 3);
+      const remainingText =
+        remaining.length > 0
+          ? ` Remaining before completion: ${remaining.join(", ")}.`
+          : "";
+      return {
+        state: "working",
+        userUpdate: truncate(
+          `Made grounded partial progress but the objective is not complete yet.${remainingText}`,
+          MAX_USER_UPDATE_CHARS,
+        ),
+        internalSummary:
+          `Rejected premature completion because the workflow completion state is ${completionProgress.completionState}.`,
+        nextCheckMs: MIN_POLL_INTERVAL_MS,
+        shouldNotifyUser: true,
+      };
+    }
+  }
+
   return decision;
 }
 
@@ -1299,14 +1340,24 @@ export function buildDecisionPrompt(params: {
   objective: string;
   actorResult: ChatExecutorResult;
   previousUpdate?: string;
+  completionProgressSummary?: string;
 }): string {
-  const { contract, objective, actorResult, previousUpdate } = params;
+  const {
+    contract,
+    objective,
+    actorResult,
+    previousUpdate,
+    completionProgressSummary,
+  } = params;
   return (
     `Objective:\n${objective}\n\n` +
     `Run contract:\n${JSON.stringify(contract, null, 2)}\n\n` +
     (previousUpdate ? `Previous published update:\n${previousUpdate}\n\n` : "") +
     `Actor stop reason: ${actorResult.stopReason}\n` +
     `Actor stop detail: ${actorResult.stopReasonDetail ?? "none"}\n\n` +
+    (completionProgressSummary
+      ? `Actor completion progress:\n${completionProgressSummary}\n\n`
+      : "") +
     `Actor response:\n${actorResult.content || "(empty)"}\n\n` +
     `Tool evidence:\n${summarizeToolCalls(actorResult.toolCalls)}\n\n` +
     "Return JSON only in this shape:\n" +
@@ -1702,6 +1753,8 @@ export function toOperatorSummary(params: {
     lastWakeReason: params.snapshot.lastWakeReason,
     carryForwardSummary: params.snapshot.carryForwardSummary,
     blockerSummary: params.snapshot.blockerSummary,
+    completionState: params.snapshot.completionState,
+    remainingRequirements: params.snapshot.remainingRequirements,
     approvalRequired:
       params.approvalState?.status === "waiting" ||
       params.blocker?.requiresApproval === true,

@@ -22,6 +22,7 @@ import {
   ReplayBackfillService,
   SqliteReplayTimelineStore,
 } from "./index.js";
+import { resolveRuntimePersistencePaths } from "../gateway/runtime-persistence.js";
 import {
   createReplayAlertDispatcher,
   type ReplayAlertDispatcher,
@@ -129,21 +130,33 @@ function buildStore(
   options: ReplayBridgeConfig,
   fallbackLogger: Logger,
 ): ReplayTimelineStore {
-  const storeConfig = options.store ?? { type: "memory" as const };
-  if (storeConfig.type === "sqlite" && storeConfig.sqlitePath) {
+  const defaultPaths = resolveRuntimePersistencePaths();
+  const storeConfig: ReplayBridgeStoreConfig =
+    options.store?.type === "memory"
+      ? options.store
+      : {
+          type: "sqlite",
+          sqlitePath:
+            options.store?.sqlitePath ?? defaultPaths.replayDbPath,
+          retention: options.store?.retention,
+          compaction: options.store?.compaction,
+        };
+  if (storeConfig.type === "sqlite") {
+    if (
+      typeof storeConfig.sqlitePath !== "string" ||
+      storeConfig.sqlitePath.trim().length === 0
+    ) {
+      throw new Error(
+        "ReplayBridge sqlite store requires a non-empty sqlitePath",
+      );
+    }
     fallbackLogger.debug(
       `ReplayBridge using sqlite store at ${storeConfig.sqlitePath}`,
     );
     return new SqliteReplayTimelineStore(storeConfig.sqlitePath, {
-      retention: storeConfig.retention,
-      compaction: storeConfig.compaction,
-    });
-  }
-
-  if (storeConfig.type === "sqlite") {
-    fallbackLogger.debug(
-      "ReplayBridge sqlite store requested without path, using memory fallback",
-    );
+        retention: storeConfig.retention,
+        compaction: storeConfig.compaction,
+      });
   }
   return new InMemoryReplayTimelineStore();
 }

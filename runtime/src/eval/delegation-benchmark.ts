@@ -60,6 +60,7 @@ export interface DelegationBenchmarkSummary {
   delegatedCases: number;
   usefulDelegations: number;
   harmfulDelegations: number;
+  unnecessaryDelegations: number;
   plannerExecutionMismatches: number;
   childTimeouts: number;
   childFailures: number;
@@ -510,6 +511,9 @@ function buildSummary(
   const harmfulDelegations = delegatedRuns.filter(
     (entry) => entry.harmfulDelegation,
   ).length;
+  const unnecessaryDelegations = delegatedRuns.filter(
+    (entry) => !entry.usefulDelegation,
+  ).length;
   const plannerExecutionMismatches = delegatedRuns.filter(
     (entry) => entry.plannerExecutionMismatch,
   ).length;
@@ -535,6 +539,7 @@ function buildSummary(
     delegatedCases: delegatedRuns.length,
     usefulDelegations,
     harmfulDelegations,
+    unnecessaryDelegations,
     plannerExecutionMismatches,
     childTimeouts,
     childFailures,

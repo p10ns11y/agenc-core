@@ -300,6 +300,18 @@ export {
   globMatch,
   extractAmount,
 } from "./approvals.js";
+export { createEffectApprovalPolicy } from "./effect-approval-policy.js";
+export type {
+  EffectApprovalPolicy,
+  EffectApprovalPolicyInput,
+  EffectApprovalOutcome,
+} from "./effect-approval-policy.js";
+export type {
+  ApprovalRiskLevel,
+  EffectApprovalReasonCode,
+  GatewayApprovalMode,
+  TargetSensitivity,
+} from "./safety-tiering.js";
 
 // Webhook routing
 export {

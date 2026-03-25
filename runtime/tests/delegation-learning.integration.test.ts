@@ -71,6 +71,17 @@ class FastSubAgentManager {
         completionTokens: 20,
         totalTokens: 60,
       },
+      completionState: "completed",
+      completionProgress: {
+        completionState: "completed",
+        stopReason: "completed",
+        requiredRequirements: [],
+        satisfiedRequirements: [],
+        remainingRequirements: [],
+        reusableEvidence: [],
+        updatedAt: Date.now(),
+      },
+      stopReason: "completed",
     });
     return id;
   }
@@ -274,6 +285,20 @@ describe("delegation learning integration", () => {
           acceptanceCriteria: [],
           requiredToolCapabilities: ["system.readFile"],
           contextRequirements: ["runtime_sources"],
+          executionContext: {
+            version: "v1",
+            workspaceRoot: "/home/tetsuo/git/AgenC/agenc-core/runtime",
+            allowedReadRoots: ["/home/tetsuo/git/AgenC/agenc-core/runtime"],
+            requiredSourceArtifacts: [
+              "/home/tetsuo/git/AgenC/agenc-core/runtime/src/llm/delegation-learning.ts",
+            ],
+            inputArtifacts: [
+              "/home/tetsuo/git/AgenC/agenc-core/runtime/src/llm/delegation-learning.ts",
+            ],
+            effectClass: "read_only",
+            verificationMode: "grounded_read",
+            stepKind: "delegated_research",
+          },
           maxBudgetHint: "30s",
           canRunParallel: true,
         },

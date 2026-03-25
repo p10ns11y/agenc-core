@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve as resolvePath } from "node:path";
 import { EventParser } from "@coral-xyz/anchor";
 import {
@@ -30,6 +29,7 @@ import {
   InMemoryReplayTimelineStore,
   SqliteReplayTimelineStore,
 } from "../replay/index.js";
+import { resolveRuntimePersistencePaths } from "../gateway/runtime-persistence.js";
 
 interface ParsedAnchorEvent {
   name: string;
@@ -84,9 +84,7 @@ interface SignedEvent {
 }
 
 export const DEFAULT_SQLITE_REPLAY_PATH = resolvePath(
-  homedir(),
-  ".agenc",
-  "replay-events.sqlite",
+  resolveRuntimePersistencePaths().replayDbPath,
 );
 const MAX_SIGNATURES_PER_PAGE = 1_000;
 const DEFAULT_FETCH_PAGE_SIZE = 100;

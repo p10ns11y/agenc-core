@@ -15,11 +15,11 @@ import type {
   FullPlannerSummaryState,
 } from "./chat-executor-types.js";
 import type { LLMStatefulDiagnostics, LLMStatefulFallbackReason } from "./types.js";
-import type { LLMPipelineStopReason } from "./policy.js";
 import type {
   DelegationTrajectoryFinalReward,
   DelegationTrajectoryRecord,
 } from "./delegation-learning.js";
+import type { WorkflowCompletionState } from "../workflow/completion-state.js";
 import { createLLMStatefulFallbackReasonCounts } from "./types.js";
 import { SHELL_BUILTIN_COMMANDS } from "./chat-executor-constants.js";
 import {
@@ -770,6 +770,14 @@ export function inferRecoveryHint(
           "Retry only after explicitly using file-writing tools and naming the changed files in the result.",
       };
     }
+    if (validationCode === "missing_required_source_evidence") {
+      return {
+        key: "execute-with-agent-missing-required-source-evidence",
+        message:
+          "The previous `execute_with_agent` attempt wrote derived files without first inspecting the named source artifacts from its delegated input contract. " +
+          "Retry only after reading those source files and preserving the distinction between planned structure and files that actually exist.",
+      };
+    }
     if (validationCode === "forbidden_phase_action") {
       return {
         key: "execute-with-agent-forbidden-phase-action",
@@ -1149,7 +1157,7 @@ export function inferRecoveryHint(
 
 /** Input for computing quality proxy score. */
 export interface QualityProxyInput {
-  readonly stopReason: LLMPipelineStopReason;
+  readonly completionState: WorkflowCompletionState;
   readonly verifierPerformed: boolean;
   readonly verifierOverall: "pass" | "retry" | "fail" | "skipped";
   readonly evaluation?: EvaluationResult;
@@ -1158,11 +1166,13 @@ export interface QualityProxyInput {
 
 /** Compute a 0–1 quality proxy score from execution outcome signals. */
 export function computeQualityProxy(input: QualityProxyInput): number {
-  const stopReasonQualityBase = input.stopReason === "completed"
+  const completionStateQualityBase = input.completionState === "completed"
     ? 0.85
-    : input.stopReason === "tool_calls"
+    : input.completionState === "needs_verification"
       ? 0.6
-      : 0.25;
+      : input.completionState === "partial"
+        ? 0.45
+        : 0.25;
   const verifierBonus = input.verifierPerformed
     ? (
       input.verifierOverall === "pass"
@@ -1180,7 +1190,10 @@ export function computeQualityProxy(input: QualityProxyInput): number {
     0,
     Math.min(
       1,
-      stopReasonQualityBase + verifierBonus + evaluatorBonus - failurePenalty,
+      completionStateQualityBase +
+        verifierBonus +
+        evaluatorBonus -
+        failurePenalty,
     ),
   );
 }
@@ -1238,13 +1251,16 @@ export function buildDelegationTrajectoryEntry(input: DelegationTrajectoryInput)
       tokenCost: ctx.cumulativeUsage.totalTokens,
       latencyMs: input.durationMs,
       errorCount:
-        ctx.failedToolCalls + (ctx.stopReason === "completed" ? 0 : 1),
-      ...(ctx.stopReason !== "completed" ? { errorClass: ctx.stopReason } : {}),
+        ctx.failedToolCalls + (ctx.completionState === "completed" ? 0 : 1),
+      ...(ctx.completionState !== "completed"
+        ? { errorClass: ctx.completionState }
+        : {}),
     },
     finalReward: input.rewardSignal,
     metadata: {
       plannerUsed: ctx.plannerSummaryState.used,
       routeReason: ctx.plannerSummaryState.routeReason ?? "none",
+      completionState: ctx.completionState,
       stopReason: ctx.stopReason,
       usefulDelegation: input.usefulnessProxy.useful,
       usefulDelegationScore: Number(input.usefulnessProxy.score.toFixed(4)),

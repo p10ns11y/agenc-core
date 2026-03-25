@@ -64,6 +64,8 @@ test("shouldAutoInspectRun only enables auto inspect for background-run state", 
   assert.equal(shouldAutoInspectRun(null, "idle"), false);
   assert.equal(shouldAutoInspectRun(null, "queued"), false);
   assert.equal(shouldAutoInspectRun(null, "working"), true);
+  assert.equal(shouldAutoInspectRun(null, "needs_verification"), true);
+  assert.equal(shouldAutoInspectRun(null, "partial"), true);
   assert.equal(shouldAutoInspectRun({ state: "completed" }, "idle"), true);
 });
 

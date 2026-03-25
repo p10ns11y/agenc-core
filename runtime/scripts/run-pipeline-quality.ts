@@ -132,6 +132,10 @@ async function main(): Promise<void> {
       `Offline replay failures: ${offlineFailures}`,
       `Delegation attempt/useful/harmful: ${artifact.delegation.delegationAttemptRate.toFixed(4)}/${artifact.delegation.usefulDelegationRate.toFixed(4)}/${artifact.delegation.harmfulDelegationRate.toFixed(4)}`,
       `Delegation deltas (quality/pass@k/pass^k): ${artifact.delegation.qualityDeltaVsBaseline.toFixed(4)}/${artifact.delegation.passAtKDeltaVsBaseline.toFixed(4)}/${artifact.delegation.passCaretKDeltaVsBaseline.toFixed(4)}`,
+      `Live coding pass/effect-ledger: ${artifact.liveCoding.passRate.toFixed(4)}/${artifact.liveCoding.effectLedgerCompletenessRate.toFixed(4)}`,
+      `Safety pass/approval correctness: ${artifact.safety.passRate.toFixed(4)}/${artifact.safety.approvalCorrectnessRate.toFixed(4)}`,
+      `Long-horizon pass/restart/compaction: ${artifact.longHorizon.passRate.toFixed(4)}/${artifact.longHorizon.restartRecoverySuccessRate.toFixed(4)}/${artifact.longHorizon.compactionContinuationRate.toFixed(4)}`,
+      `Chaos pass/provider/tool/persistence/approval/child/restart: ${artifact.chaos.passRate.toFixed(4)}/${artifact.chaos.providerTimeoutRecoveryRate.toFixed(4)}/${artifact.chaos.toolTimeoutContainmentRate.toFixed(4)}/${artifact.chaos.persistenceSafeModeRate.toFixed(4)}/${artifact.chaos.approvalStoreSafeModeRate.toFixed(4)}/${artifact.chaos.childRunCrashContainmentRate.toFixed(4)}/${artifact.chaos.daemonRestartRecoveryRate.toFixed(4)}`,
       `Output: ${options.outputPath}`,
     ].join("\n"),
   );

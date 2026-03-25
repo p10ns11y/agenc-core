@@ -2169,7 +2169,7 @@ describe("WebChatChannel", () => {
   });
 
   describe('observability handlers', () => {
-    it('returns summary, trace list, trace detail, artifact, and logs for owned sessions', async () => {
+    it('returns summary, trace list, trace detail, artifact, and logs for operator clients', async () => {
       deps = createDeps();
       context = createContext();
       channel = new WebChatChannel(deps);
@@ -2232,10 +2232,7 @@ describe("WebChatChannel", () => {
           }),
         ),
       );
-      expect(getObservabilitySummary).toHaveBeenCalledWith({
-        windowMs: undefined,
-        sessionIds: [ownedSessionId],
-      });
+      expect(getObservabilitySummary).toHaveBeenCalledWith({ windowMs: undefined });
 
       channel.handleMessage(
         'client_1',
@@ -2259,7 +2256,6 @@ describe("WebChatChannel", () => {
           search: undefined,
           status: undefined,
           sessionId: undefined,
-          sessionIds: [ownedSessionId],
         }),
       );
 
@@ -2330,7 +2326,7 @@ describe("WebChatChannel", () => {
       );
     });
 
-    it('rejects observability access for foreign sessions', async () => {
+    it('allows observability access for traces from other sessions', async () => {
       const traceDetail = makeTraceDetail('foreign-session');
       const getObservabilityTrace = vi.fn(async () => traceDetail);
 
@@ -2353,17 +2349,37 @@ describe("WebChatChannel", () => {
       await vi.waitFor(() =>
         expect(send).toHaveBeenCalledWith(
           expect.objectContaining({
-            type: 'error',
+            type: 'observability.trace',
             id: 'req-observability-foreign',
-            error: 'Not authorized for target session trace data',
+            payload: expect.objectContaining({
+              summary: expect.objectContaining({ traceId: traceDetail.summary.traceId }),
+            }),
           }),
         ),
       );
     });
 
-    it('returns empty observability results for clients without owned sessions', async () => {
-      const getObservabilitySummary = vi.fn();
-      const listObservabilityTraces = vi.fn();
+    it('returns observability results for clients without owned sessions', async () => {
+      const traceDetail = makeTraceDetail('foreign-session');
+      const getObservabilitySummary = vi.fn(async () => ({
+        windowMs: 86_400_000,
+        traces: {
+          total: 1,
+          completed: 1,
+          errors: 0,
+          open: 0,
+          completenessRate: 1,
+        },
+        events: {
+          providerErrors: 0,
+          toolRejections: 0,
+          routeMisses: 0,
+          completionGateFailures: 0,
+        },
+        topTools: [{ name: 'system.readFile', count: 1 }],
+        topStopReasons: [{ name: 'completed', count: 1 }],
+      }));
+      const listObservabilityTraces = vi.fn(async () => [traceDetail.summary]);
 
       deps = createDeps({
         getObservabilitySummary,
@@ -2390,8 +2406,8 @@ describe("WebChatChannel", () => {
             payload: expect.objectContaining({
               windowMs: 86_400_000,
               traces: expect.objectContaining({
-                total: 0,
-                completed: 0,
+                total: 1,
+                completed: 1,
                 errors: 0,
                 open: 0,
                 completenessRate: 1,
@@ -2400,6 +2416,7 @@ describe("WebChatChannel", () => {
           }),
         ),
       );
+      expect(getObservabilitySummary).toHaveBeenCalledWith({ windowMs: undefined });
 
       channel.handleMessage(
         'client_1',
@@ -2412,17 +2429,23 @@ describe("WebChatChannel", () => {
           expect.objectContaining({
             type: 'observability.traces',
             id: 'req-observability-empty-traces',
-            payload: [],
+            payload: [expect.objectContaining({ traceId: traceDetail.summary.traceId })],
           }),
         ),
       );
 
-      expect(getObservabilitySummary).not.toHaveBeenCalled();
-      expect(listObservabilityTraces).not.toHaveBeenCalled();
+      expect(listObservabilityTraces).toHaveBeenCalledWith(
+        expect.objectContaining({
+          limit: 50,
+          sessionId: undefined,
+        }),
+      );
     });
 
-    it('rejects foreign session filters for observability trace listings', async () => {
-      const listObservabilityTraces = vi.fn(async () => []);
+    it('allows explicit session filters for observability trace listings', async () => {
+      const foreignSessionId = 'foreign-session';
+      const traceDetail = makeTraceDetail(foreignSessionId);
+      const listObservabilityTraces = vi.fn(async () => [traceDetail.summary]);
 
       deps = createDeps({ listObservabilityTraces });
       context = createContext();
@@ -2431,15 +2454,7 @@ describe("WebChatChannel", () => {
       await channel.start();
 
       const send = vi.fn<(response: ControlResponse) => void>();
-      const foreignSend = vi.fn<(response: ControlResponse) => void>();
       openChatSession(channel, context, 'client_1', send, 'owned session');
-      const foreignSessionId = openChatSession(
-        channel,
-        context,
-        'client_2',
-        foreignSend,
-        'foreign session',
-      );
 
       channel.handleMessage(
         'client_1',
@@ -2455,13 +2470,18 @@ describe("WebChatChannel", () => {
       await vi.waitFor(() =>
         expect(send).toHaveBeenCalledWith(
           expect.objectContaining({
-            type: 'error',
+            type: 'observability.traces',
             id: 'req-observability-foreign-traces',
-            error: 'Not authorized for target session trace data',
+            payload: [expect.objectContaining({ traceId: traceDetail.summary.traceId })],
           }),
         ),
       );
-      expect(listObservabilityTraces).not.toHaveBeenCalled();
+      expect(listObservabilityTraces).toHaveBeenCalledWith(
+        expect.objectContaining({
+          limit: 50,
+          sessionId: foreignSessionId,
+        }),
+      );
     });
 
     it('requires traceId for observability logs', async () => {
@@ -2498,10 +2518,13 @@ describe("WebChatChannel", () => {
       expect(getObservabilityLogTail).not.toHaveBeenCalled();
     });
 
-    it('rejects observability logs for foreign traces', async () => {
+    it('returns observability logs for traces from other sessions', async () => {
       const traceDetail = makeTraceDetail('foreign-session');
       const getObservabilityTrace = vi.fn(async () => traceDetail);
-      const getObservabilityLogTail = vi.fn();
+      const getObservabilityLogTail = vi.fn(async () => ({
+        path: 'daemon.log',
+        lines: [`${traceDetail.summary.traceId} line`],
+      }));
 
       deps = createDeps({ getObservabilityTrace, getObservabilityLogTail });
       context = createContext();
@@ -2526,15 +2549,21 @@ describe("WebChatChannel", () => {
       await vi.waitFor(() =>
         expect(send).toHaveBeenCalledWith(
           expect.objectContaining({
-            type: 'error',
+            type: 'observability.logs',
             id: 'req-observability-logs-foreign',
-            error: 'Not authorized for target session trace data',
+            payload: expect.objectContaining({
+              path: 'daemon.log',
+              lines: [`${traceDetail.summary.traceId} line`],
+            }),
           }),
         ),
       );
 
       expect(getObservabilityTrace).toHaveBeenCalledWith(traceDetail.summary.traceId);
-      expect(getObservabilityLogTail).not.toHaveBeenCalled();
+      expect(getObservabilityLogTail).toHaveBeenCalledWith({
+        lines: 50,
+        traceId: traceDetail.summary.traceId,
+      });
     });
   });
 

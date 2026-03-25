@@ -10,7 +10,10 @@ import {
   annotateFailureError,
   buildActiveCooldownSnapshot,
   emitProviderTraceEvent,
+  maybeInjectProviderFault,
 } from "./chat-executor-provider-retry.js";
+import { RuntimeFaultInjector } from "../eval/fault-injection.js";
+import { LLMTimeoutError } from "./errors.js";
 
 describe("shouldRetryProviderImmediately", () => {
   const rule = { maxRetries: 3, baseDelayMs: 100, maxDelayMs: 1000 };
@@ -156,5 +159,29 @@ describe("emitProviderTraceEvent", () => {
       provider: "grok",
       payload: {},
     });
+  });
+});
+
+describe("maybeInjectProviderFault", () => {
+  it("is inert when no injector is provided", () => {
+    expect(() =>
+      maybeInjectProviderFault(undefined, {
+        provider: "grok",
+        stage: "chat",
+      }),
+    ).not.toThrow();
+  });
+
+  it("throws an LLM timeout when an enabled provider fault matches", () => {
+    const injector = new RuntimeFaultInjector({
+      enabled: true,
+      rules: [{ point: "provider_timeout", provider: "grok", operation: "chat" }],
+    });
+    expect(() =>
+      maybeInjectProviderFault(injector, {
+        provider: "grok",
+        stage: "chat",
+      }),
+    ).toThrow(LLMTimeoutError);
   });
 });

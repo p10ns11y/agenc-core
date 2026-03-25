@@ -275,22 +275,51 @@ describe('CLI output contract tests', () => {
         argv: ['replay', 'backfill', '--to-slot', '999', '--store-type', 'memory'],
       },
       async execute({}) {
-        const result = await runCliCapture([
-          'replay',
-          'backfill',
-          '--to-slot',
-          '999',
-          '--store-type',
-          'memory',
-        ]);
-        return parseCliOutput(result);
+        const configPath = join(workspace, 'empty-cli-config.json');
+        writeFileSync(configPath, JSON.stringify({}), 'utf8');
+        const originalRpcUrl = process.env.AGENC_RUNTIME_RPC_URL;
+        const originalConfig = process.env.AGENC_CONFIG;
+        const originalRuntimeConfig = process.env.AGENC_RUNTIME_CONFIG;
+        delete process.env.AGENC_RUNTIME_RPC_URL;
+        process.env.AGENC_CONFIG = configPath;
+        delete process.env.AGENC_RUNTIME_CONFIG;
+        try {
+          const result = await runCliCapture([
+            'replay',
+            'backfill',
+            '--to-slot',
+            '999',
+            '--store-type',
+            'memory',
+          ]);
+          return parseCliOutput(result);
+        } finally {
+          if (originalRpcUrl === undefined) {
+            delete process.env.AGENC_RUNTIME_RPC_URL;
+          } else {
+            process.env.AGENC_RUNTIME_RPC_URL = originalRpcUrl;
+          }
+          if (originalConfig === undefined) {
+            delete process.env.AGENC_CONFIG;
+          } else {
+            process.env.AGENC_CONFIG = originalConfig;
+          }
+          if (originalRuntimeConfig === undefined) {
+            delete process.env.AGENC_RUNTIME_CONFIG;
+          } else {
+            process.env.AGENC_RUNTIME_CONFIG = originalRuntimeConfig;
+          }
+        }
       },
       shape(output) {
         const parsed = output as { status: string; code: string; message: string };
         return {
           status: parsed.status,
           code: parsed.code,
-          message: parsed.message,
+          message: parsed.message.replace(
+            /\/tmp\/agenc-cli-contract-[^/]+\/empty-cli-config\.json/g,
+            '/tmp/agenc-cli-contract-<fixture>/empty-cli-config.json',
+          ),
         };
       },
     },

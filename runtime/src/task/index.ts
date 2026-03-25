@@ -12,6 +12,8 @@ export * from "./executor.js";
 export * from "./priority-queue.js";
 export * from "./dlq.js";
 export * from "./checkpoint.js";
+export * from "./sqlite-dlq.js";
+export * from "./sqlite-checkpoint-store.js";
 export * from "./metrics.js";
 export * from "./dependency-graph.js";
 export * from "./proof-pipeline.js";

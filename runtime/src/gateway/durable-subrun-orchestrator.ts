@@ -87,10 +87,25 @@ function uniqueStrings(values: readonly string[] | undefined): string[] {
 }
 
 function mergeChildScope(children: readonly DurableSubrunSpec[]): SubrunScope {
+  const workspaceRoots = uniqueStrings(
+    children.flatMap((child) => child.scope.workspaceRoot ?? []),
+  );
   return {
     allowedTools: uniqueStrings(children.flatMap((child) => child.scope.allowedTools)),
+    ...(workspaceRoots.length === 1
+      ? { workspaceRoot: workspaceRoots[0] }
+      : {}),
+    allowedReadRoots: uniqueStrings(
+      children.flatMap((child) => child.scope.allowedReadRoots ?? []),
+    ),
     allowedWriteRoots: uniqueStrings(
       children.flatMap((child) => child.scope.allowedWriteRoots ?? []),
+    ),
+    requiredSourceArtifacts: uniqueStrings(
+      children.flatMap((child) => child.scope.requiredSourceArtifacts ?? []),
+    ),
+    targetArtifacts: uniqueStrings(
+      children.flatMap((child) => child.scope.targetArtifacts ?? []),
     ),
     allowedHosts: uniqueStrings(
       children.flatMap((child) => child.scope.allowedHosts ?? []),

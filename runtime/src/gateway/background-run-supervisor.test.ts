@@ -37,6 +37,7 @@ function makeResult(
     durationMs: 10,
     compacted: false,
     stopReason: "completed",
+    completionState: "completed",
     ...overrides,
   };
 }
@@ -1632,6 +1633,162 @@ describe("background-run-supervisor", () => {
     );
   });
 
+  it("preserves partial completion progress across pause and resume without redoing grounded evidence", async () => {
+    const publishUpdate = vi.fn(async () => undefined);
+    const execute = vi
+      .fn()
+      .mockResolvedValueOnce(
+        makeResult({
+          content: "Implemented the shell changes and ran the repo-local build.",
+          toolCalls: [
+            {
+              name: "system.bash",
+              args: { command: "make test" },
+              result: JSON.stringify({
+                stdout: "ok",
+                stderr: "",
+                exitCode: 0,
+                __agencVerification: {
+                  category: "build",
+                  repoLocal: true,
+                  command: "make test",
+                },
+              }),
+              isError: false,
+              durationMs: 5,
+            },
+          ],
+          completionState: "needs_verification",
+          completionProgress: {
+            completionState: "needs_verification",
+            stopReason: "completed",
+            requiredRequirements: [
+              "build_verification",
+              "workflow_verifier_pass",
+            ],
+            satisfiedRequirements: ["build_verification"],
+            remainingRequirements: ["workflow_verifier_pass"],
+            reusableEvidence: [
+              {
+                requirement: "build_verification",
+                summary: "make test",
+                observedAt: 10,
+              },
+            ],
+            updatedAt: 10,
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        makeResult({
+          content: "Resumed from the prior grounded build and finished the remaining verification.",
+          completionState: "completed",
+          completionProgress: {
+            completionState: "completed",
+            stopReason: "completed",
+            requiredRequirements: ["workflow_verifier_pass"],
+            satisfiedRequirements: ["workflow_verifier_pass"],
+            remainingRequirements: [],
+            reusableEvidence: [],
+            updatedAt: 20,
+          },
+        }),
+      );
+    const supervisor = new BackgroundRunSupervisor({
+      chatExecutor: { execute } as any,
+      supervisorLlm: {
+        name: "supervisor",
+        chat: vi
+          .fn()
+          .mockResolvedValueOnce({
+            content:
+              '{"kind":"finite","successCriteria":["finish the implementation truthfully"],"completionCriteria":["pass the remaining verifier obligations"],"blockedCriteria":["missing runtime evidence"],"nextCheckMs":4000,"heartbeatMs":12000,"requiresUserStop":false}',
+            toolCalls: [],
+            usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+            model: "supervisor-model",
+            finishReason: "stop",
+          })
+          .mockResolvedValueOnce({
+            content:
+              '{"state":"completed","userUpdate":"Shell implementation completed.","internalSummary":"done","shouldNotifyUser":true}',
+            toolCalls: [],
+            usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+            model: "supervisor-model",
+            finishReason: "stop",
+          })
+          .mockResolvedValueOnce({
+            content:
+              '{"summary":"Implementation is partially complete.","verifiedFacts":["Repo-local build succeeded."],"openLoops":["Finish the remaining verifier pass."],"nextFocus":"Resume from the grounded build evidence instead of repeating it."}',
+            toolCalls: [],
+            usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+            model: "supervisor-model",
+            finishReason: "stop",
+          })
+          .mockResolvedValueOnce({
+            content:
+              '{"state":"completed","userUpdate":"Shell implementation verified and complete.","internalSummary":"verified complete","shouldNotifyUser":true}',
+            toolCalls: [],
+            usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+            model: "supervisor-model",
+            finishReason: "stop",
+          })
+          .mockResolvedValueOnce({
+            content:
+              '{"summary":"Implementation verified and complete.","verifiedFacts":["Repo-local build succeeded.","Remaining verification completed."],"openLoops":[],"nextFocus":"None."}',
+            toolCalls: [],
+            usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+            model: "supervisor-model",
+            finishReason: "stop",
+          }),
+        chatStream: vi.fn(),
+        healthCheck: vi.fn(async () => true),
+      },
+      getSystemPrompt: () => "base system prompt",
+      runStore: createRunStore(),
+      createToolHandler: (): ToolHandler => vi.fn(async () => "ok"),
+      publishUpdate,
+    });
+
+    await supervisor.startRun({
+      sessionId: "session-partial-resume",
+      objective: "Implement the shell fully and keep going until the remaining verification passes.",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    let detail = await supervisor.getOperatorDetail("session-partial-resume");
+    expect(detail?.state).toBe("working");
+    expect(detail?.completionProgress).toMatchObject({
+      completionState: "needs_verification",
+      satisfiedRequirements: ["build_verification"],
+      remainingRequirements: ["workflow_verifier_pass"],
+    });
+    expect(supervisor.getStatusSnapshot("session-partial-resume")).toMatchObject({
+      state: "working",
+      completionState: "needs_verification",
+      remainingRequirements: ["workflow_verifier_pass"],
+    });
+
+    await supervisor.pauseRun("session-partial-resume");
+    await supervisor.resumeRun("session-partial-resume");
+    await vi.advanceTimersByTimeAsync(0);
+
+    const resumedPrompt = execute.mock.calls[1]?.[0]?.message?.content;
+    expect(resumedPrompt).toContain("Current completion state: needs_verification");
+    expect(resumedPrompt).toContain("Already satisfied: build_verification");
+    expect(resumedPrompt).toContain("Reusable grounded evidence: make test");
+
+    detail = await supervisor.getOperatorDetail("session-partial-resume");
+    expect(detail?.state).toBe("completed");
+    expect(detail?.completionProgress).toMatchObject({
+      completionState: "completed",
+      satisfiedRequirements: expect.arrayContaining([
+        "build_verification",
+        "workflow_verifier_pass",
+      ]),
+      remainingRequirements: [],
+    });
+  });
+
   it("preserves the latest deterministic update while a stable background run waits for the next verification", async () => {
     const publishUpdate = vi.fn(async () => undefined);
     const execute = vi
@@ -2294,6 +2451,289 @@ describe("background-run-supervisor", () => {
       });
       await vi.advanceTimersByTimeAsync(4_000);
       expect(execute2).toHaveBeenCalledTimes(2);
+      await backend2.close();
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers partial completion progress after restart without losing remaining obligations", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "agenc-bg-run-partial-"));
+    const dbPath = join(tempDir, "memory.sqlite");
+
+    try {
+      const backend1 = new SqliteBackend({ dbPath });
+      const runStore1 = new BackgroundRunStore({ memoryBackend: backend1 });
+      const supervisor1 = new BackgroundRunSupervisor({
+        chatExecutor: {
+          execute: vi.fn(async () =>
+            makeResult({
+              content: "Implemented the code and grounded the build step.",
+              toolCalls: [
+                {
+                  name: "system.bash",
+                  args: { command: "npm test" },
+                  result: JSON.stringify({
+                    stdout: "ok",
+                    stderr: "",
+                    exitCode: 0,
+                    __agencVerification: {
+                      category: "build",
+                      repoLocal: true,
+                      command: "npm test",
+                    },
+                  }),
+                  isError: false,
+                  durationMs: 4,
+                },
+              ],
+              completionState: "needs_verification",
+              completionProgress: {
+                completionState: "needs_verification",
+                stopReason: "completed",
+                requiredRequirements: [
+                  "build_verification",
+                  "workflow_verifier_pass",
+                ],
+                satisfiedRequirements: ["build_verification"],
+                remainingRequirements: ["workflow_verifier_pass"],
+                reusableEvidence: [
+                  {
+                    requirement: "build_verification",
+                    summary: "npm test",
+                    observedAt: 10,
+                  },
+                ],
+                updatedAt: 10,
+              },
+            }),
+          ),
+        } as any,
+        supervisorLlm: {
+          name: "supervisor",
+          chat: vi
+            .fn()
+            .mockResolvedValueOnce({
+              content:
+                '{"kind":"finite","successCriteria":["finish the implementation"],"completionCriteria":["pass the remaining verifier obligations"],"blockedCriteria":["missing runtime evidence"],"nextCheckMs":4000,"heartbeatMs":12000,"requiresUserStop":false}',
+              toolCalls: [],
+              usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+              model: "supervisor-model",
+              finishReason: "stop",
+            })
+            .mockResolvedValueOnce({
+              content:
+                '{"state":"completed","userUpdate":"Implementation completed.","internalSummary":"done","shouldNotifyUser":true}',
+              toolCalls: [],
+              usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+              model: "supervisor-model",
+              finishReason: "stop",
+            })
+            .mockResolvedValueOnce({
+              content:
+                '{"summary":"Implementation is partially complete.","verifiedFacts":["Build check passed."],"openLoops":["Run the remaining verifier pass."],"nextFocus":"Resume from the existing grounded build evidence."}',
+              toolCalls: [],
+              usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+              model: "supervisor-model",
+              finishReason: "stop",
+            }),
+          chatStream: vi.fn(),
+          healthCheck: vi.fn(async () => true),
+        },
+        getSystemPrompt: () => "base system prompt",
+        runStore: runStore1,
+        createToolHandler: (): ToolHandler => vi.fn(async () => "ok"),
+        publishUpdate: vi.fn(async () => undefined),
+      });
+
+      await supervisor1.startRun({
+        sessionId: "session-partial-recover",
+        objective: "Keep working on the implementation until the remaining verification passes.",
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      await supervisor1.shutdown();
+      await expect(runStore1.loadRun("session-partial-recover")).resolves.toMatchObject({
+        state: "suspended",
+        completionProgress: {
+          completionState: "needs_verification",
+          satisfiedRequirements: ["build_verification"],
+          remainingRequirements: ["workflow_verifier_pass"],
+        },
+      });
+      await backend1.close();
+
+      const backend2 = new SqliteBackend({ dbPath });
+      const runStore2 = new BackgroundRunStore({ memoryBackend: backend2 });
+      const execute2 = vi.fn(async () =>
+        makeResult({
+          content: "Finished the remaining verification after restart.",
+          completionState: "completed",
+          completionProgress: {
+            completionState: "completed",
+            stopReason: "completed",
+            requiredRequirements: ["workflow_verifier_pass"],
+            satisfiedRequirements: ["workflow_verifier_pass"],
+            remainingRequirements: [],
+            reusableEvidence: [],
+            updatedAt: 20,
+          },
+        }),
+      );
+      const supervisor2 = new BackgroundRunSupervisor({
+        chatExecutor: { execute: execute2 } as any,
+        supervisorLlm: {
+          name: "supervisor",
+          chat: vi
+            .fn()
+            .mockResolvedValueOnce({
+              content:
+                '{"state":"completed","userUpdate":"Implementation verified after restart.","internalSummary":"verified after restart","shouldNotifyUser":true}',
+              toolCalls: [],
+              usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+              model: "supervisor-model",
+              finishReason: "stop",
+            })
+            .mockResolvedValueOnce({
+              content:
+                '{"summary":"Implementation verified after restart.","verifiedFacts":["Build check reused from the previous cycle.","Final verification passed."],"openLoops":[],"nextFocus":"None."}',
+              toolCalls: [],
+              usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+              model: "supervisor-model",
+              finishReason: "stop",
+            }),
+          chatStream: vi.fn(),
+          healthCheck: vi.fn(async () => true),
+        },
+        getSystemPrompt: () => "base system prompt",
+        runStore: runStore2,
+        createToolHandler: (): ToolHandler => vi.fn(async () => "ok"),
+        publishUpdate: vi.fn(async () => undefined),
+      });
+
+      await expect(supervisor2.recoverRuns()).resolves.toBe(1);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const recoveredPrompt = execute2.mock.calls[0]?.[0]?.message?.content;
+      expect(recoveredPrompt).toContain("Current completion state: needs_verification");
+      expect(recoveredPrompt).toContain("Still required: workflow_verifier_pass");
+      expect(recoveredPrompt).toContain("Reusable grounded evidence: npm test");
+      await expect(runStore2.loadCheckpoint("session-partial-recover")).resolves.toMatchObject({
+        completionProgress: {
+          completionState: "completed",
+          remainingRequirements: [],
+        },
+      });
+      await backend2.close();
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers persisted canonical delegated scope without re-synthesizing workspace truth from prompt text", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "agenc-bg-run-lineage-"));
+    const dbPath = join(tempDir, "memory.sqlite");
+
+    try {
+      const canonicalWorkspaceRoot = "/home/tetsuo/git/AgenC/agenc-core";
+      const canonicalLineage = {
+        rootRunId: "bg-lineage-root",
+        parentRunId: "bg-lineage-parent",
+        role: "worker" as const,
+        depth: 1,
+        scope: {
+          allowedTools: ["system.readFile", "system.writeFile"],
+          workspaceRoot: canonicalWorkspaceRoot,
+          allowedReadRoots: [canonicalWorkspaceRoot],
+          allowedWriteRoots: [`${canonicalWorkspaceRoot}/docs`],
+          requiredSourceArtifacts: [`${canonicalWorkspaceRoot}/PLAN.md`],
+          targetArtifacts: [`${canonicalWorkspaceRoot}/docs/AGENC.md`],
+        },
+        artifactContract: { requiredKinds: ["file"] as const },
+        budget: { maxRuntimeMs: 60_000, maxToolCalls: 4 },
+        childRunIds: [],
+      };
+
+      const backend1 = new SqliteBackend({ dbPath });
+      const runStore1 = new BackgroundRunStore({ memoryBackend: backend1 });
+      await runStore1.saveRun(
+        makePersistedRunRecord({
+          sessionId: "session-lineage-recover",
+          objective:
+            "Review /workspace/PLAN.md and continue the delegated local-file task.",
+          internalHistory: [
+            {
+              role: "user",
+              content:
+                "legacy hint: cwd=/workspace and required file /workspace/PLAN.md",
+            },
+          ],
+          lineage: canonicalLineage,
+        }) as any,
+      );
+      await backend1.close();
+
+      const backend2 = new SqliteBackend({ dbPath });
+      const runStore2 = new BackgroundRunStore({ memoryBackend: backend2 });
+      const supervisor = new BackgroundRunSupervisor({
+        chatExecutor: {
+          execute: vi.fn(async () =>
+            makeResult({
+              content: "Recovered using the persisted canonical delegated scope.",
+              completionState: "completed",
+            })),
+        } as any,
+        supervisorLlm: {
+          name: "supervisor",
+          chat: vi
+            .fn()
+            .mockResolvedValueOnce({
+              content:
+                '{"state":"completed","userUpdate":"Recovered delegated child completed.","internalSummary":"recovered with canonical scope","shouldNotifyUser":true}',
+              toolCalls: [],
+              usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+              model: "supervisor-model",
+              finishReason: "stop",
+            })
+            .mockResolvedValueOnce({
+              content:
+                '{"summary":"Recovered with canonical delegated scope.","verifiedFacts":["Persisted canonical scope reused after restart."],"openLoops":[],"nextFocus":"None."}',
+              toolCalls: [],
+              usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+              model: "supervisor-model",
+              finishReason: "stop",
+            }),
+          chatStream: vi.fn(),
+          healthCheck: vi.fn(async () => true),
+        },
+        getSystemPrompt: () => "base system prompt",
+        runStore: runStore2,
+        createToolHandler: (): ToolHandler => vi.fn(async () => "ok"),
+        publishUpdate: vi.fn(async () => undefined),
+      });
+
+      await expect(supervisor.recoverRuns()).resolves.toBe(1);
+      await vi.advanceTimersByTimeAsync(0);
+
+      await expect(
+        Promise.all([
+          runStore2.loadRun("session-lineage-recover"),
+          runStore2.loadCheckpoint("session-lineage-recover"),
+        ]),
+      ).resolves.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            lineage: expect.objectContaining({
+              scope: expect.objectContaining({
+                workspaceRoot: canonicalWorkspaceRoot,
+                allowedReadRoots: [canonicalWorkspaceRoot],
+                allowedWriteRoots: [`${canonicalWorkspaceRoot}/docs`],
+                requiredSourceArtifacts: [`${canonicalWorkspaceRoot}/PLAN.md`],
+                targetArtifacts: [`${canonicalWorkspaceRoot}/docs/AGENC.md`],
+              }),
+            }),
+          }),
+        ]),
+      );
       await backend2.close();
     } finally {
       await rm(tempDir, { recursive: true, force: true });

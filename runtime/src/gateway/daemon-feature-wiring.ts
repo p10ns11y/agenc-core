@@ -291,8 +291,12 @@ export async function wireAutonomousFeatures(
     }
 
     // Create GoalManager early so actions can reference it
-    const { GoalManager } = await import("../autonomous/goal-manager.js");
-    ctx.goalManager = new GoalManager({ memory: ctx.memoryBackend! });
+    const [{ GoalManager }, { StrategicMemory }] = await Promise.all([
+      import("../autonomous/goal-manager.js"),
+      import("../autonomous/strategic-memory.js"),
+    ]);
+    const strategicMemory = new StrategicMemory({ memory: ctx.memoryBackend! });
+    ctx.goalManager = new GoalManager({ goalStore: strategicMemory.goalStore });
     const workspaceFiles = await new WorkspaceLoader(
       ctx.resolveActiveHostWorkspacePath(config),
     ).load();
@@ -318,6 +322,7 @@ export async function wireAutonomousFeatures(
     const metaPlannerAction = createMetaPlannerAction({
       llm,
       memory: ctx.memoryBackend!,
+      strategicMemory,
       traceProviderPayloads,
     });
     const proactiveCommsAction = createProactiveCommsAction({
@@ -430,69 +435,6 @@ export async function wireAutonomousFeatures(
         }),
       );
       ctx.logger.info("Awareness → goal bridge connected");
-    }
-
-    // Bridge meta-planner goals into GoalManager
-    {
-      const goalManager = ctx.goalManager!;
-      const memory = ctx.memoryBackend!;
-      const originalMetaPlannerExecute =
-        metaPlannerAction.execute.bind(metaPlannerAction);
-      (
-        metaPlannerAction as { execute: typeof metaPlannerAction.execute }
-      ).execute = async function (execCtx) {
-        const result = await originalMetaPlannerExecute(execCtx);
-        if (result.hasOutput) {
-          try {
-            const goals =
-              await memory.get<
-                Array<{
-                  description: string;
-                  title: string;
-                  priority: "critical" | "high" | "medium" | "low";
-                  rationale: string;
-                  status: string;
-                }>
-              >("goal:active");
-            if (goals) {
-              for (const g of goals.filter((g) => g.status === "proposed")) {
-                const active = await goalManager.getActiveGoals();
-                if (!goalManager.isDuplicate(g.description, active)) {
-                  await goalManager.addGoal({
-                    title: g.title,
-                    description: g.description,
-                    priority: g.priority,
-                    source: "meta-planner",
-                    maxAttempts: 2,
-                    rationale: g.rationale,
-                  });
-                }
-              }
-            }
-          } catch {
-            // Silently ignore sync errors — meta-planner result still valid
-          }
-        }
-        // Sync GoalManager state to a key meta-planner can see next cycle
-        try {
-          const managedActive = await goalManager.getActiveGoals();
-          if (managedActive.length > 0) {
-            await memory.set(
-              "goal:managed-active",
-              managedActive.map((g) => ({
-                title: g.title,
-                description: g.description,
-                priority: g.priority,
-                status: g.status,
-                source: g.source,
-              })),
-            );
-          }
-        } catch {
-          // non-critical
-        }
-        return result;
-      };
     }
 
     // Goal executor: dequeue from GoalManager and execute via DesktopExecutor

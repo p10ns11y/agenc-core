@@ -9,9 +9,11 @@
 
 import type { ToolHandler } from "../llm/types.js";
 import type { MemoryBackend } from "../memory/types.js";
+import type { ContextArtifactRef } from "../memory/artifact-store.js";
 import type { ApprovalEngine } from "../gateway/approvals.js";
 import type { DelegationDecompositionSignal } from "../gateway/delegation-scope.js";
 import type { ProgressTracker } from "../gateway/progress.js";
+import type { DelegationExecutionContext } from "../utils/delegation-execution-context.js";
 import {
   didToolCallFail,
   extractToolFailureTextFromResult,
@@ -20,6 +22,22 @@ import type { Logger } from "../utils/logger.js";
 import { WorkflowStateError } from "./errors.js";
 import { toErrorMessage, SEVEN_DAYS_MS } from "../utils/async.js";
 import type { WorkflowGraphEdge } from "./types.js";
+import type { ExecutionKernelStepState } from "./execution-kernel-types.js";
+import { emitStepStateChange } from "./execution-kernel-events.js";
+import {
+  resolvePipelineCompletionState,
+  type WorkflowCompletionState,
+} from "./completion-state.js";
+import type { EffectLedger } from "./effect-ledger.js";
+import {
+  buildPipelineEffectIdempotencyKey,
+  runWithEffectExecutionContext,
+} from "./idempotency.js";
+import {
+  PIPELINE_CHECKPOINT_SCHEMA_VERSION,
+  migratePipelineCheckpoint,
+  serializePipelineCheckpoint,
+} from "./migrations.js";
 
 // ============================================================================
 // Types
@@ -61,7 +79,10 @@ export interface PipelinePlannerSubagentStep extends PipelinePlannerStepBase {
   readonly inputContract: string;
   readonly acceptanceCriteria: readonly string[];
   readonly requiredToolCapabilities: readonly string[];
+  /** Human-readable phase notes only; not the authoritative workspace/artifact contract. */
   readonly contextRequirements: readonly string[];
+  /** Runtime-owned execution envelope; authoritative for workspace, artifacts, and tool scope. */
+  readonly executionContext?: DelegationExecutionContext;
   readonly maxBudgetHint: string;
   readonly canRunParallel: boolean;
 }
@@ -108,6 +129,9 @@ export interface PipelinePlannerContext {
   readonly history: readonly PipelinePlannerContextHistoryEntry[];
   readonly memory: readonly PipelinePlannerContextMemoryEntry[];
   readonly toolOutputs: readonly PipelinePlannerContextToolOutputEntry[];
+  readonly artifactContext?: readonly ContextArtifactRef[];
+  /** Canonical workspace root for this turn when known. */
+  readonly workspaceRoot?: string;
   /** Optional parent-turn tool allowlist used for child least-privilege scoping. */
   readonly parentAllowedTools?: readonly string[];
 }
@@ -146,6 +170,7 @@ export type PipelineStopReasonHint =
 
 export interface PipelineResult {
   readonly status: PipelineStatus;
+  readonly completionState: WorkflowCompletionState;
   readonly context: PipelineContext;
   readonly completedSteps: number;
   readonly totalSteps: number;
@@ -161,6 +186,17 @@ export interface PipelineResult {
 }
 
 export interface PipelineCheckpoint {
+  readonly schemaVersion?: typeof PIPELINE_CHECKPOINT_SCHEMA_VERSION;
+  readonly provenance?: {
+    readonly schemaVersion?: 1;
+    readonly source: "live_runtime" | "migrated_checkpoint";
+    readonly trust: "trusted" | "needs_revalidation";
+    readonly recordedAt: number;
+    readonly reasons?: readonly (
+      | "schema_migrated"
+      | "legacy_execution_envelope"
+    )[];
+  };
   readonly pipelineId: string;
   readonly pipeline: Pipeline;
   readonly stepIndex: number;
@@ -176,6 +212,7 @@ export interface PipelineExecutorConfig {
   readonly progressTracker?: ProgressTracker;
   readonly logger?: Logger;
   readonly checkpointTtlMs?: number;
+  readonly effectLedger?: EffectLedger;
 }
 
 export interface PipelineExecutionOptions {
@@ -193,6 +230,7 @@ export interface PipelineExecutionOptions {
 
 export type PipelineExecutionEventType =
   | "pipeline_halted"
+  | "step_state_changed"
   | "step_finished"
   | "step_started";
 
@@ -206,6 +244,12 @@ export interface PipelineExecutionEvent {
   readonly durationMs?: number;
   readonly result?: string;
   readonly error?: string;
+  readonly state?: ExecutionKernelStepState;
+  readonly previousState?: ExecutionKernelStepState;
+  readonly reason?: string;
+  readonly blockingDependencies?: readonly string[];
+  readonly effectId?: string;
+  readonly effectIdempotencyKey?: string;
 }
 
 // ============================================================================
@@ -227,6 +271,7 @@ export class PipelineExecutor {
   private readonly progressTracker?: ProgressTracker;
   private readonly logger?: Logger;
   private readonly checkpointTtlMs: number;
+  private readonly effectLedger?: EffectLedger;
 
   /** Active pipeline IDs tracked in memory. */
   private readonly active = new Set<string>();
@@ -238,6 +283,7 @@ export class PipelineExecutor {
     this.progressTracker = config.progressTracker;
     this.logger = config.logger;
     this.checkpointTtlMs = config.checkpointTtlMs ?? SEVEN_DAYS_MS;
+    this.effectLedger = config.effectLedger;
   }
 
   /**
@@ -252,6 +298,7 @@ export class PipelineExecutor {
     if (this.active.has(pipeline.id)) {
       return {
         status: "failed",
+        completionState: "blocked",
         context: pipeline.context,
         completedSteps: 0,
         totalSteps: pipeline.steps.length,
@@ -267,6 +314,21 @@ export class PipelineExecutor {
     try {
       for (let i = startFrom; i < pipeline.steps.length; i++) {
         const step = pipeline.steps[i];
+        const previousState =
+          i === startFrom && startFrom > 0 ? "resumed" : undefined;
+
+        if (startFrom > 0 && i === startFrom) {
+          emitStepStateChange({
+            options,
+            pipelineId: pipeline.id,
+            stepName: step.name,
+            stepIndex: i,
+            state: "resumed",
+            tool: step.tool,
+            args: step.args,
+            reason: `Resumed deterministic execution from step ${i + 1}`,
+          });
+        }
 
         // Save running checkpoint
         await this.saveCheckpoint({
@@ -282,6 +344,17 @@ export class PipelineExecutor {
         if (step.requiresApproval && this.approvalEngine) {
           const rule = this.approvalEngine.requiresApproval(step.tool, step.args);
           if (rule) {
+            emitStepStateChange({
+              options,
+              pipelineId: pipeline.id,
+              stepName: step.name,
+              stepIndex: i,
+              previousState,
+              state: "blocked_on_approval",
+              tool: step.tool,
+              args: step.args,
+              reason: `Approval required for tool "${step.tool}"`,
+            });
             options?.onEvent?.({
               type: "pipeline_halted",
               pipelineId: pipeline.id,
@@ -301,6 +374,10 @@ export class PipelineExecutor {
             });
             return {
               status: "halted",
+              completionState: resolvePipelineCompletionState({
+                status: "halted",
+                completedSteps,
+              }),
               context: { results: { ...mutableResults } },
               completedSteps,
               totalSteps: pipeline.steps.length,
@@ -317,9 +394,37 @@ export class PipelineExecutor {
           stepIndex: i,
           tool: step.tool,
           args: step.args,
+          effectIdempotencyKey: buildPipelineEffectIdempotencyKey({
+            pipelineId: pipeline.id,
+            stepName: step.name,
+            stepIndex: i,
+          }),
+        });
+        emitStepStateChange({
+          options,
+          pipelineId: pipeline.id,
+          stepName: step.name,
+          stepIndex: i,
+          previousState,
+          state: "running",
+          tool: step.tool,
+          args: step.args,
         });
         const stepStartedAt = Date.now();
-        const stepResult = await this.executeStep(step, executionToolHandler);
+        const effectIdempotencyKey = buildPipelineEffectIdempotencyKey({
+          pipelineId: pipeline.id,
+          stepName: step.name,
+          stepIndex: i,
+        });
+        const stepResult = await this.executeStep(
+          pipeline.id,
+          step,
+          i,
+          executionToolHandler,
+        );
+        const effectRecord = this.effectLedger
+          ? await this.effectLedger.getByIdempotencyKey(effectIdempotencyKey)
+          : undefined;
         options?.onEvent?.({
           type: "step_finished",
           pipelineId: pipeline.id,
@@ -328,6 +433,8 @@ export class PipelineExecutor {
           tool: step.tool,
           args: step.args,
           durationMs: Date.now() - stepStartedAt,
+          effectIdempotencyKey,
+          ...(effectRecord ? { effectId: effectRecord.id } : {}),
           ...(typeof stepResult.result === "string"
             ? { result: stepResult.result }
             : {}),
@@ -340,13 +447,30 @@ export class PipelineExecutor {
           const recovery = await this.handleStepError(
             pipeline.id,
             step,
+            i,
             stepResult.error,
             executionToolHandler,
+            options,
           );
           if (recovery.terminal) {
             this.active.delete(pipeline.id);
+            emitStepStateChange({
+              options,
+              pipelineId: pipeline.id,
+              stepName: step.name,
+              stepIndex: i,
+              previousState: "running",
+              state: "failed",
+              tool: step.tool,
+              args: step.args,
+              reason: recovery.error,
+            });
             return {
               status: "failed",
+              completionState: resolvePipelineCompletionState({
+                status: "failed",
+                completedSteps,
+              }),
               context: { results: { ...mutableResults } },
               completedSteps,
               totalSteps: pipeline.steps.length,
@@ -354,8 +478,29 @@ export class PipelineExecutor {
             };
           }
           mutableResults[step.name] = recovery.result;
+          emitStepStateChange({
+            options,
+            pipelineId: pipeline.id,
+            stepName: step.name,
+            stepIndex: i,
+            previousState: "running",
+            state: "completed",
+            tool: step.tool,
+            args: step.args,
+            reason: step.onError === "skip" ? "Recovered via skip policy" : "Recovered via retry policy",
+          });
         } else {
           mutableResults[step.name] = stepResult.result;
+          emitStepStateChange({
+            options,
+            pipelineId: pipeline.id,
+            stepName: step.name,
+            stepIndex: i,
+            previousState: "running",
+            state: "completed",
+            tool: step.tool,
+            args: step.args,
+          });
         }
 
         completedSteps = i + 1;
@@ -367,6 +512,7 @@ export class PipelineExecutor {
       this.active.delete(pipeline.id);
       return {
         status: "completed",
+        completionState: "completed",
         context: { results: { ...mutableResults } },
         completedSteps,
         totalSteps: pipeline.steps.length,
@@ -375,6 +521,10 @@ export class PipelineExecutor {
       this.active.delete(pipeline.id);
       return {
         status: "failed",
+        completionState: resolvePipelineCompletionState({
+          status: "failed",
+          completedSteps,
+        }),
         context: { results: { ...mutableResults } },
         completedSteps,
         totalSteps: pipeline.steps.length,
@@ -388,13 +538,24 @@ export class PipelineExecutor {
     pipelineId: string,
     options?: PipelineExecutionOptions,
   ): Promise<PipelineResult> {
-    const checkpoint = await this.backend.get<PipelineCheckpoint>(
-      checkpointKey(pipelineId),
-    );
-    if (!checkpoint) {
+    const rawCheckpoint = await this.backend.get<unknown>(checkpointKey(pipelineId));
+    if (!rawCheckpoint) {
       throw new WorkflowStateError(
         `No checkpoint found for pipeline "${pipelineId}"`,
       );
+    }
+    const migration = migratePipelineCheckpoint(rawCheckpoint);
+    const checkpoint = migration.value;
+    if (checkpoint.provenance?.trust === "needs_revalidation") {
+      if (migration.migrated) {
+        await this.saveCheckpoint(checkpoint);
+      }
+      throw new WorkflowStateError(
+        `Checkpoint for pipeline "${pipelineId}" requires provenance revalidation before resume`,
+      );
+    }
+    if (migration.migrated) {
+      await this.saveCheckpoint(checkpoint);
     }
 
     // Reconstruct pipeline with saved context
@@ -410,10 +571,13 @@ export class PipelineExecutor {
   async listActive(): Promise<readonly PipelineCheckpoint[]> {
     const results: PipelineCheckpoint[] = [];
     for (const id of this.active) {
-      const checkpoint = await this.backend.get<PipelineCheckpoint>(
-        checkpointKey(id),
-      );
-      if (checkpoint) results.push(checkpoint);
+      const rawCheckpoint = await this.backend.get<unknown>(checkpointKey(id));
+      if (!rawCheckpoint) continue;
+      const migration = migratePipelineCheckpoint(rawCheckpoint);
+      if (migration.migrated) {
+        await this.saveCheckpoint(migration.value);
+      }
+      results.push(migration.value);
     }
     return results;
   }
@@ -435,8 +599,10 @@ export class PipelineExecutor {
   private async handleStepError(
     pipelineId: string,
     step: PipelineStep,
+    stepIndex: number,
     error: string,
     toolHandler: ToolHandler,
+    options?: PipelineExecutionOptions,
   ): Promise<{ terminal: true; error: string } | { terminal: false; result: string }> {
     const policy = step.onError ?? "abort";
 
@@ -448,7 +614,23 @@ export class PipelineExecutor {
     if (policy === "retry") {
       const maxRetries = step.maxRetries ?? 0;
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        const retryResult = await this.executeStep(step, toolHandler);
+        emitStepStateChange({
+          options,
+          pipelineId,
+          stepName: step.name,
+          stepIndex,
+          previousState: "running",
+          state: "retry_pending",
+          tool: step.tool,
+          args: step.args,
+          reason: `Retry ${attempt}/${maxRetries} after: ${error}`,
+        });
+        const retryResult = await this.executeStep(
+          pipelineId,
+          step,
+          stepIndex,
+          toolHandler,
+        );
         if (!retryResult.error) {
           return { terminal: false, result: retryResult.result };
         }
@@ -464,11 +646,25 @@ export class PipelineExecutor {
   }
 
   private async executeStep(
+    pipelineId: string,
     step: PipelineStep,
+    stepIndex: number,
     toolHandler: ToolHandler,
   ): Promise<{ result: string; error?: string }> {
     try {
-      const result = await toolHandler(step.tool, step.args);
+      const result = await runWithEffectExecutionContext(
+        {
+          pipelineId,
+          stepName: step.name,
+          stepIndex,
+          idempotencyKey: buildPipelineEffectIdempotencyKey({
+            pipelineId,
+            stepName: step.name,
+            stepIndex,
+          }),
+        },
+        async () => toolHandler(step.tool, step.args),
+      );
       if (didToolCallFail(false, result)) {
         return {
           result,
@@ -484,7 +680,7 @@ export class PipelineExecutor {
   private async saveCheckpoint(checkpoint: PipelineCheckpoint): Promise<void> {
     await this.backend.set(
       checkpointKey(checkpoint.pipelineId),
-      checkpoint,
+      serializePipelineCheckpoint(checkpoint),
       this.checkpointTtlMs,
     );
   }

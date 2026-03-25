@@ -145,7 +145,7 @@ import {
   type DesktopRouterFactory,
 } from "./desktop-routing-config.js";
 import { ApprovalEngine } from "./approvals.js";
-import { resolveGatewayApprovalRules } from "./approval-runtime.js";
+import { resolveGatewayApprovalEngineConfig } from "./approval-runtime.js";
 import { buildToolPolicyAction } from "../policy/tool-governance.js";
 import {
   SessionCredentialBroker,
@@ -167,6 +167,10 @@ import { UnifiedTelemetryCollector } from "../telemetry/collector.js";
 import type { TelemetrySnapshot } from "../telemetry/types.js";
 import { TELEMETRY_METRIC_NAMES } from "../telemetry/metric-names.js";
 import {
+  RuntimeIncidentDiagnostics,
+} from "../telemetry/incident-diagnostics.js";
+import { computeRuntimeSloSnapshot } from "../telemetry/slo.js";
+import {
   SessionManager,
 } from "./session.js";
 import {
@@ -181,7 +185,6 @@ import {
 } from "./system-prompt-builder.js";
 import { HookDispatcher, createBuiltinHooks } from "./hooks.js";
 import {
-  INIT_ROUTED_TOOL_NAMES,
   runModelBackedProjectGuide,
 } from "./init-runner.js";
 import { ProgressTracker, summarizeToolResult } from "./progress.js";
@@ -190,8 +193,18 @@ import {
   normalizeGrokModel,
 } from "./context-window.js";
 import {
+  buildModelRoutingPolicy,
+  resolveModelRoute,
+} from "../llm/model-routing-policy.js";
+import {
+  buildRuntimeEconomicsPolicy,
+  createRuntimeEconomicsState,
+  getRuntimeBudgetPressure,
+} from "../llm/run-budget.js";
+import {
   PipelineExecutor,
 } from "../workflow/pipeline.js";
+import { EffectLedger } from "../workflow/effect-ledger.js";
 import { ConnectionManager } from "../connection/manager.js";
 import type { ChannelPlugin } from "./channel.js";
 import {
@@ -231,6 +244,7 @@ import {
   isBackgroundRunStatusRequest,
   isBackgroundRunStopRequest,
 } from "./background-run-supervisor.js";
+import type { RuntimeFaultInjector } from "../eval/fault-injection.js";
 
 function firstSurfaceSummaryLine(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -991,6 +1005,7 @@ export interface DaemonManagerConfig {
   pidPath?: string;
   logger?: Logger;
   yolo?: boolean;
+  faultInjector?: RuntimeFaultInjector;
 }
 
 export interface DaemonStatus {
@@ -1020,6 +1035,7 @@ export class DaemonManager {
     null;
   private _voiceBridge: VoiceBridge | null = null;
   private _memoryBackend: MemoryBackend | null = null;
+  private _effectLedger: EffectLedger | null = null;
   private _observabilityService: ObservabilityService | null = null;
   private _approvalEngine: ApprovalEngine | null = null;
   private _governanceAuditLog:
@@ -1028,6 +1044,7 @@ export class DaemonManager {
   private _sessionCredentialBroker: SessionCredentialBroker | null = null;
   private _webSessionManager: SessionManager | null = null;
   private _telemetry: UnifiedTelemetryCollector | null = null;
+  private _incidentDiagnostics: RuntimeIncidentDiagnostics | null = null;
   private _hookDispatcher: HookDispatcher | null = null;
   private _connectionManager: ConnectionManager | null = null;
   private _chatExecutor: ChatExecutor | null = null;
@@ -1045,6 +1062,14 @@ export class DaemonManager {
   private _delegationBanditTuner: DelegationBanditPolicyTuner | null = null;
   private _subAgentLifecycleUnsubscribe: (() => void) | null = null;
   private readonly _activeSessionTraceIds = new Map<string, string>();
+  private readonly _activeSlashInitBySession = new Map<
+    string,
+    {
+      filePath: string;
+      executionSessionId: string;
+      promise: Promise<void>;
+    }
+  >();
   private readonly _subagentActivityTraceBySession = new Map<string, string>();
   private readonly _latestDelegationSurfaceContextBySession = new Map<
     string,
@@ -1143,6 +1168,7 @@ export class DaemonManager {
   private readonly pidPath: string;
   private readonly logger: Logger;
   private readonly yolo: boolean;
+  private readonly faultInjector: RuntimeFaultInjector | undefined;
   private readonly resolveDelegationToolContext: DelegationToolCompositionResolver =
     (): DelegationToolCompositionContext | undefined => {
       if (
@@ -1169,6 +1195,7 @@ export class DaemonManager {
     this.pidPath = config.pidPath ?? getDefaultPidPath();
     this.logger = config.logger ?? silentLogger;
     this.yolo = config.yolo ?? false;
+    this.faultInjector = config.faultInjector;
   }
 
   private initializeObservabilityService(logging?: GatewayLoggingConfig): void {
@@ -1216,12 +1243,42 @@ export class DaemonManager {
     requiredCapabilities: readonly string[] | undefined,
     fallbackProvider: LLMProvider,
   ): LLMProvider {
-    return selectSubagentProviderForTaskImpl(
+    const capabilitySelected = selectSubagentProviderForTaskImpl(
       requiredCapabilities,
       fallbackProvider,
       this._subAgentRuntimeConfig,
       this._llmProviders,
     );
+    if (this._llmProviders.length <= 1) {
+      return capabilitySelected;
+    }
+    const economicsPolicy = buildRuntimeEconomicsPolicy({
+      sessionTokenBudget: resolveSessionTokenBudget(
+        this._primaryLlmConfig,
+        this._resolvedContextWindowTokens,
+      ),
+      plannerMaxTokens: this._primaryLlmConfig?.plannerMaxTokens,
+      requestTimeoutMs: this._primaryLlmConfig?.requestTimeoutMs,
+      childTimeoutMs: this._subAgentRuntimeConfig?.defaultTimeoutMs,
+      maxFanoutPerTurn: this._subAgentRuntimeConfig?.maxFanoutPerTurn,
+      mode: "enforce",
+    });
+    const routingPolicy = buildModelRoutingPolicy({
+      providers: this._llmProviders,
+      economicsPolicy,
+      llmConfig: this._primaryLlmConfig,
+    });
+    const routingDecision = resolveModelRoute({
+      policy: routingPolicy,
+      runClass: "child",
+      pressure: getRuntimeBudgetPressure(
+        economicsPolicy,
+        createRuntimeEconomicsState(),
+        "child",
+      ),
+      requiredCapabilities,
+    });
+    return routingDecision.providers[0] ?? capabilitySelected;
   }
 
   private refreshSubAgentToolCatalog(
@@ -1447,6 +1504,8 @@ export class DaemonManager {
           approvalEngine: this._approvalEngine ?? undefined,
           delegation: this.resolveDelegationToolContext,
           credentialBroker: this._sessionCredentialBroker ?? undefined,
+          effectLedger: this._effectLedger ?? undefined,
+          effectChannel: "subagent",
           resolvePolicyScope: () =>
             this.resolvePolicyScopeForSession({
               sessionId: sessionIdentity.subagentSessionId,
@@ -1720,6 +1779,7 @@ export class DaemonManager {
       logger: this.logger,
     });
     this._memoryBackend = memoryBackend;
+    this._effectLedger = EffectLedger.fromMemoryBackend(memoryBackend);
 
     const { memoryRetriever, learningProvider } =
       await this.createWebChatMemoryRetrievers({
@@ -1769,18 +1829,15 @@ export class DaemonManager {
       memoryBackend,
     });
 
-    const approvalRules = resolveGatewayApprovalRules({
+    const approvalConfig = resolveGatewayApprovalEngineConfig({
       approvals: config.approvals,
       mcpServers: config.mcp?.servers,
+      workspaceRoot: config.workspace?.hostPath,
     });
     const approvalEngine =
-      approvalRules.length > 0
+      approvalConfig
         ? new ApprovalEngine({
-            rules: approvalRules,
-            timeoutMs: config.approvals?.timeoutMs,
-            defaultSlaMs: config.approvals?.defaultSlaMs,
-            defaultEscalationDelayMs:
-              config.approvals?.defaultEscalationDelayMs,
+            ...approvalConfig,
             resolverSigningKey:
               config.approvals?.resolverSigningKey ?? config.auth?.secret,
           })
@@ -1861,6 +1918,16 @@ export class DaemonManager {
         });
     });
     approvalEngine?.onResponse(async (request, response) => {
+      this._telemetry?.histogram(
+        TELEMETRY_METRIC_NAMES.APPROVAL_RESPONSE_LATENCY_MS,
+        Math.max(
+          0,
+          (response.resolver?.resolvedAt ?? Date.now()) - request.createdAt,
+        ),
+        {
+          disposition: response.disposition,
+        },
+      );
       await this.appendGovernanceAuditEvent({
         type: "approval.resolved",
         actor: response.approvedBy,
@@ -1909,6 +1976,7 @@ export class DaemonManager {
       approvalEngine: approvalEngine ?? undefined,
       progressTracker,
       logger: this.logger,
+      effectLedger: this._effectLedger ?? undefined,
     });
 
     const contextWindowTokens = await this.resolveLlmContextWindowTokens(
@@ -1961,6 +2029,7 @@ export class DaemonManager {
         defaultStrategyArmId: "balanced",
       },
       resolveHostToolingProfile: () => this._hostToolingProfile,
+      resolveHostWorkspaceRoot: () => this._hostWorkspacePath,
       pipelineExecutor: plannerPipelineExecutor,
     });
 
@@ -2153,6 +2222,9 @@ export class DaemonManager {
             channel: "webchat",
           }),
         telemetry: this._telemetry ?? undefined,
+        incidentDiagnostics: this._incidentDiagnostics ?? undefined,
+        effectLedger: this._effectLedger ?? undefined,
+        faultInjector: this.faultInjector,
         createToolHandler: ({ sessionId, runId, cycleIndex }) =>
           this.createWebChatSessionToolHandler({
             sessionId,
@@ -2294,6 +2366,7 @@ export class DaemonManager {
     config: GatewayConfig,
   ): UnifiedTelemetryCollector | null {
     if (config.telemetry?.enabled === false) {
+      this._incidentDiagnostics = new RuntimeIncidentDiagnostics();
       return null;
     }
     const telemetry = new UnifiedTelemetryCollector(
@@ -2301,6 +2374,9 @@ export class DaemonManager {
       this.logger,
     );
     this._telemetry = telemetry;
+    this._incidentDiagnostics = new RuntimeIncidentDiagnostics({
+      telemetry,
+    });
     return telemetry;
   }
 
@@ -2425,8 +2501,10 @@ export class DaemonManager {
     GatewayBackgroundRunStatus {
     const fleet = this._backgroundRunSupervisor?.getFleetStatusSnapshot();
     const telemetry = this._telemetry?.getFullSnapshot();
+    const incidentSnapshot = this._incidentDiagnostics?.getSnapshot();
     const multiAgentEnabled = this._durableSubrunOrchestrator !== null;
     const availability = this.buildBackgroundRunOperatorAvailability();
+    const slo = computeRuntimeSloSnapshot({ telemetry });
 
     return {
       enabled: availability.enabled,
@@ -2438,6 +2516,8 @@ export class DaemonManager {
       multiAgentEnabled,
       activeTotal: fleet?.activeTotal ?? 0,
       queuedSignalsTotal: fleet?.queuedSignalsTotal ?? 0,
+      runtimeMode: incidentSnapshot?.runtimeMode,
+      degradedDependencies: incidentSnapshot?.dependencies ?? [],
       stateCounts: fleet?.stateCounts ?? {
         pending: 0,
         running: 0,
@@ -2504,6 +2584,7 @@ export class DaemonManager {
           TELEMETRY_METRIC_NAMES.BACKGROUND_RUN_VERIFIER_ACCURACY,
         ),
       },
+      slo,
     };
   }
 
@@ -3410,6 +3491,7 @@ export class DaemonManager {
           defaultStrategyArmId: "balanced",
         },
         resolveHostToolingProfile: () => this._hostToolingProfile,
+        resolveHostWorkspaceRoot: () => this._hostWorkspacePath,
         pipelineExecutor: plannerPipelineExecutor,
       });
 
@@ -3699,6 +3781,80 @@ export class DaemonManager {
       getPlaywrightBridges: () => this._playwrightBridges,
       getContainerMCPBridges: () => this._containerMCPBridges as any,
       getGoalManager: () => this._goalManager as any,
+      startSlashInit: async (params) => {
+        const workspaceRoot = resolvePath(params.workspaceRoot);
+        const filePath = `${workspaceRoot}/AGENC.md`;
+        const existing = this._activeSlashInitBySession.get(params.sessionId);
+        if (existing) {
+          return {
+            filePath: existing.filePath,
+            started: false,
+          };
+        }
+        const executionSessionId =
+          `slash-init:${params.sessionId}:${Date.now().toString(36)}`;
+
+        const turnTraceId = createTurnTraceId(
+          createGatewayMessage({
+            channel: params.channel,
+            senderId: params.senderId,
+            senderName: "Slash Init",
+            sessionId: executionSessionId,
+            scope: "dm",
+            content: `/init ${params.force === true ? "--force" : ""}`.trim(),
+            metadata: {
+              source: "slash-init",
+              workspaceRoot,
+              parentSessionId: params.sessionId,
+            },
+          }),
+        );
+        const safeReply = async (content: string) => {
+          try {
+            await params.reply(content);
+          } catch (error) {
+            this.logger.warn("Slash /init reply failed", error);
+          }
+        };
+        const runPromise = (async () => {
+          try {
+            const result = await this.runProjectInitOperation({
+              workspaceRoot,
+              force: params.force,
+              sessionId: executionSessionId,
+              channel: params.channel,
+              traceLabel: "slash.init",
+              traceConfig: resolveTraceLoggingConfig(this.gateway?.config.logging),
+              turnTraceId,
+              sendResponse: () => {
+                // Keep slash-command init chat output concise. The command
+                // sends an immediate ack plus a single completion/error reply.
+              },
+            });
+            const providerSuffix = result.result
+              ? ` (${result.result.provider}/${result.result.model ?? "unknown"})`
+              : "";
+            await safeReply(
+              `AGENC.md ${result.status} at ${result.filePath}. Attempts: ${result.attempts}. Delegated investigations: ${result.delegatedInvestigations}.${providerSuffix}`,
+            );
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            await safeReply(`Error: /init failed — ${message}`);
+          } finally {
+            this._activeSlashInitBySession.delete(params.sessionId);
+          }
+        })();
+        this._activeSlashInitBySession.set(params.sessionId, {
+          filePath,
+          executionSessionId,
+          promise: runPromise,
+        });
+        return {
+          filePath,
+          started: true,
+        };
+      },
     };
   }
 
@@ -3746,73 +3902,22 @@ export class DaemonManager {
     baseToolHandler?: ToolHandler;
     approvalEngine?: ApprovalEngine | null;
   }) {
-    const chatExecutor = this._chatExecutor;
-    const baseToolHandler = params.baseToolHandler ?? this._baseToolHandler;
-    const hooks = params.hooks ?? this._hookDispatcher;
-    const approvalEngine = params.approvalEngine ?? this._approvalEngine;
-    const systemPrompt = this._systemPrompt;
     const workspaceRoot = resolvePath(params.workspaceRoot);
 
     const workspaceStats = await stat(workspaceRoot).catch(() => null);
     if (!workspaceStats?.isDirectory()) {
       throw new Error(`Init workspace root is not a directory: ${workspaceRoot}`);
     }
-    if (!chatExecutor) {
-      throw new Error(
-        "Init unavailable: no LLM provider is configured for the runtime.",
-      );
-    }
-    if (!baseToolHandler || !hooks) {
-      throw new Error(
-        "Init unavailable: the runtime tool pipeline is not initialized.",
-      );
-    }
-    if (systemPrompt.trim().length === 0) {
-      throw new Error("Init unavailable: system prompt is not initialized.");
-    }
-
-    const baseSessionHandler = createSessionToolHandler({
-      sessionId: params.sessionId,
-      baseHandler: baseToolHandler,
-      availableToolNames: [...INIT_ROUTED_TOOL_NAMES],
-      routerId: params.sessionId,
-      defaultWorkingDirectory: workspaceRoot,
-      workspaceAliasRoot: workspaceRoot,
-      scopedFilesystemRoot: workspaceRoot,
-      resolveWorkspaceContext: async () => ({
-        defaultWorkingDirectory: workspaceRoot,
-        workspaceAliasRoot: workspaceRoot,
-        scopedFilesystemRoot: workspaceRoot,
-        additionalAllowedPaths: [workspaceRoot],
-      }),
-      send: params.sendResponse,
-      hooks,
-      approvalEngine: approvalEngine ?? undefined,
-      delegation: this.resolveDelegationToolContext,
-      credentialBroker: this._sessionCredentialBroker ?? undefined,
-      resolvePolicyScope: () =>
-        this.resolvePolicyScopeForSession({
-          sessionId: params.sessionId,
-          runId: params.sessionId,
-          channel: params.channel,
-        }),
-    });
-
-    const toolHandler = this.createTracedSessionToolHandler({
-      traceLabel: params.traceLabel,
-      traceConfig: params.traceConfig,
-      turnTraceId: params.turnTraceId,
-      sessionId: params.sessionId,
-      baseSessionHandler,
-    });
-
     return runModelBackedProjectGuide({
       workspaceRoot,
       force: params.force,
       sessionId: params.sessionId,
-      systemPrompt,
-      chatExecutor,
-      toolHandler,
+      onProgress: (event) => {
+        const suffix = event.detail ? ` ${event.detail}` : "";
+        this.logger.info(
+          `[init:${params.channel}] ${event.stage} workspace=${event.workspaceRoot} file=${event.filePath}${typeof event.attempt === "number" ? ` attempt=${event.attempt}` : ""}${suffix}`,
+        );
+      },
     });
   }
 
@@ -4156,6 +4261,12 @@ export class DaemonManager {
         required: approvalDecision.required,
         elevated: approvalDecision.elevated,
         denied: approvalDecision.denied,
+        ...(approvalDecision.reasonCode
+          ? { reasonCode: approvalDecision.reasonCode }
+          : {}),
+        ...(approvalDecision.autoApprovedReasonCode
+          ? { autoApprovedReasonCode: approvalDecision.autoApprovedReasonCode }
+          : {}),
         ...(approvalDecision.requestPreview
           ? {
               requestPreview: {
@@ -4163,6 +4274,15 @@ export class DaemonManager {
                 deadlineAt: approvalDecision.requestPreview.deadlineAt,
                 allowDelegatedResolution:
                   approvalDecision.requestPreview.allowDelegatedResolution,
+                ...(approvalDecision.requestPreview.approvalScopeKey
+                  ? {
+                      approvalScopeKey:
+                        approvalDecision.requestPreview.approvalScopeKey,
+                    }
+                  : {}),
+                ...(approvalDecision.requestPreview.reasonCode
+                  ? { reasonCode: approvalDecision.requestPreview.reasonCode }
+                  : {}),
                 ...(approvalDecision.requestPreview.approverGroup
                   ? {
                       approverGroup:
@@ -5100,7 +5220,11 @@ export class DaemonManager {
       send: (m) => webChat.pushToSession(sessionId, m),
       hooks,
       approvalEngine,
+      incidentDiagnostics: this._incidentDiagnostics ?? undefined,
+      faultInjector: this.faultInjector,
       credentialBroker: this._sessionCredentialBroker ?? undefined,
+      effectLedger: this._effectLedger ?? undefined,
+      effectChannel: "webchat",
       resolvePolicyScope: () =>
         this.resolvePolicyScopeForSession({
           sessionId,
@@ -5170,8 +5294,12 @@ export class DaemonManager {
       },
       hooks: this._hookDispatcher ?? undefined,
       approvalEngine: this._approvalEngine ?? undefined,
+      incidentDiagnostics: this._incidentDiagnostics ?? undefined,
+      faultInjector: this.faultInjector,
       delegation: this.resolveDelegationToolContext,
       credentialBroker: this._sessionCredentialBroker ?? undefined,
+      effectLedger: this._effectLedger ?? undefined,
+      effectChannel: channelName,
       resolvePolicyScope: () =>
         this.resolvePolicyScopeForSession({
           sessionId,
@@ -5968,6 +6096,7 @@ export class DaemonManager {
       if (this._memoryBackend !== null) {
         await this._memoryBackend.close();
         this._memoryBackend = null;
+        this._effectLedger = null;
       }
       // Stop MCP server connections
       if (this._mcpManager !== null) {

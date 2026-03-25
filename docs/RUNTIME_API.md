@@ -13,6 +13,25 @@ npm --prefix runtime install
 npm --prefix runtime run build
 ```
 
+## Required Validation Lane
+
+Use the root runtime-validation command when changing `@tetsuo-ai/runtime`:
+
+```bash
+npm run validate:runtime
+```
+
+That command delegates to:
+
+```bash
+npm --prefix runtime run validate:required
+```
+
+The required lane runs the runtime unit/regression suite plus the mutation,
+pipeline-quality, delegation-quality, background-run-quality, and
+autonomy-rollout gate scripts. The same root command is enforced in the default
+PR workflows `Package Pack Smoke` and `Private Kernel Registry Validation`.
+
 ```typescript
 import { Connection, Keypair } from '@solana/web3.js';
 import {

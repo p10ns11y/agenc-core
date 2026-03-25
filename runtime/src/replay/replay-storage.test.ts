@@ -1,7 +1,7 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   BackfillFetcher,
@@ -19,6 +19,7 @@ import type {
   ReplayAlertDispatcher,
 } from "./alerting.js";
 import { REPLAY_QUALITY_FIXTURE_V1 } from "../../tests/fixtures/replay-quality-fixture.v1.ts";
+import { RuntimeSchemaCompatibilityError } from "../workflow/schema-version.js";
 
 function makeRecord(
   seq: number,
@@ -96,13 +97,74 @@ describe("replay storage", () => {
     const restoredCursor = await second.getCursor();
 
     expect(restoredCursor).toEqual({
+      schemaVersion: 1,
       slot: 10,
       signature: "SIG_CURSOR",
       eventName: "taskClaimed",
+      traceId: undefined,
+      traceSpanId: undefined,
     });
     expect(restored).toHaveLength(2);
     expect(restored.map((entry) => entry.seq)).toEqual([1, 2]);
     expect(restored.map((entry) => entry.slot)).toEqual([3, 3]);
+  });
+
+  it("migrates legacy unversioned file state on read and rewrites it with schema versions", async () => {
+    const file = join(tmpdir(), `replay-store-legacy-${randomUUID()}.json`);
+    writeFileSync(
+      file,
+      JSON.stringify({
+        cursor: {
+          slot: 10,
+          signature: "SIG_CURSOR",
+          eventName: "taskClaimed",
+        },
+        records: [makeRecord(1, "discovered", 3, "SIG_A")],
+      }),
+      "utf8",
+    );
+
+    const store = new FileReplayTimelineStore(file);
+    const restored = await store.query();
+    const restoredCursor = await store.getCursor();
+
+    expect(restored).toHaveLength(1);
+    expect(restoredCursor).toEqual({
+      schemaVersion: 1,
+      slot: 10,
+      signature: "SIG_CURSOR",
+      eventName: "taskClaimed",
+      traceId: undefined,
+      traceSpanId: undefined,
+    });
+
+    const persisted = JSON.parse(readFileSync(file, "utf8")) as {
+      schemaVersion: number;
+      cursor: { schemaVersion: number };
+      records: Array<{ schemaVersion: number }>;
+    };
+    expect(persisted.schemaVersion).toBe(1);
+    expect(persisted.cursor.schemaVersion).toBe(1);
+    expect(persisted.records[0]?.schemaVersion).toBe(1);
+  });
+
+  it("fails loudly on incompatible persisted file state", async () => {
+    const file = join(tmpdir(), `replay-store-bad-${randomUUID()}.json`);
+    writeFileSync(
+      file,
+      JSON.stringify({
+        schemaVersion: 999,
+        cursor: null,
+        records: [],
+      }),
+      "utf8",
+    );
+
+    const store = new FileReplayTimelineStore(file);
+
+    await expect(store.query()).rejects.toBeInstanceOf(
+      RuntimeSchemaCompatibilityError,
+    );
   });
 
   it("persists trace identifiers in cursor and projected records through backfill", async () => {

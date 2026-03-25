@@ -549,6 +549,10 @@ export function createWatchFrameController(dependencies = {}) {
         return "fail";
       case "cancelled":
         return "stop";
+      case "partial":
+        return "part";
+      case "needs_verification":
+        return "check";
       case "blocked":
         return "hold";
       default:
@@ -566,7 +570,7 @@ export function createWatchFrameController(dependencies = {}) {
         hiddenTotal: 0,
       };
     }
-    const focusStatuses = new Set(["running", "failed", "blocked"]);
+    const focusStatuses = new Set(["running", "failed", "blocked", "partial", "needs_verification"]);
     const focusKeys = new Set();
     const focusNodes = nodes.filter((node) => focusStatuses.has(node.status));
     const seedNodes = focusNodes.length > 0
@@ -640,7 +644,11 @@ export function createWatchFrameController(dependencies = {}) {
     }
 
     const focusNodes = displayNodes.filter((node) =>
-      node.status === "running" || node.status === "failed" || node.status === "blocked"
+      node.status === "running" ||
+      node.status === "failed" ||
+      node.status === "blocked" ||
+      node.status === "partial" ||
+      node.status === "needs_verification"
     );
     const focusNote = focusNodes
       .map((node) => sanitizeInlineText(node.note || node.objective || ""))

@@ -151,6 +151,49 @@ describe("BackgroundRunStore", () => {
     expect(await store.listRuns()).toEqual([]);
   });
 
+  it("preserves canonical delegated scope in durable lineage records", async () => {
+    const backend = new InMemoryBackend();
+    const store = new BackgroundRunStore({ memoryBackend: backend });
+    const run = makeRun({
+      lineage: {
+        rootRunId: "bg-test",
+        parentRunId: "bg-parent",
+        role: "worker",
+        depth: 1,
+        scope: {
+          allowedTools: ["system.readFile", "system.writeFile"],
+          workspaceRoot: "/home/tetsuo/git/AgenC/agenc-core",
+          allowedReadRoots: ["/home/tetsuo/git/AgenC/agenc-core"],
+          allowedWriteRoots: ["/home/tetsuo/git/AgenC/agenc-core/docs"],
+          requiredSourceArtifacts: ["/home/tetsuo/git/AgenC/agenc-core/PLAN.md"],
+          targetArtifacts: ["/home/tetsuo/git/AgenC/agenc-core/docs/AGENC.md"],
+        },
+        artifactContract: {
+          requiredKinds: ["file"],
+        },
+        budget: {
+          maxRuntimeMs: 30_000,
+          maxToolCalls: 4,
+        },
+        childRunIds: [],
+      },
+    });
+
+    await store.saveRun(run);
+
+    await expect(store.loadRun(run.sessionId)).resolves.toMatchObject({
+      lineage: {
+        scope: {
+          workspaceRoot: "/home/tetsuo/git/AgenC/agenc-core",
+          allowedReadRoots: ["/home/tetsuo/git/AgenC/agenc-core"],
+          allowedWriteRoots: ["/home/tetsuo/git/AgenC/agenc-core/docs"],
+          requiredSourceArtifacts: ["/home/tetsuo/git/AgenC/agenc-core/PLAN.md"],
+          targetArtifacts: ["/home/tetsuo/git/AgenC/agenc-core/docs/AGENC.md"],
+        },
+      },
+    });
+  });
+
   it("enforces lease ownership until the lease expires", async () => {
     const backend = new InMemoryBackend();
     const store = new BackgroundRunStore({ memoryBackend: backend });
@@ -322,6 +365,81 @@ describe("BackgroundRunStore", () => {
     expect(await store.loadCheckpoint(run.sessionId)).toBeUndefined();
   });
 
+  it("persists completion progress across runs, snapshots, and checkpoints", async () => {
+    const backend = new InMemoryBackend();
+    const store = new BackgroundRunStore({ memoryBackend: backend });
+    const run = makeRun({
+      completionProgress: {
+        completionState: "needs_verification",
+        stopReason: "completed",
+        requiredRequirements: [
+          "build_verification",
+          "workflow_verifier_pass",
+        ],
+        satisfiedRequirements: ["build_verification"],
+        remainingRequirements: ["workflow_verifier_pass"],
+        reusableEvidence: [
+          {
+            requirement: "build_verification",
+            summary: "make test",
+            observedAt: 10,
+          },
+        ],
+        updatedAt: 10,
+      },
+    });
+
+    await store.saveRun(run);
+    await store.saveCheckpoint(run);
+    await store.saveRecentSnapshot({
+      version: AGENT_RUN_SCHEMA_VERSION,
+      runId: run.id,
+      sessionId: run.sessionId,
+      objective: run.objective,
+      policyScope: run.policyScope,
+      state: run.state,
+      contractKind: run.contract.kind,
+      requiresUserStop: run.contract.requiresUserStop,
+      cycleCount: run.cycleCount,
+      createdAt: run.createdAt,
+      updatedAt: run.updatedAt,
+      lastVerifiedAt: run.lastVerifiedAt,
+      nextCheckAt: run.nextCheckAt,
+      nextHeartbeatAt: run.nextHeartbeatAt,
+      lastUserUpdate: run.lastUserUpdate,
+      lastToolEvidence: run.lastToolEvidence,
+      lastWakeReason: run.lastWakeReason,
+      pendingSignals: 0,
+      carryForwardSummary: run.carryForward?.summary,
+      blockerSummary: undefined,
+      completionState: "needs_verification",
+      remainingRequirements: ["workflow_verifier_pass"],
+      watchCount: 1,
+      fenceToken: 1,
+    });
+
+    expect(await store.loadRun(run.sessionId)).toMatchObject({
+      completionProgress: {
+        completionState: "needs_verification",
+        remainingRequirements: ["workflow_verifier_pass"],
+      },
+    });
+    expect(await store.loadCheckpoint(run.sessionId)).toMatchObject({
+      completionProgress: {
+        completionState: "needs_verification",
+        reusableEvidence: [
+          expect.objectContaining({
+            summary: "make test",
+          }),
+        ],
+      },
+    });
+    expect(await store.loadRecentSnapshot(run.sessionId)).toMatchObject({
+      completionState: "needs_verification",
+      remainingRequirements: ["workflow_verifier_pass"],
+    });
+  });
+
   it("persists policy scope and extended budget counters across reload", async () => {
     const backend = new InMemoryBackend();
     const store = new BackgroundRunStore({ memoryBackend: backend });
@@ -426,6 +544,22 @@ describe("BackgroundRunStore", () => {
       "watch:managed_process:proc_watcher",
     );
     expect(migrated!.fenceToken).toBe(1);
+  });
+
+  it("quarantines incompatible schema versions instead of silently coercing them", async () => {
+    const backend = new InMemoryBackend();
+    const store = new BackgroundRunStore({ memoryBackend: backend });
+
+    await backend.set("background-run:session:future", {
+      ...makeRun(),
+      sessionId: "future",
+      version: 999,
+    });
+
+    await expect(store.loadRun("future")).resolves.toBeUndefined();
+    await expect(store.listCorruptRunKeys()).resolves.toContain(
+      "background-run:corrupt:future",
+    );
   });
 
   it("scales default cycle budgets to the runtime budget instead of a fixed short cap", () => {

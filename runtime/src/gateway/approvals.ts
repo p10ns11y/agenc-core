@@ -11,6 +11,8 @@
 
 import type { HookHandler, HookContext, HookResult } from "./hooks.js";
 import { createHmac } from "node:crypto";
+import type { EffectApprovalPolicy } from "./effect-approval-policy.js";
+import type { EffectFilesystemEntryType } from "../workflow/effects.js";
 
 // ============================================================================
 // Types
@@ -42,6 +44,21 @@ export interface ApprovalRule {
   readonly approverGroup?: string;
   /** Optional resolver role set required to approve or deny the request. */
   readonly approverRoles?: readonly string[];
+}
+
+export interface ApprovalEffectRef {
+  readonly effectId: string;
+  readonly idempotencyKey: string;
+  readonly effectClass?: string;
+  readonly effectKind?: string;
+  readonly summary?: string;
+  readonly compensationAvailable?: boolean;
+  readonly targets?: readonly string[];
+  readonly preExecutionSnapshots?: readonly {
+    readonly path: string;
+    readonly exists: boolean;
+    readonly entryType: EffectFilesystemEntryType;
+  }[];
 }
 
 /** Per-session elevated mode configuration. */
@@ -94,6 +111,14 @@ export interface ApprovalRequest {
   readonly requiredApproverRoles?: readonly string[];
   /** The rule that triggered this request. */
   readonly rule: ApprovalRule;
+  /** Canonical approval scope key for elevation/denial carry-forward. */
+  readonly approvalScopeKey?: string;
+  /** Structured reason code for effect-centric approval policy. */
+  readonly reasonCode?: string;
+  /** Whether the request originated from effect-centric or legacy rules. */
+  readonly decisionSource?: "effect_policy" | "legacy_rule";
+  /** Optional linked effect intent for the pending mutation. */
+  readonly effect?: ApprovalEffectRef;
 }
 
 /** The disposition of an approval response. */
@@ -145,6 +170,11 @@ export interface ApprovalSimulationDecision {
   readonly denied: boolean;
   readonly rule?: ApprovalRule;
   readonly requestPreview?: ApprovalRequest;
+  readonly reasonCode?: string;
+  readonly decisionSource?: "effect_policy" | "legacy_rule";
+  readonly approvalScopeKey?: string;
+  readonly autoApprovedReasonCode?: string;
+  readonly denyReason?: string;
 }
 
 /** Configuration for the ApprovalEngine (with injectable deps for testing). */
@@ -159,6 +189,8 @@ export interface ApprovalEngineConfig {
   readonly defaultEscalationDelayMs?: number;
   /** Optional signing key for resolver identity assertions. */
   readonly resolverSigningKey?: string;
+  /** Optional effect-centric approval policy. */
+  readonly effectPolicy?: EffectApprovalPolicy;
   /** Clock function (default: Date.now). */
   readonly now?: () => number;
   /** ID generator (default: crypto.randomUUID-like). */
@@ -356,6 +388,7 @@ export type ApprovalEscalationHandler = (
  */
 export class ApprovalEngine {
   private readonly rules: readonly ApprovalRule[];
+  private readonly effectPolicy?: EffectApprovalPolicy;
   private readonly timeoutMs: number;
   private readonly defaultSlaMs?: number;
   private readonly defaultEscalationDelayMs?: number;
@@ -372,6 +405,7 @@ export class ApprovalEngine {
 
   constructor(config?: ApprovalEngineConfig) {
     this.rules = config?.rules ?? DEFAULT_APPROVAL_RULES;
+    this.effectPolicy = config?.effectPolicy;
     this.timeoutMs = config?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.defaultSlaMs = config?.defaultSlaMs;
     this.defaultEscalationDelayMs = config?.defaultEscalationDelayMs;
@@ -434,6 +468,10 @@ export class ApprovalEngine {
     context?: {
       parentSessionId?: string;
       subagentSessionId?: string;
+      effect?: ApprovalEffectRef;
+      approvalScopeKey?: string;
+      reasonCode?: string;
+      decisionSource?: "effect_policy" | "legacy_rule";
     },
   ): ApprovalRequest {
     return this.buildRequest(
@@ -457,6 +495,10 @@ export class ApprovalEngine {
     context?: {
       parentSessionId?: string;
       subagentSessionId?: string;
+      effect?: ApprovalEffectRef;
+      approvalScopeKey?: string;
+      reasonCode?: string;
+      decisionSource?: "effect_policy" | "legacy_rule";
     },
   ): ApprovalRequest {
     const createdAt = this.now();
@@ -506,6 +548,171 @@ export class ApprovalEngine {
         ? { requiredApproverRoles: normalizeResolverRoles(rule.approverRoles) }
         : {}),
       rule,
+      ...(context?.approvalScopeKey
+        ? { approvalScopeKey: context.approvalScopeKey }
+        : {}),
+      ...(context?.reasonCode ? { reasonCode: context.reasonCode } : {}),
+      ...(context?.decisionSource
+        ? { decisionSource: context.decisionSource }
+        : {}),
+      ...(context?.effect ? { effect: context.effect } : {}),
+    };
+  }
+
+  private serializeApprovalScopeKey(scopeKey: string): string {
+    return `scope:${scopeKey}`;
+  }
+
+  private isPatternMatch(
+    pattern: string,
+    toolName: string,
+    approvalScopeKey?: string,
+  ): boolean {
+    if (pattern.startsWith("scope:")) {
+      return (
+        approvalScopeKey !== undefined &&
+        pattern === this.serializeApprovalScopeKey(approvalScopeKey)
+      );
+    }
+    return globMatch(pattern, toolName);
+  }
+
+  private buildEffectDecision(
+    toolName: string,
+    args: Record<string, unknown>,
+    sessionId: string,
+    context?: {
+      parentSessionId?: string;
+      subagentSessionId?: string;
+      message?: string;
+      effect?: ApprovalEffectRef;
+    },
+  ):
+    | {
+        required: boolean;
+        denied: boolean;
+        elevated: boolean;
+        rule?: ApprovalRule;
+        requestPreview?: ApprovalRequest;
+        reasonCode?: string;
+        decisionSource?: "effect_policy" | "legacy_rule";
+        approvalScopeKey?: string;
+        autoApprovedReasonCode?: string;
+        denyReason?: string;
+      }
+    | undefined {
+    if (!this.effectPolicy) {
+      return undefined;
+    }
+
+    const outcome = this.effectPolicy.evaluate({
+      toolName,
+      args,
+      sessionId,
+      ...(context?.parentSessionId
+        ? { parentSessionId: context.parentSessionId }
+        : {}),
+      ...(context?.subagentSessionId
+        ? { subagentSessionId: context.subagentSessionId }
+        : {}),
+      ...(context?.effect ? { effect: context.effect } : {}),
+    });
+
+    if (
+      this.isToolDenied(
+        sessionId,
+        toolName,
+        context?.parentSessionId,
+        outcome.approvalScopeKey,
+      )
+    ) {
+      return {
+        required: false,
+        denied: true,
+        elevated: false,
+        reasonCode: outcome.reasonCode,
+        decisionSource: outcome.source,
+        approvalScopeKey: outcome.approvalScopeKey,
+        denyReason: `Tool "${toolName}" blocked because this action scope was denied earlier in the request tree`,
+      };
+    }
+
+    if (this.isToolElevated(sessionId, toolName, outcome.approvalScopeKey)) {
+      return {
+        required: false,
+        denied: false,
+        elevated: true,
+        reasonCode: outcome.reasonCode,
+        decisionSource: outcome.source,
+        approvalScopeKey: outcome.approvalScopeKey,
+      };
+    }
+
+    if (outcome.status === "deny") {
+      return {
+        required: false,
+        denied: true,
+        elevated: false,
+        reasonCode: outcome.reasonCode,
+        decisionSource: outcome.source,
+        approvalScopeKey: outcome.approvalScopeKey,
+        denyReason: outcome.message,
+      };
+    }
+
+    if (outcome.status === "allow") {
+      return {
+        required: false,
+        denied: false,
+        elevated: false,
+        reasonCode: outcome.reasonCode,
+        decisionSource: outcome.source,
+        approvalScopeKey: outcome.approvalScopeKey,
+        ...(outcome.autoApprovedReasonCode
+          ? { autoApprovedReasonCode: outcome.autoApprovedReasonCode }
+          : {}),
+      };
+    }
+
+    const rule: ApprovalRule = {
+      tool: toolName,
+      description: outcome.message,
+      ...(outcome.approverGroup ? { approverGroup: outcome.approverGroup } : {}),
+      ...(outcome.approverRoles && outcome.approverRoles.length > 0
+        ? { approverRoles: outcome.approverRoles }
+        : {}),
+    };
+
+    const requestPreview = this.buildRequest(
+      `approval-preview:${sessionId}:${toolName}:${outcome.approvalScopeKey}`,
+      toolName,
+      args,
+      sessionId,
+      context?.message ?? outcome.message,
+      rule,
+      {
+        ...(context?.parentSessionId
+          ? { parentSessionId: context.parentSessionId }
+          : {}),
+        ...(context?.subagentSessionId
+          ? { subagentSessionId: context.subagentSessionId }
+          : {}),
+        ...(context?.effect ? { effect: context.effect } : {}),
+        approvalScopeKey: outcome.approvalScopeKey,
+        reasonCode: outcome.reasonCode,
+        decisionSource: outcome.source,
+      },
+    );
+
+    return {
+      required: true,
+      denied: false,
+      elevated: false,
+      rule,
+      requestPreview,
+      reasonCode: outcome.reasonCode,
+      decisionSource: outcome.source,
+      approvalScopeKey: outcome.approvalScopeKey,
     };
   }
 
@@ -517,8 +724,19 @@ export class ApprovalEngine {
       parentSessionId?: string;
       subagentSessionId?: string;
       message?: string;
+      effect?: ApprovalEffectRef;
     },
   ): ApprovalSimulationDecision {
+    const effectDecision = this.buildEffectDecision(
+      toolName,
+      args,
+      sessionId,
+      context,
+    );
+    if (effectDecision) {
+      return effectDecision;
+    }
+
     if (this.isToolDenied(sessionId, toolName, context?.parentSessionId)) {
       return {
         required: false,
@@ -546,6 +764,7 @@ export class ApprovalEngine {
       elevated: false,
       denied: false,
       rule,
+      decisionSource: "legacy_rule",
       requestPreview: this.buildRequest(
         `approval-preview:${sessionId}:${toolName}`,
         toolName,
@@ -556,7 +775,10 @@ export class ApprovalEngine {
             ? `Approval required: ${rule.description}`
             : `Approval required for ${toolName}`),
         rule,
-        context,
+        {
+          ...context,
+          decisionSource: "legacy_rule",
+        },
       ),
     };
   }
@@ -654,30 +876,73 @@ export class ApprovalEngine {
     this.pending.delete(requestId);
 
     if (normalizedResponse.disposition === "always") {
-      this.elevate(entry.request.sessionId, entry.request.rule.tool);
-      this.clearDeniedPattern(entry.request.sessionId, entry.request.rule.tool);
-      if (entry.request.parentSessionId) {
-        this.clearDeniedPattern(
-          entry.request.parentSessionId,
-          entry.request.rule.tool,
+      if (entry.request.approvalScopeKey) {
+        this.elevateScope(
+          entry.request.sessionId,
+          entry.request.approvalScopeKey,
         );
+        this.clearDeniedScope(
+          entry.request.sessionId,
+          entry.request.approvalScopeKey,
+        );
+      } else {
+        this.elevate(entry.request.sessionId, entry.request.rule.tool);
+        this.clearDeniedPattern(entry.request.sessionId, entry.request.rule.tool);
+      }
+      if (entry.request.parentSessionId) {
+        if (entry.request.approvalScopeKey) {
+          this.clearDeniedScope(
+            entry.request.parentSessionId,
+            entry.request.approvalScopeKey,
+          );
+        } else {
+          this.clearDeniedPattern(
+            entry.request.parentSessionId,
+            entry.request.rule.tool,
+          );
+        }
       }
     }
 
     if (normalizedResponse.disposition === "yes") {
-      this.clearDeniedPattern(entry.request.sessionId, entry.request.rule.tool);
-      if (entry.request.parentSessionId) {
-        this.clearDeniedPattern(
-          entry.request.parentSessionId,
-          entry.request.rule.tool,
+      if (entry.request.approvalScopeKey) {
+        this.clearDeniedScope(
+          entry.request.sessionId,
+          entry.request.approvalScopeKey,
         );
+      } else {
+        this.clearDeniedPattern(entry.request.sessionId, entry.request.rule.tool);
+      }
+      if (entry.request.parentSessionId) {
+        if (entry.request.approvalScopeKey) {
+          this.clearDeniedScope(
+            entry.request.parentSessionId,
+            entry.request.approvalScopeKey,
+          );
+        } else {
+          this.clearDeniedPattern(
+            entry.request.parentSessionId,
+            entry.request.rule.tool,
+          );
+        }
       }
     }
 
     if (normalizedResponse.disposition === "no") {
-      this.deny(entry.request.sessionId, entry.request.rule.tool);
+      if (entry.request.approvalScopeKey) {
+        this.denyScope(entry.request.sessionId, entry.request.approvalScopeKey);
+      } else {
+        this.deny(entry.request.sessionId, entry.request.rule.tool);
+      }
       if (entry.request.parentSessionId) {
-        this.deny(entry.request.parentSessionId, entry.request.rule.tool);
+        if (entry.request.approvalScopeKey) {
+          this.denyScope(
+            entry.request.parentSessionId,
+            entry.request.approvalScopeKey,
+          );
+        } else {
+          this.deny(entry.request.parentSessionId, entry.request.rule.tool);
+        }
       }
     }
 
@@ -712,11 +977,15 @@ export class ApprovalEngine {
   /**
    * Check if a specific tool is covered by a session's elevated patterns.
    */
-  isToolElevated(sessionId: string, toolName: string): boolean {
+  isToolElevated(
+    sessionId: string,
+    toolName: string,
+    approvalScopeKey?: string,
+  ): boolean {
     const patterns = this.elevations.get(sessionId);
     if (!patterns) return false;
     for (const pattern of patterns) {
-      if (globMatch(pattern, toolName)) return true;
+      if (this.isPatternMatch(pattern, toolName, approvalScopeKey)) return true;
     }
     return false;
   }
@@ -731,6 +1000,10 @@ export class ApprovalEngine {
       this.elevations.set(sessionId, patterns);
     }
     patterns.add(toolPattern);
+  }
+
+  elevateScope(sessionId: string, approvalScopeKey: string): void {
+    this.elevate(sessionId, this.serializeApprovalScopeKey(approvalScopeKey));
   }
 
   /**
@@ -748,6 +1021,7 @@ export class ApprovalEngine {
     sessionId: string,
     toolName: string,
     parentSessionId?: string,
+    approvalScopeKey?: string,
   ): boolean {
     const scopes = new Set<string>();
     const normalizedSession = sessionId.trim();
@@ -760,7 +1034,7 @@ export class ApprovalEngine {
       const deniedPatterns = this.denials.get(scope);
       if (!deniedPatterns) continue;
       for (const pattern of deniedPatterns) {
-        if (globMatch(pattern, toolName)) return true;
+        if (this.isPatternMatch(pattern, toolName, approvalScopeKey)) return true;
       }
     }
     return false;
@@ -901,6 +1175,10 @@ export class ApprovalEngine {
     patterns.add(toolPattern);
   }
 
+  private denyScope(sessionId: string, approvalScopeKey: string): void {
+    this.deny(sessionId, this.serializeApprovalScopeKey(approvalScopeKey));
+  }
+
   private clearDeniedPattern(sessionId: string, toolPattern: string): void {
     const normalizedSession = sessionId.trim();
     if (normalizedSession.length === 0) return;
@@ -910,6 +1188,13 @@ export class ApprovalEngine {
     if (patterns.size === 0) {
       this.denials.delete(normalizedSession);
     }
+  }
+
+  private clearDeniedScope(sessionId: string, approvalScopeKey: string): void {
+    this.clearDeniedPattern(
+      sessionId,
+      this.serializeApprovalScopeKey(approvalScopeKey),
+    );
   }
 }
 
@@ -938,27 +1223,43 @@ export function createApprovalGateHook(engine: ApprovalEngine): HookHandler {
         return { continue: true };
       }
 
-      // Check if the tool is elevated for this session
-      if (engine.isToolElevated(sessionId, toolName)) {
-        return { continue: true };
+      const decision = engine.simulate(toolName, args, sessionId);
+      if (decision.denied) {
+        return {
+          continue: false,
+          payload: {
+            blocked: true,
+            reason:
+              decision.denyReason ??
+              `Tool "${toolName}" blocked by approval policy`,
+          },
+        };
       }
-
-      // Check if the tool requires approval
-      const rule = engine.requiresApproval(toolName, args);
-      if (!rule) {
+      if (decision.elevated || !decision.required || !decision.rule) {
         return { continue: true };
       }
 
       // Create and submit approval request
-      const message = rule.description
-        ? `Approval required: ${rule.description}`
-        : `Approval required for ${toolName}`;
+      const message =
+        decision.requestPreview?.message ??
+        (decision.rule.description
+          ? `Approval required: ${decision.rule.description}`
+          : `Approval required for ${toolName}`);
       const request = engine.createRequest(
         toolName,
         args,
         sessionId,
         message,
-        rule,
+        decision.rule,
+        {
+          ...(decision.approvalScopeKey
+            ? { approvalScopeKey: decision.approvalScopeKey }
+            : {}),
+          ...(decision.reasonCode ? { reasonCode: decision.reasonCode } : {}),
+          ...(decision.decisionSource
+            ? { decisionSource: decision.decisionSource }
+            : {}),
+        },
       );
       const response = await engine.requestApproval(request);
 

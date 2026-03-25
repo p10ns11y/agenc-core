@@ -17,6 +17,9 @@ export type {
   AddEntryOptions,
   DurabilityLevel,
   DurabilityInfo,
+  StrategicMemoryScope,
+  StrategicMemoryRecordKind,
+  StrategicMemoryRecordEnvelope,
 } from "./types.js";
 
 // LLM interop helpers + operational limits
@@ -93,7 +96,9 @@ export {
   DailyLogManager,
   CuratedMemoryManager,
   NoopEntityExtractor,
+  renderStructuredMemoryDigest,
   type StructuredMemoryEntry,
+  type StructuredMemoryDigestEntry,
   type EntityExtractor,
 } from "./structured.js";
 

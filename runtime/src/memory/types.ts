@@ -61,6 +61,37 @@ export interface AddEntryOptions {
 }
 
 /**
+ * Scope for durable structured memory that lives outside raw conversation
+ * threads.
+ */
+export type StrategicMemoryScope = "global" | "session" | "run";
+
+/**
+ * Categories of structured strategic memory records.
+ */
+export type StrategicMemoryRecordKind =
+  | "goal"
+  | "working_note"
+  | "execution_summary"
+  | "learned_pattern";
+
+/**
+ * Common envelope for durable strategic-memory records.
+ */
+export interface StrategicMemoryRecordEnvelope<
+  TData extends Record<string, unknown> = Record<string, unknown>,
+> {
+  readonly id: string;
+  readonly kind: StrategicMemoryRecordKind;
+  readonly scope: StrategicMemoryScope;
+  readonly sessionId?: string;
+  readonly runId?: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly data: TData;
+}
+
+/**
  * Durability level of a memory backend.
  *
  * - `'none'`  — data lives only in process memory (InMemory)

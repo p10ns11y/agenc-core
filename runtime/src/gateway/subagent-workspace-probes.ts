@@ -19,6 +19,7 @@ import type {
 } from "../workflow/pipeline.js";
 import type { SubAgentResult } from "./sub-agent.js";
 import { tokenizeShellCommand } from "../tools/system/command-line.js";
+import { sanitizeDelegationContextRequirements } from "../utils/delegation-execution-context.js";
 import { redactSensitiveData, normalizeDependencyArtifactPath } from "./subagent-context-curation.js";
 import type {
   PipelinePlannerDeterministicStep as DeterministicStep,
@@ -260,7 +261,7 @@ export function shouldRunAcceptanceTestProbe(
     step.objective,
     step.inputContract,
     ...step.acceptanceCriteria,
-    ...step.contextRequirements,
+    ...sanitizeDelegationContextRequirements(step.contextRequirements),
   ].join(" ");
   if (/\b(?:test|tests|vitest|jest|spec|coverage)\b/i.test(stepText)) {
     return true;
@@ -726,7 +727,7 @@ export function buildWorkspaceStateGuidanceLines(
     step.objective,
     step.inputContract,
     ...step.acceptanceCriteria,
-    ...step.contextRequirements,
+    ...sanitizeDelegationContextRequirements(step.contextRequirements),
   ].join(" ");
   const phaseMentionsTests =
     collectReachableVerificationCategories(step, pipeline).has("test") ||

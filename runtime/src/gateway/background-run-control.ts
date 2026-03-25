@@ -5,6 +5,30 @@ type BackgroundRunSnapshotLike =
   | BackgroundRunStatusSnapshot
   | BackgroundRunRecentSnapshot;
 
+function preferredCompletionTruth(
+  snapshot: BackgroundRunSnapshotLike,
+): string {
+  return snapshot.completionState ?? snapshot.state;
+}
+
+function supervisorStateLine(
+  snapshot: BackgroundRunSnapshotLike,
+): string | undefined {
+  if (!snapshot.completionState || snapshot.completionState === snapshot.state) {
+    return undefined;
+  }
+  return `Supervisor state: ${snapshot.state}`;
+}
+
+function remainingRequirementsLine(
+  snapshot: BackgroundRunSnapshotLike,
+): string | undefined {
+  if (!snapshot.remainingRequirements || snapshot.remainingRequirements.length === 0) {
+    return undefined;
+  }
+  return `Remaining requirements: ${snapshot.remainingRequirements.join(", ")}`;
+}
+
 function formatRelativeAge(
   timestamp: number | undefined,
   now: number,
@@ -29,10 +53,14 @@ export function formatBackgroundRunStatus(
   const nextHeartbeat = formatRelativeDelay(snapshot.nextHeartbeatAt, now);
   const lastVerified = formatRelativeAge(snapshot.lastVerifiedAt, now);
   const lines = [
-    `Background run: ${snapshot.state}`,
+    `Background run: ${preferredCompletionTruth(snapshot)}`,
     `Objective: ${snapshot.objective}`,
     `Cycles: ${snapshot.cycleCount}`,
   ];
+  const supervisorState = supervisorStateLine(snapshot);
+  const remainingRequirements = remainingRequirementsLine(snapshot);
+  if (supervisorState) lines.push(supervisorState);
+  if (remainingRequirements) lines.push(remainingRequirements);
   if (lastVerified) lines.push(`Last verified: ${lastVerified}`);
   if (snapshot.lastUserUpdate) lines.push(`Latest update: ${snapshot.lastUserUpdate}`);
   if (snapshot.pendingSignals > 0) lines.push(`Pending signals: ${snapshot.pendingSignals}`);
@@ -52,9 +80,13 @@ export function formatInactiveBackgroundRunStatus(
   const lastChanged = formatRelativeAge(snapshot.updatedAt, now);
   const lines = [
     "No active background run for this session.",
-    `Last run: ${snapshot.state}`,
+    `Last run: ${preferredCompletionTruth(snapshot)}`,
     `Objective: ${snapshot.objective}`,
   ];
+  const supervisorState = supervisorStateLine(snapshot);
+  const remainingRequirements = remainingRequirementsLine(snapshot);
+  if (supervisorState) lines.push(supervisorState);
+  if (remainingRequirements) lines.push(remainingRequirements);
   if (lastChanged) lines.push(`Last changed: ${lastChanged}`);
   if (snapshot.lastUserUpdate) lines.push(`Latest update: ${snapshot.lastUserUpdate}`);
   return lines.join("\n");
@@ -70,9 +102,13 @@ export function formatInactiveBackgroundRunStop(
   const lastChanged = formatRelativeAge(snapshot.updatedAt, now);
   const lines = [
     "No active background run to stop.",
-    `Last run: ${snapshot.state}`,
+    `Last run: ${preferredCompletionTruth(snapshot)}`,
     `Objective: ${snapshot.objective}`,
   ];
+  const supervisorState = supervisorStateLine(snapshot);
+  const remainingRequirements = remainingRequirementsLine(snapshot);
+  if (supervisorState) lines.push(supervisorState);
+  if (remainingRequirements) lines.push(remainingRequirements);
   if (lastChanged) lines.push(`Last changed: ${lastChanged}`);
   return lines.join("\n");
 }

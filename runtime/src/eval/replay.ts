@@ -59,6 +59,14 @@ export interface TrajectoryReplayConfig {
   seed?: number;
 }
 
+export interface ReplayParityArtifact {
+  readonly ok: boolean;
+  readonly deterministic: boolean;
+  readonly replayErrors: number;
+  readonly replayWarnings: number;
+  readonly deterministicHash: string;
+}
+
 interface MutableReplayTaskState extends ReplayTaskState {
   terminal: boolean;
 }
@@ -384,4 +392,21 @@ export class TrajectoryReplayEngine {
       .update(stableStringifyJson(payload as unknown as JsonValue))
       .digest("hex");
   }
+}
+
+export function evaluateReplayParity(
+  input: unknown,
+  config: TrajectoryReplayConfig = {},
+): ReplayParityArtifact {
+  const engine = new TrajectoryReplayEngine(config);
+  const first = engine.replay(input);
+  const second = engine.replay(input);
+  const deterministic = first.deterministicHash === second.deterministicHash;
+  return {
+    ok: first.errors.length === 0 && deterministic,
+    deterministic,
+    replayErrors: first.errors.length,
+    replayWarnings: first.warnings.length,
+    deterministicHash: first.deterministicHash,
+  };
 }

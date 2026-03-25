@@ -7,6 +7,8 @@
  * @module
  */
 
+import type { WorkflowCompletionState } from "../workflow/completion-state.js";
+
 export const DELEGATION_TRAJECTORY_SCHEMA_VERSION = 1 as const;
 
 export type DelegationTrajectoryTurnType = "parent" | "child";
@@ -105,7 +107,7 @@ export interface DelegationFinalRewardInput {
 
 export interface DelegationUsefulnessProxyInput {
   readonly delegated: boolean;
-  readonly stopReason: string;
+  readonly completionState: WorkflowCompletionState;
   readonly failedToolCalls: number;
   readonly estimatedRecallsAvoided: number;
   readonly verifier: {
@@ -178,11 +180,13 @@ export function computeUsefulDelegationProxy(
   const rewardComponent = clamp01((input.reward.value + 1) / 2);
   const recallGain = Math.min(0.15, clamp01(input.estimatedRecallsAvoided / 4) * 0.15);
   const failedToolPenalty = Math.min(0.25, Math.max(0, input.failedToolCalls) * 0.06);
-  const stopReasonPenalty = input.stopReason === "completed"
+  const completionPenalty = input.completionState === "completed"
     ? 0
-    : input.stopReason === "tool_calls"
+    : input.completionState === "needs_verification"
       ? 0.15
-      : 0.3;
+      : input.completionState === "partial"
+        ? 0.2
+        : 0.3;
 
   let verifierAdjustment = 0;
   if (input.verifier.performed) {
@@ -200,13 +204,13 @@ export function computeUsefulDelegationProxy(
       recallGain +
       verifierAdjustment -
       failedToolPenalty -
-      stopReasonPenalty,
+      completionPenalty,
   );
 
   return {
     score,
     useful:
-      input.stopReason === "completed" &&
+      input.completionState === "completed" &&
       score >= DEFAULT_USEFUL_DELEGATION_THRESHOLD,
   };
 }

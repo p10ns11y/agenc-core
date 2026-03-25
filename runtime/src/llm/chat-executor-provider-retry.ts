@@ -28,6 +28,7 @@ import type {
   ChatCallUsageRecord,
   CooldownEntry,
 } from "./chat-executor-types.js";
+import type { RuntimeFaultInjector } from "../eval/fault-injection.js";
 
 // ---------------------------------------------------------------------------
 // shouldRetryProviderImmediately
@@ -218,5 +219,22 @@ export function emitProviderTraceEvent(
     ...(options.callPhase !== undefined
       ? { callPhase: options.callPhase }
       : {}),
+  });
+}
+
+/**
+ * Explicitly gated provider fault-injection seam used by evals and drills.
+ */
+export function maybeInjectProviderFault(
+  faultInjector: RuntimeFaultInjector | undefined,
+  params: {
+    provider: string;
+    stage: "chat" | "chat_stream";
+  },
+): void {
+  faultInjector?.maybeThrow({
+    point: "provider_timeout",
+    provider: params.provider,
+    operation: params.stage,
   });
 }

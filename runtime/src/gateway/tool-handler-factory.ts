@@ -14,10 +14,12 @@ import type { ToolHandler } from '../llm/types.js';
 import { SESSION_ALLOWED_ROOTS_ARG } from "../tools/system/filesystem.js";
 import {
   didToolCallFail,
+  enrichToolResultMetadata,
+  extractToolFailureTextFromResult,
   normalizeToolCallArguments,
 } from '../llm/chat-executor-tool-utils.js';
 import type { HookDispatcher } from './hooks.js';
-import type { ApprovalEngine } from './approvals.js';
+import type { ApprovalEffectRef, ApprovalEngine } from './approvals.js';
 import {
   EXECUTE_WITH_AGENT_TOOL_NAME,
 } from './delegation-tool.js';
@@ -28,6 +30,24 @@ import {
 import { executeDelegationTool } from "./tool-handler-factory-delegation.js";
 import type { PolicyEvaluationScope } from "../policy/types.js";
 import type { SessionCredentialBroker } from "../policy/session-credentials.js";
+import { buildArtifactContract, isArtifactAccessAllowed, type ArtifactAccessMode } from "../workflow/artifact-contract.js";
+import { buildCompensationState, captureFilesystemSnapshot } from "../workflow/compensation.js";
+import type { EffectLedger } from "../workflow/effect-ledger.js";
+import {
+  buildEffectIntentSummary,
+  inferEffectClass,
+  inferEffectKind,
+  isMutatingTool,
+  type EffectRecord,
+  type EffectTarget,
+} from "../workflow/effects.js";
+import { deriveEffectIdempotencyKey, getCurrentEffectExecutionContext } from "../workflow/idempotency.js";
+import { isPathWithinAnyRoot, normalizeEnvelopePath, normalizeEnvelopeRoots } from "../workflow/path-normalization.js";
+import type { RuntimeIncidentDiagnostics } from "../telemetry/incident-diagnostics.js";
+import {
+  FaultInjectionError,
+  type RuntimeFaultInjector,
+} from "../eval/fault-injection.js";
 
 const DESKTOP_GUI_LAUNCH_RE =
   /^\s*(?:sudo\s+)?(?:env\s+[^;]+\s+)?(?:nohup\s+|setsid\s+)?(?:xfce4-terminal|gnome-terminal|xterm|kitty|firefox|chromium|chromium-browser|google-chrome|thunar|nautilus|mousepad|gedit)\b/i;
@@ -93,6 +113,31 @@ const TOOL_PATH_ARG_KEYS: Readonly<Record<string, readonly string[]>> = {
   "system.spreadsheetInfo": ["path"],
   "system.spreadsheetRead": ["path"],
 };
+const READ_ONLY_FILESYSTEM_TOOL_NAMES = new Set([
+  "system.readFile",
+  "system.listDir",
+  "system.stat",
+  "system.pdfInfo",
+  "system.pdfExtractText",
+  "system.officeDocumentInfo",
+  "system.officeDocumentExtractText",
+  "system.emailMessageInfo",
+  "system.emailMessageExtractText",
+  "system.calendarInfo",
+  "system.calendarRead",
+  "system.sqliteSchema",
+  "system.sqliteQuery",
+  "system.spreadsheetInfo",
+  "system.spreadsheetRead",
+]);
+const WRITE_FILESYSTEM_TOOL_MODES: Readonly<Record<string, ArtifactAccessMode>> = {
+  "desktop.text_editor": "write",
+  "system.writeFile": "write",
+  "system.appendFile": "append",
+  "system.mkdir": "mkdir",
+  "system.delete": "write",
+  "system.move": "write",
+};
 const ROOT_SCOPED_COMMAND_TOOLS = new Set([
   "system.bash",
   "desktop.bash",
@@ -129,6 +174,21 @@ const SED_OPTION_VALUE_FLAGS = new Set([
   "--file",
 ]);
 const WORKSPACE_ALIAS_ROOT = "/workspace";
+const TEST_FILE_PATH_RE =
+  /(?:^|\/)(?:test|tests|spec|specs|__tests__)(?:\/|$)|\.(?:test|spec)\.[^/]+$/i;
+const BEHAVIOR_COMMAND_RE =
+  /\b(?:test|tests|vitest|jest|pytest|playwright|ctest|cargo test|go test|smoke|scenario|e2e|end-to-end)\b/i;
+const BUILD_COMMAND_RE =
+  /\b(?:build|compile|compiled|typecheck|lint|tsc|cmake|make(?:\s+test)?|cargo build|npm run build|pnpm build|yarn build)\b/i;
+
+interface VerificationResultMetadata {
+  readonly category: "build" | "behavior" | "review";
+  readonly repoLocal?: boolean;
+  readonly generatedHarness?: boolean;
+  readonly command?: string;
+  readonly cwd?: string;
+  readonly path?: string;
+}
 
 function normalizeToolName(name: string): string {
   const alias = TOOL_NAME_ALIASES[name];
@@ -162,6 +222,27 @@ function applySessionAllowedRoots(
     ...args,
     [SESSION_ALLOWED_ROOTS_ARG]: [...additionalAllowedPaths],
   };
+}
+
+function deriveSessionAllowedPaths(params: {
+  readonly explicitAdditionalAllowedPaths?: readonly string[];
+  readonly scopedFilesystemRoot?: string;
+  readonly defaultWorkingDirectory?: string;
+}): readonly string[] | undefined {
+  const candidates = [
+    ...(params.explicitAdditionalAllowedPaths ?? []),
+    params.scopedFilesystemRoot,
+    params.defaultWorkingDirectory,
+  ]
+    .filter(
+      (value): value is string =>
+        typeof value === "string" && value.trim().length > 0,
+    )
+    .map((value) => resolvePath(value.trim()).normalize("NFC"));
+  if (candidates.length === 0) {
+    return undefined;
+  }
+  return Array.from(new Set(candidates));
 }
 
 function isRelativeLocalPath(value: string): boolean {
@@ -214,6 +295,478 @@ interface DefaultWorkingDirectoryApplication {
     readonly path: string;
     readonly bootstrapPermitted: boolean;
   };
+}
+
+interface RecentFileObservation {
+  readonly path: string;
+  readonly content?: string;
+  readonly observedAtSeq: number;
+}
+
+const RECENT_FILE_OBSERVATION_LIMIT = 12;
+const DESTRUCTIVE_OVERWRITE_MAX_AGE = 4;
+const DESTRUCTIVE_OVERWRITE_LENGTH_RATIO = 0.6;
+
+function tryParseJsonRecord(value: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function resolveFilesystemTargetPath(
+  args: Record<string, unknown>,
+  defaultWorkingDirectory?: string,
+): string | undefined {
+  const rawPath = typeof args.path === 'string' ? args.path.trim() : '';
+  if (rawPath.length === 0) return undefined;
+  if (isAbsolute(rawPath) || rawPath.startsWith('~')) {
+    return rawPath;
+  }
+  const cwd = typeof args.cwd === 'string' && args.cwd.trim().length > 0
+    ? args.cwd.trim()
+    : defaultWorkingDirectory?.trim();
+  if (!cwd) return undefined;
+  return resolvePath(cwd, rawPath);
+}
+
+function resolveToolTargetPaths(
+  toolName: string,
+  args: Record<string, unknown>,
+  defaultWorkingDirectory?: string,
+): string[] {
+  const pathKeys = TOOL_PATH_ARG_KEYS[toolName] ?? [];
+  if (pathKeys.length === 0) {
+    return [];
+  }
+  const resolved = new Set<string>();
+  for (const key of pathKeys) {
+    const value = args[key];
+    if (typeof value !== "string" || value.trim().length === 0) {
+      continue;
+    }
+    resolved.add(resolveFilesystemToolPath(value.trim(), args, defaultWorkingDirectory));
+  }
+  return [...resolved];
+}
+
+function buildEffectTargets(params: {
+  readonly toolName: string;
+  readonly args: Record<string, unknown>;
+  readonly defaultWorkingDirectory?: string;
+  readonly executionContext?: {
+    readonly targetArtifacts?: readonly string[];
+  };
+}): EffectTarget[] {
+  const filesystemTargets = resolveToolTargetPaths(
+    params.toolName,
+    params.args,
+    params.defaultWorkingDirectory,
+  ).map((path) => ({ kind: "path" as const, path }));
+  if (filesystemTargets.length > 0) {
+    return filesystemTargets;
+  }
+
+  if (params.toolName === "system.processStart") {
+    return [
+      {
+        kind: "process",
+        label:
+          typeof params.args.label === "string" ? params.args.label : undefined,
+        command:
+          typeof params.args.command === "string"
+            ? params.args.command
+            : undefined,
+        cwd:
+          typeof params.args.cwd === "string" ? params.args.cwd : undefined,
+      },
+    ];
+  }
+
+  if (params.toolName === "system.serverStart") {
+    return [
+      {
+        kind: "server",
+        label:
+          typeof params.args.label === "string" ? params.args.label : undefined,
+        command:
+          typeof params.args.command === "string"
+            ? params.args.command
+            : undefined,
+        cwd:
+          typeof params.args.cwd === "string" ? params.args.cwd : undefined,
+      },
+    ];
+  }
+
+  if (params.toolName === "system.bash" || params.toolName === "desktop.bash") {
+    const command =
+      typeof params.args.command === "string"
+        ? params.args.command
+        : Array.isArray(params.args.args)
+          ? [params.args.command, ...params.args.args].join(" ")
+          : undefined;
+    const explicitTargetArtifacts =
+      params.executionContext?.targetArtifacts?.map((path) => ({
+        kind: "path" as const,
+        path,
+      })) ?? [];
+    return [
+      ...explicitTargetArtifacts,
+      {
+        kind: "command",
+        command,
+        cwd:
+          typeof params.args.cwd === "string"
+            ? params.args.cwd
+            : params.defaultWorkingDirectory,
+      },
+    ];
+  }
+
+  return [
+    {
+      kind: "command",
+      command: params.toolName,
+    },
+  ];
+}
+
+function serializeEffectSnapshots(
+  snapshots: readonly NonNullable<EffectRecord["preExecutionSnapshots"]>[number][] | undefined,
+): readonly Record<string, unknown>[] | undefined {
+  if (!snapshots || snapshots.length === 0) {
+    return undefined;
+  }
+  return snapshots.map((snapshot) => ({
+    path: snapshot.path,
+    exists: snapshot.exists,
+    entryType: snapshot.entryType,
+    ...(typeof snapshot.sizeBytes === "number"
+      ? { sizeBytes: snapshot.sizeBytes }
+      : {}),
+    ...(typeof snapshot.sha256 === "string" ? { sha256: snapshot.sha256 } : {}),
+  }));
+}
+
+function buildEffectResultMetadata(
+  effectRecord: EffectRecord,
+): Record<string, unknown> {
+  return {
+    __agencEffect: {
+      id: effectRecord.id,
+      idempotencyKey: effectRecord.idempotencyKey,
+      kind: effectRecord.kind,
+      effectClass: effectRecord.effectClass,
+      status: effectRecord.status,
+      targets: effectRecord.targets,
+      ...(serializeEffectSnapshots(effectRecord.preExecutionSnapshots)
+        ? { preExecutionSnapshots: serializeEffectSnapshots(effectRecord.preExecutionSnapshots) }
+        : {}),
+      ...(serializeEffectSnapshots(effectRecord.postExecutionSnapshots)
+        ? { postExecutionSnapshots: serializeEffectSnapshots(effectRecord.postExecutionSnapshots) }
+        : {}),
+      ...(effectRecord.result ? { result: effectRecord.result } : {}),
+    },
+  };
+}
+
+function buildVerificationResultMetadata(params: {
+  readonly toolName: string;
+  readonly args: Record<string, unknown>;
+  readonly defaultWorkingDirectory?: string;
+  readonly scopedFilesystemRoot?: string;
+}): Record<string, unknown> | undefined {
+  const normalizedRoots = normalizeEnvelopeRoots([
+    params.scopedFilesystemRoot,
+    params.defaultWorkingDirectory,
+  ]);
+  const toolName = params.toolName.trim();
+
+  if (toolName === "system.bash" || toolName === "desktop.bash") {
+    const invocation = collectShellCommandInvocation(params.args);
+    const category = classifyVerificationCommand(invocation);
+    if (!category) {
+      return undefined;
+    }
+    const cwd =
+      typeof params.args.cwd === "string" && params.args.cwd.trim().length > 0
+        ? normalizeEnvelopePath(params.args.cwd, params.defaultWorkingDirectory)
+        : params.defaultWorkingDirectory;
+    return {
+      __agencVerification: {
+        category,
+        ...(typeof cwd === "string" && cwd.trim().length > 0 ? { cwd } : {}),
+        ...(invocation.commandText ? { command: invocation.commandText } : {}),
+        ...(cwd && isPathWithinAnyRoot(cwd, normalizedRoots)
+          ? { repoLocal: true }
+          : {}),
+      },
+    };
+  }
+
+  if (
+    toolName === "system.writeFile" ||
+    toolName === "system.appendFile" ||
+    toolName === "desktop.text_editor"
+  ) {
+    const rawPath =
+      typeof params.args.path === "string" ? params.args.path : undefined;
+    if (!rawPath || !TEST_FILE_PATH_RE.test(rawPath)) {
+      return undefined;
+    }
+    const path = normalizeEnvelopePath(rawPath, params.defaultWorkingDirectory);
+    return {
+      __agencVerification: {
+        category: "behavior",
+        generatedHarness: true,
+        path,
+        ...(isPathWithinAnyRoot(path, normalizedRoots)
+          ? { repoLocal: true }
+          : {}),
+      },
+    };
+  }
+
+  return undefined;
+}
+
+function collectShellCommandInvocation(args: Record<string, unknown>): {
+  readonly commandText: string;
+  readonly executable: string;
+  readonly argvText: string;
+} {
+  const parts: string[] = [];
+  let executable = "";
+  if (typeof args.command === "string" && args.command.trim().length > 0) {
+    executable = args.command.trim();
+    parts.push(executable);
+  }
+  if (Array.isArray(args.args)) {
+    for (const entry of args.args) {
+      if (typeof entry === "string" && entry.trim().length > 0) {
+        parts.push(entry.trim());
+      }
+    }
+  }
+  return {
+    commandText: parts.join(" ").trim(),
+    executable: executable.toLowerCase(),
+    argvText: parts.slice(1).join(" ").toLowerCase(),
+  };
+}
+
+function classifyVerificationCommand(
+  invocation: {
+    readonly executable: string;
+    readonly argvText: string;
+  },
+): VerificationResultMetadata["category"] | undefined {
+  if (!invocation.executable) {
+    return undefined;
+  }
+  if (
+    ["vitest", "jest", "pytest", "playwright", "ctest"].includes(
+      invocation.executable,
+    ) ||
+    (
+      ["npm", "pnpm", "yarn", "cargo", "go", "make"].includes(
+        invocation.executable,
+      ) &&
+      BEHAVIOR_COMMAND_RE.test(invocation.argvText)
+    )
+  ) {
+    return "behavior";
+  }
+  if (
+    ["tsc", "cmake"].includes(invocation.executable) ||
+    (
+      ["npm", "pnpm", "yarn", "cargo", "go", "make"].includes(
+        invocation.executable,
+      ) &&
+      BUILD_COMMAND_RE.test(invocation.argvText)
+    )
+  ) {
+    return "build";
+  }
+  return undefined;
+}
+
+function buildApprovalEffectRef(params: {
+  readonly effectId: string;
+  readonly effectIdempotencyKey: string;
+  readonly toolName: string;
+  readonly targets: readonly EffectTarget[];
+  readonly effectClass: string;
+  readonly effectKind: string;
+  readonly compensationAvailable: boolean;
+  readonly preExecutionSnapshots?: readonly {
+    readonly path: string;
+    readonly exists: boolean;
+    readonly entryType: import("../workflow/effects.js").EffectFilesystemEntryType;
+  }[];
+}): ApprovalEffectRef {
+  return {
+    effectId: params.effectId,
+    idempotencyKey: params.effectIdempotencyKey,
+    effectClass: params.effectClass,
+    effectKind: params.effectKind,
+    summary: buildEffectIntentSummary({
+      toolName: params.toolName,
+      targets: params.targets,
+    }),
+    compensationAvailable: params.compensationAvailable,
+    targets: params.targets
+      .map((target) => target.path ?? target.command ?? target.label)
+      .filter((value): value is string => typeof value === "string"),
+    ...(params.preExecutionSnapshots && params.preExecutionSnapshots.length > 0
+      ? { preExecutionSnapshots: params.preExecutionSnapshots }
+      : {}),
+  };
+}
+
+function resolveFilesystemToolPath(
+  rawPath: string,
+  args: Record<string, unknown>,
+  defaultWorkingDirectory?: string,
+): string {
+  const cwd = typeof args.cwd === "string" && args.cwd.trim().length > 0
+    ? args.cwd.trim()
+    : defaultWorkingDirectory?.trim();
+  return normalizeEnvelopePath(rawPath, cwd);
+}
+
+function getFilesystemToolAccessMode(
+  toolName: string,
+): ArtifactAccessMode | undefined {
+  if (READ_ONLY_FILESYSTEM_TOOL_NAMES.has(toolName)) {
+    return "read";
+  }
+  return WRITE_FILESYSTEM_TOOL_MODES[toolName];
+}
+
+function enforceSubAgentExecutionEnvelope(params: {
+  readonly toolName: string;
+  readonly args: Record<string, unknown>;
+  readonly executionContext?: {
+    readonly workspaceRoot?: string;
+    readonly allowedReadRoots?: readonly string[];
+    readonly allowedWriteRoots?: readonly string[];
+    readonly inputArtifacts?: readonly string[];
+    readonly requiredSourceArtifacts?: readonly string[];
+    readonly targetArtifacts?: readonly string[];
+  };
+  readonly defaultWorkingDirectory?: string;
+}): string | undefined {
+  const { executionContext } = params;
+  if (!executionContext) return undefined;
+
+  const mode = getFilesystemToolAccessMode(params.toolName);
+  if (!mode) return undefined;
+
+  const pathKeys = TOOL_PATH_ARG_KEYS[params.toolName] ?? [];
+  if (pathKeys.length === 0) return undefined;
+
+  const workspaceRoot = executionContext.workspaceRoot?.trim() || params.defaultWorkingDirectory;
+  const readRoots = normalizeEnvelopeRoots(
+    executionContext.allowedReadRoots ?? [],
+    workspaceRoot,
+  );
+  const writeRoots = normalizeEnvelopeRoots(
+    executionContext.allowedWriteRoots ?? [],
+    workspaceRoot,
+  );
+  const artifactContract = buildArtifactContract({
+    requiredSourceArtifacts:
+      executionContext.requiredSourceArtifacts ??
+      executionContext.inputArtifacts,
+    targetArtifacts: executionContext.targetArtifacts,
+  });
+
+  for (const key of pathKeys) {
+    const rawValue = params.args[key];
+    if (typeof rawValue !== "string" || rawValue.trim().length === 0) {
+      continue;
+    }
+    const resolvedPath = resolveFilesystemToolPath(
+      rawValue,
+      params.args,
+      workspaceRoot,
+    );
+    const allowedRoots = mode === "read" ? readRoots : writeRoots;
+    if (allowedRoots.length > 0 && !isPathWithinAnyRoot(resolvedPath, allowedRoots)) {
+      return `Delegated ${mode} path "${resolvedPath}" is outside the execution envelope roots`;
+    }
+    if (
+      mode !== "read" &&
+      artifactContract.targetArtifacts.length > 0 &&
+      !isArtifactAccessAllowed({
+        contract: artifactContract,
+        path: resolvedPath,
+        mode,
+      })
+    ) {
+      return `Delegated ${mode} path "${resolvedPath}" is not permitted by the execution envelope target artifacts`;
+    }
+  }
+
+  return undefined;
+}
+
+function collectMeaningfulLines(value: string): string[] {
+  return value
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line.length >= 16);
+}
+
+function hasSufficientLineOverlap(
+  previousContent: string,
+  nextContent: string,
+): boolean {
+  const previousLines = collectMeaningfulLines(previousContent);
+  if (previousLines.length === 0) {
+    return false;
+  }
+  const nextLines = new Set(collectMeaningfulLines(nextContent));
+  if (nextLines.size === 0) {
+    return false;
+  }
+  const overlapCount = previousLines.filter((line) => nextLines.has(line)).length;
+  return overlapCount / previousLines.length >= 0.25;
+}
+
+function isPotentiallyDestructiveOverwrite(
+  previousContent: string,
+  nextContent: string,
+): boolean {
+  const previous = previousContent.trim();
+  const next = nextContent.trim();
+  if (previous.length === 0 || next.length === 0) {
+    return false;
+  }
+  if (next === previous) {
+    return false;
+  }
+  if (next.length >= previous.length * DESTRUCTIVE_OVERWRITE_LENGTH_RATIO) {
+    return false;
+  }
+  return !hasSufficientLineOverlap(previous, next);
+}
+
+function buildRecentFileObservationMap(
+  observations: readonly RecentFileObservation[],
+): Map<string, RecentFileObservation> {
+  const map = new Map<string, RecentFileObservation>();
+  for (const observation of observations) {
+    map.set(observation.path, observation);
+  }
+  return map;
 }
 
 function applyDefaultWorkingDirectory(
@@ -488,6 +1041,71 @@ function applyWorkspaceAliasTranslation(
   }
 
   return nextArgs;
+}
+
+function buildDelegatedWorkspaceAliasLeakError(detail: string): string {
+  return (
+    `Delegated tool execution requires canonical host paths before execution. ${detail}. ` +
+    "Canonicalize /workspace aliases before the child session starts."
+  );
+}
+
+function validateDelegatedCanonicalToolPaths(
+  toolName: string,
+  args: Record<string, unknown>,
+): string | undefined {
+  const pathArgKeys = TOOL_PATH_ARG_KEYS[toolName];
+  if (pathArgKeys) {
+    for (const key of pathArgKeys) {
+      const value = args[key];
+      if (typeof value !== "string" || value.trim().length === 0) {
+        continue;
+      }
+      if (hasWorkspaceAliasPath(value.trim())) {
+        return buildDelegatedWorkspaceAliasLeakError(
+          `${key} still uses the logical /workspace alias (${value.trim()})`,
+        );
+      }
+    }
+  }
+
+  const cwdValue = typeof args.cwd === "string" ? args.cwd.trim() : undefined;
+  if (cwdValue && hasWorkspaceAliasPath(cwdValue)) {
+    return buildDelegatedWorkspaceAliasLeakError(
+      `cwd still uses the logical /workspace alias (${cwdValue})`,
+    );
+  }
+
+  if (toolName !== "system.bash" && toolName !== "desktop.bash") {
+    return undefined;
+  }
+
+  const commandValue = typeof args.command === "string"
+    ? args.command.trim()
+    : undefined;
+  if (!commandValue) {
+    return undefined;
+  }
+  for (const pathValue of extractAbsoluteShellPaths(commandValue)) {
+    if (hasWorkspaceAliasPath(pathValue)) {
+      return buildDelegatedWorkspaceAliasLeakError(
+        `shell command references the logical /workspace alias (${pathValue})`,
+      );
+    }
+  }
+
+  if (!Array.isArray(args.args)) {
+    return undefined;
+  }
+  for (const pathValue of extractDirectCommandPathArgs(args.command, args.args)) {
+    if (hasWorkspaceAliasPath(pathValue.trim())) {
+      return buildDelegatedWorkspaceAliasLeakError(
+        `command arguments reference the logical /workspace alias (${pathValue.trim()})`,
+      );
+    }
+  }
+
+  return undefined;
 }
 
 function buildScopedRootViolationMessage(
@@ -1003,8 +1621,19 @@ function sendDeniedToolResult(params: {
   toolCallId: string;
   sessionId: string;
   isSubAgentSession: boolean;
+  effectId?: string;
+  effectIdempotencyKey?: string;
 }): void {
-  const { send, toolName, result, toolCallId, sessionId, isSubAgentSession } =
+  const {
+    send,
+    toolName,
+    result,
+    toolCallId,
+    sessionId,
+    isSubAgentSession,
+    effectId,
+    effectIdempotencyKey,
+  } =
     params;
   send({
     type: "tools.result",
@@ -1014,6 +1643,8 @@ function sendDeniedToolResult(params: {
       durationMs: 0,
       isError: true,
       toolCallId,
+      ...(effectId ? { effectId } : {}),
+      ...(effectIdempotencyKey ? { effectIdempotencyKey } : {}),
       ...(isSubAgentSession ? { subagentSessionId: sessionId } : {}),
     },
   });
@@ -1068,6 +1699,8 @@ function sendImmediateToolError(params: {
   hooks?: HookDispatcher;
   args: Record<string, unknown>;
   hookMetadata?: Record<string, unknown>;
+  effectId?: string;
+  effectIdempotencyKey?: string;
 }): string {
   const {
     send,
@@ -1080,6 +1713,8 @@ function sendImmediateToolError(params: {
     hooks,
     args,
     hookMetadata,
+    effectId,
+    effectIdempotencyKey,
   } = params;
   sendDeniedToolResult({
     send,
@@ -1088,6 +1723,8 @@ function sendImmediateToolError(params: {
     toolCallId,
     sessionId,
     isSubAgentSession,
+    effectId,
+    effectIdempotencyKey,
   });
   if (hooks) {
     void hooks.dispatch("tool:after", {
@@ -1116,6 +1753,12 @@ async function runApprovalGate(params: {
   send: (msg: ControlResponse) => void;
   onToolEnd: SessionToolHandlerConfig["onToolEnd"];
   toolCallId: string;
+  effectLedger?: EffectLedger;
+  effectId?: string;
+  effectIdempotencyKey?: string;
+  effectRef?: ApprovalEffectRef;
+  incidentDiagnostics?: RuntimeIncidentDiagnostics;
+  faultInjector?: RuntimeFaultInjector;
 }): Promise<string | null> {
   const {
     approvalEngine,
@@ -1129,19 +1772,76 @@ async function runApprovalGate(params: {
     send,
     onToolEnd,
     toolCallId,
+    effectLedger,
+    effectId,
+    effectIdempotencyKey,
+    effectRef,
+    incidentDiagnostics,
+    faultInjector,
   } = params;
   if (!approvalEngine) {
     return null;
   }
 
-  const rule = approvalEngine.requiresApproval(name, args);
-  if (!rule || approvalEngine.isToolElevated(sessionId, name)) {
-    return null;
+  const decision =
+    typeof (approvalEngine as { simulate?: unknown }).simulate === "function"
+      ? approvalEngine.simulate(name, args, sessionId, {
+          ...(parentSessionId ? { parentSessionId } : {}),
+          ...(isSubAgentSession ? { subagentSessionId: sessionId } : {}),
+          ...(effectRef ? { effect: effectRef } : {}),
+        })
+      : undefined;
+  const legacyRule =
+    decision === undefined &&
+    typeof (approvalEngine as { requiresApproval?: unknown }).requiresApproval ===
+      "function"
+      ? approvalEngine.requiresApproval(name, args)
+      : null;
+  const legacyElevated =
+    decision === undefined &&
+    typeof (approvalEngine as { isToolElevated?: unknown }).isToolElevated ===
+      "function"
+      ? approvalEngine.isToolElevated(sessionId, name)
+      : false;
+  const legacyDenied =
+    decision === undefined &&
+    typeof (approvalEngine as { isToolDenied?: unknown }).isToolDenied ===
+      "function"
+      ? approvalEngine.isToolDenied(sessionId, name, parentSessionId)
+      : false;
+  if (decision === undefined) {
+    if (legacyDenied) {
+      const err = JSON.stringify({
+        error:
+          `Tool "${name}" blocked because this action was denied earlier in the request tree`,
+      });
+      sendDeniedToolResult({
+        send,
+        toolName: name,
+        result: err,
+        toolCallId,
+        sessionId,
+        isSubAgentSession,
+        effectId,
+        effectIdempotencyKey,
+      });
+      if (effectLedger && effectId) {
+        await effectLedger.markDenied({
+          effectId,
+          reason: `Tool "${name}" blocked because this action was denied earlier in the request tree`,
+        });
+      }
+      onToolEnd?.(name, err, 0, toolCallId);
+      return err;
+    }
+    if (!legacyRule || legacyElevated) {
+      return null;
+    }
   }
-
-  if (approvalEngine.isToolDenied(sessionId, name, parentSessionId)) {
+  if (decision && decision.denied && !decision.required) {
     const err = JSON.stringify({
       error:
+        decision.denyReason ??
         `Tool "${name}" blocked because this action was denied earlier in the request tree`,
     });
     sendDeniedToolResult({
@@ -1151,7 +1851,17 @@ async function runApprovalGate(params: {
       toolCallId,
       sessionId,
       isSubAgentSession,
+      effectId,
+      effectIdempotencyKey,
     });
+    if (effectLedger && effectId) {
+      await effectLedger.markDenied({
+        effectId,
+        reason:
+          decision.denyReason ??
+          `Tool "${name}" blocked because this action was denied earlier in the request tree`,
+      });
+    }
     if (isSubAgentSession && lifecycleEmitter) {
       lifecycleEmitter.emit({
         type: "subagents.failed",
@@ -1162,7 +1872,10 @@ async function runApprovalGate(params: {
         toolName: name,
         payload: {
           stage: "approval",
-          reason: "denied_previously",
+          reason:
+            decision.denyReason?.startsWith("Denied by approval policy:")
+              ? "denied_by_policy"
+              : "denied_previously",
           toolCallId,
         },
       });
@@ -1171,24 +1884,116 @@ async function runApprovalGate(params: {
     return err;
   }
 
-  const approvalMessage = buildApprovalMessage({
-    ruleDescription: rule.description,
-    toolName: name,
-    sessionId,
-    isSubAgentSession,
-    subAgentInfo,
-  });
-  const request = approvalEngine.createRequest(
-    name,
-    args,
-    sessionId,
-    approvalMessage,
-    rule,
-    {
-      ...(parentSessionId ? { parentSessionId } : {}),
-      ...(isSubAgentSession ? { subagentSessionId: sessionId } : {}),
-    },
-  );
+  if (decision && (!decision.required || decision.elevated)) {
+    return null;
+  }
+
+  if (
+    effectRef &&
+    incidentDiagnostics?.getSnapshot().runtimeMode === "safe_mode"
+  ) {
+    const err = JSON.stringify({
+      error:
+        'Runtime is in safe mode because approval or persistence infrastructure is degraded; mutating actions are blocked until recovery.',
+    });
+    sendDeniedToolResult({
+      send,
+      toolName: name,
+      result: err,
+      toolCallId,
+      sessionId,
+      isSubAgentSession,
+      effectId,
+      effectIdempotencyKey,
+    });
+    if (effectLedger && effectId) {
+      await effectLedger.markDenied({
+        effectId,
+        reason:
+          "Runtime safe mode blocked the action because approval or persistence infrastructure is degraded.",
+      });
+    }
+    onToolEnd?.(name, err, 0, toolCallId);
+    return err;
+  }
+
+  const rule = decision?.rule ?? legacyRule;
+  const approvalMessage =
+    decision?.requestPreview?.message ??
+    buildApprovalMessage({
+      ruleDescription: rule?.description,
+      toolName: name,
+      sessionId,
+      isSubAgentSession,
+      subAgentInfo,
+    });
+  let request;
+  try {
+    faultInjector?.maybeThrow({
+      point: "approval_store_failure",
+      sessionId,
+      runId: parentSessionId,
+      operation: "create_request",
+    });
+    request = approvalEngine.createRequest(
+      name,
+      args,
+      sessionId,
+      approvalMessage,
+      rule!,
+      {
+        ...(parentSessionId ? { parentSessionId } : {}),
+        ...(isSubAgentSession ? { subagentSessionId: sessionId } : {}),
+        ...(effectRef ? { effect: effectRef } : {}),
+        ...(decision?.approvalScopeKey
+          ? { approvalScopeKey: decision.approvalScopeKey }
+          : {}),
+        ...(decision?.reasonCode ? { reasonCode: decision.reasonCode } : {}),
+        ...(decision?.decisionSource
+          ? { decisionSource: decision.decisionSource }
+          : {}),
+      },
+    );
+  } catch (error) {
+    incidentDiagnostics?.report({
+      domain: "approval_store",
+      mode: "safe_mode",
+      severity: "error",
+      code: "approval_store_failure",
+      message:
+        error instanceof FaultInjectionError ? error.message : String(error),
+      sessionId,
+      ...(parentSessionId ? { runId: parentSessionId } : {}),
+    });
+    const err = JSON.stringify({
+      error:
+        "Approval subsystem is unavailable; runtime entered safe mode and refused this action.",
+    });
+    sendDeniedToolResult({
+      send,
+      toolName: name,
+      result: err,
+      toolCallId,
+      sessionId,
+      isSubAgentSession,
+      effectId,
+      effectIdempotencyKey,
+    });
+    if (effectLedger && effectId) {
+      await effectLedger.markDenied({
+        effectId,
+        reason: "Approval subsystem is unavailable.",
+      });
+    }
+    onToolEnd?.(name, err, 0, toolCallId);
+    return err;
+  }
+  if (effectLedger && effectId) {
+    await effectLedger.recordApprovalRequested({
+      effectId,
+      requestId: request.id,
+    });
+  }
   send({
     type: "approval.request",
     payload: {
@@ -1215,10 +2020,64 @@ async function runApprovalGate(params: {
       ...(request.subagentSessionId
         ? { subagentSessionId: request.subagentSessionId }
         : {}),
+      ...(request.approvalScopeKey
+        ? { approvalScopeKey: request.approvalScopeKey }
+        : {}),
+      ...(request.reasonCode ? { reasonCode: request.reasonCode } : {}),
+      ...(request.effect ? { effect: request.effect } : {}),
     },
   });
 
-  const response = await approvalEngine.requestApproval(request);
+  let response;
+  try {
+    faultInjector?.maybeThrow({
+      point: "approval_store_failure",
+      sessionId,
+      runId: parentSessionId,
+      operation: "request_approval",
+    });
+    response = await approvalEngine.requestApproval(request);
+    incidentDiagnostics?.clearDomain("approval_store");
+  } catch (error) {
+    incidentDiagnostics?.report({
+      domain: "approval_store",
+      mode: "safe_mode",
+      severity: "error",
+      code: "approval_store_failure",
+      message:
+        error instanceof FaultInjectionError ? error.message : String(error),
+      sessionId,
+      ...(parentSessionId ? { runId: parentSessionId } : {}),
+    });
+    const err = JSON.stringify({
+      error:
+        "Approval subsystem is unavailable; runtime entered safe mode and refused this action.",
+    });
+    sendDeniedToolResult({
+      send,
+      toolName: name,
+      result: err,
+      toolCallId,
+      sessionId,
+      isSubAgentSession,
+      effectId,
+      effectIdempotencyKey,
+    });
+    if (effectLedger && effectId) {
+      await effectLedger.markDenied({
+        effectId,
+        reason: "Approval subsystem is unavailable.",
+      });
+    }
+    onToolEnd?.(name, err, 0, toolCallId);
+    return err;
+  }
+  if (effectLedger && effectId) {
+    await effectLedger.recordApprovalResolved({
+      effectId,
+      response,
+    });
+  }
   if (response.disposition === "no") {
     const err = JSON.stringify({ error: `Tool "${name}" denied by user` });
     sendDeniedToolResult({
@@ -1228,6 +2087,8 @@ async function runApprovalGate(params: {
       toolCallId,
       sessionId,
       isSubAgentSession,
+      effectId,
+      effectIdempotencyKey,
     });
     if (isSubAgentSession && lifecycleEmitter) {
       lifecycleEmitter.emit({
@@ -1275,6 +2136,10 @@ export interface SessionToolHandlerConfig {
   hooks?: HookDispatcher;
   /** Approval engine for tool gating. */
   approvalEngine?: ApprovalEngine;
+  /** Runtime incident diagnostics used for safe/degraded-mode behavior. */
+  incidentDiagnostics?: RuntimeIncidentDiagnostics;
+  /** Explicitly gated fault-injection hooks for eval/drill runs only. */
+  faultInjector?: RuntimeFaultInjector;
   /** Called when tool execution starts (before hooks). */
   onToolStart?: (
     toolName: string,
@@ -1319,6 +2184,10 @@ export interface SessionToolHandlerConfig {
   credentialBroker?: SessionCredentialBroker;
   /** Optional callback resolving the policy scope for this session. */
   resolvePolicyScope?: () => PolicyEvaluationScope | undefined;
+  /** Persistent effect ledger for first-class side-effect records. */
+  effectLedger?: EffectLedger;
+  /** Optional channel/source label attached to emitted effect records. */
+  effectChannel?: string;
 }
 
 // ============================================================================
@@ -1349,6 +2218,8 @@ export function createSessionToolHandler(config: SessionToolHandlerConfig): Tool
     send,
     hooks,
     approvalEngine,
+    incidentDiagnostics,
+    faultInjector,
     onToolStart,
     onToolEnd,
     delegation,
@@ -1356,17 +2227,21 @@ export function createSessionToolHandler(config: SessionToolHandlerConfig): Tool
     hookMetadata,
     credentialBroker,
     resolvePolicyScope,
+    effectLedger,
+    effectChannel,
     resolveWorkspaceContext,
   } = config;
   let toolCallSeq = 0;
   // Per-message duplicate guard to avoid opening the same GUI app twice when
   // the model emits repeated desktop.bash launch calls in one turn.
   const seenGuiLaunches = new Set<string>();
+  const recentFileObservations: RecentFileObservation[] = [];
   const nextToolCallId = (): string =>
     `tool-${Date.now().toString(36)}-${++toolCallSeq}`;
 
   return async (name: string, args: Record<string, unknown>): Promise<string> => {
     const toolName = normalizeToolName(name);
+    const isSubAgentSession = isSubAgentSessionId(sessionId);
     const workspaceContext = (await resolveWorkspaceContext?.()) ?? {};
     const defaultWorkingDirectory =
       workspaceContext.defaultWorkingDirectory ?? config.defaultWorkingDirectory;
@@ -1377,18 +2252,34 @@ export function createSessionToolHandler(config: SessionToolHandlerConfig): Tool
       config.workspaceAliasRoot ??
       scopedFilesystemRoot ??
       defaultWorkingDirectory;
+    const normalizedToolArgs = stripInternalToolArgs(
+      normalizeToolCallArguments(toolName, args),
+    );
     const {
       args: normalizedArgs,
       missingDefaultWorkingDirectory,
     } = applyDefaultWorkingDirectory(
       toolName,
-      applyWorkspaceAliasTranslation(
-        toolName,
-        stripInternalToolArgs(normalizeToolCallArguments(toolName, args)),
-        workspaceAliasRoot,
-      ),
+      isSubAgentSession
+        ? normalizedToolArgs
+        : applyWorkspaceAliasTranslation(
+          toolName,
+          normalizedToolArgs,
+          workspaceAliasRoot,
+        ),
       defaultWorkingDirectory,
     );
+    if (isSubAgentSession) {
+      const delegatedAliasViolation = validateDelegatedCanonicalToolPaths(
+        toolName,
+        normalizedArgs,
+      );
+      if (delegatedAliasViolation) {
+        return JSON.stringify({
+          error: delegatedAliasViolation,
+        });
+      }
+    }
     if (
       missingDefaultWorkingDirectory &&
       !missingDefaultWorkingDirectory.bootstrapPermitted
@@ -1409,10 +2300,13 @@ export function createSessionToolHandler(config: SessionToolHandlerConfig): Tool
     const verifier = delegationContext?.verifier ?? null;
     const lifecycleEmitter = delegationContext?.lifecycleEmitter ?? null;
     const unsafeBenchmarkMode = delegationContext?.unsafeBenchmarkMode === true;
-    const isSubAgentSession = isSubAgentSessionId(sessionId);
     const subAgentInfo = isSubAgentSession
       ? subAgentManager?.getInfo(sessionId) ?? null
       : null;
+    const subAgentExecutionContext =
+      isSubAgentSession && typeof subAgentManager?.getExecutionContext === "function"
+        ? subAgentManager.getExecutionContext(sessionId)
+        : undefined;
     const parentSessionId = subAgentInfo?.parentSessionId;
     const policyScope = resolvePolicyScope?.();
     const credentialPreparation = credentialBroker?.prepare({
@@ -1445,7 +2339,12 @@ export function createSessionToolHandler(config: SessionToolHandlerConfig): Tool
       }
     }
 
+    const effectiveDefaultWorkingDirectory =
+      subAgentExecutionContext?.workspaceRoot ?? defaultWorkingDirectory;
+    const effectiveScopedFilesystemRoot =
+      subAgentExecutionContext?.workspaceRoot ?? scopedFilesystemRoot;
     const toolCallId = nextToolCallId();
+    const fileObservationMap = buildRecentFileObservationMap(recentFileObservations);
     const delegationObjective = extractDelegationObjective(normalizedArgs);
 
     if (
@@ -1547,6 +2446,150 @@ export function createSessionToolHandler(config: SessionToolHandlerConfig): Tool
     }
 
     // 2. Notify caller: tool execution starting
+    const effectExecutionContext = getCurrentEffectExecutionContext();
+    const shouldRecordEffect =
+      effectLedger !== undefined && isMutatingTool(toolName);
+    const effectTargets = shouldRecordEffect
+      ? buildEffectTargets({
+          toolName,
+          args: normalizedArgs,
+          defaultWorkingDirectory: effectiveDefaultWorkingDirectory,
+          executionContext: subAgentExecutionContext,
+        })
+      : [];
+    const effectKind = inferEffectKind(toolName);
+    const effectIdempotencyKey =
+      shouldRecordEffect
+        ? deriveEffectIdempotencyKey({
+            sessionId,
+            toolName,
+            toolCallId,
+            args: normalizedArgs,
+            executionContext: effectExecutionContext,
+          })
+        : undefined;
+    const effectPathTargets =
+      effectTargets
+        .map((target) => target.path)
+        .filter((path): path is string => typeof path === "string" && path.length > 0);
+    const preExecutionSnapshots =
+      shouldRecordEffect && effectPathTargets.length > 0
+        ? await Promise.all(
+            effectPathTargets.map((path) => captureFilesystemSnapshot(path)),
+          )
+        : [];
+    const provisionalCompensation =
+      shouldRecordEffect
+        ? buildCompensationState({
+            toolName,
+            args: normalizedArgs,
+            effectKind,
+            preExecutionSnapshots,
+            effectId: `${toolCallId}:effect`,
+          })
+        : { status: "not_available" as const, actions: [] };
+    const inferredEffectClass = inferEffectClass({
+      toolName,
+      explicitEffectClass: subAgentExecutionContext?.effectClass,
+    });
+    const preApprovalEffectRef =
+      shouldRecordEffect && effectIdempotencyKey
+        ? buildApprovalEffectRef({
+            effectId: `${toolCallId}:effect`,
+            effectIdempotencyKey,
+            toolName,
+            targets: effectTargets,
+            effectClass: inferredEffectClass,
+            effectKind,
+            compensationAvailable:
+              provisionalCompensation.actions.some((action) => action.supported),
+            preExecutionSnapshots,
+          })
+        : undefined;
+    const approvalDecision =
+      approvalEngine &&
+      typeof (approvalEngine as { simulate?: unknown }).simulate === "function"
+        ? approvalEngine.simulate(toolName, normalizedArgs, sessionId, {
+            ...(parentSessionId ? { parentSessionId } : {}),
+            ...(isSubAgentSession ? { subagentSessionId: sessionId } : {}),
+            ...(preApprovalEffectRef ? { effect: preApprovalEffectRef } : {}),
+          })
+        : undefined;
+    let effectRecord =
+      shouldRecordEffect && effectLedger && effectIdempotencyKey
+        ? await effectLedger.beginEffect({
+            id: `${toolCallId}:effect`,
+            idempotencyKey: effectIdempotencyKey,
+            toolCallId,
+            toolName,
+            args: normalizedArgs,
+            scope: {
+              sessionId,
+              ...(parentSessionId ? { parentSessionId } : {}),
+              ...(isSubAgentSession ? { subagentSessionId: sessionId } : {}),
+              ...(effectExecutionContext?.pipelineId
+                ? { pipelineId: effectExecutionContext.pipelineId }
+                : {}),
+              ...(effectExecutionContext?.stepName
+                ? { stepName: effectExecutionContext.stepName }
+                : {}),
+              ...(typeof effectExecutionContext?.stepIndex === "number"
+                ? { stepIndex: effectExecutionContext.stepIndex }
+                : {}),
+              ...(effectExecutionContext?.runId
+                ? { runId: effectExecutionContext.runId }
+                : typeof hookMetadata?.backgroundRunId === "string"
+                  ? { runId: hookMetadata.backgroundRunId }
+                  : {}),
+              ...(effectExecutionContext?.channel
+                ? { channel: effectExecutionContext.channel }
+                : effectChannel
+                  ? { channel: effectChannel }
+                  : {}),
+            },
+            kind: effectKind,
+            effectClass: inferredEffectClass,
+            intentSummary: buildEffectIntentSummary({
+              toolName,
+              targets: effectTargets,
+            }),
+            targets: effectTargets,
+            createdAt: Date.now(),
+            requiresApproval:
+              approvalDecision?.required === true,
+            ...(preExecutionSnapshots.length > 0
+              ? { preExecutionSnapshots }
+              : {}),
+            metadata: {
+              ...(policyScope ? { policyScope } : {}),
+              ...(hookMetadata ? { hookMetadata } : {}),
+              ...(approvalDecision?.reasonCode
+                ? { approvalReasonCode: approvalDecision.reasonCode }
+                : {}),
+              ...(approvalDecision?.autoApprovedReasonCode
+                ? {
+                    autoApprovalReasonCode:
+                      approvalDecision.autoApprovedReasonCode,
+                  }
+                : {}),
+            },
+          })
+        : undefined;
+    const approvalEffectRef =
+      effectRecord && effectIdempotencyKey
+        ? buildApprovalEffectRef({
+            effectId: effectRecord.id,
+            effectIdempotencyKey,
+            toolName,
+            targets: effectTargets,
+            effectClass: effectRecord.effectClass,
+            effectKind,
+            compensationAvailable:
+              provisionalCompensation.actions.some((action) => action.supported),
+            preExecutionSnapshots,
+          })
+        : undefined;
+
     onToolStart?.(toolName, normalizedArgs, toolCallId);
 
     if (isSubAgentSession && lifecycleEmitter) {
@@ -1560,6 +2603,38 @@ export function createSessionToolHandler(config: SessionToolHandlerConfig): Tool
       });
     }
 
+    if (
+      incidentDiagnostics?.getSnapshot().runtimeMode === "safe_mode" &&
+      effectRecord
+    ) {
+      if (effectLedger) {
+        effectRecord =
+          (await effectLedger.markDenied({
+            effectId: effectRecord.id,
+            reason:
+              "Runtime safe mode blocked the mutation because persistence or approval infrastructure is degraded.",
+          })) ?? effectRecord;
+      }
+      const safeModeError = JSON.stringify({
+        error:
+          "Runtime is in safe mode because persistence or approval infrastructure is degraded; mutating actions are blocked until recovery.",
+      });
+      return sendImmediateToolError({
+        send,
+        toolName,
+        result: safeModeError,
+        toolCallId,
+        sessionId,
+        isSubAgentSession,
+        onToolEnd,
+        hookMetadata,
+        args: normalizedArgs,
+        hooks,
+        effectId: effectRecord.id,
+        effectIdempotencyKey,
+      });
+    }
+
     // 3. Send tools.executing to client
     send({
       type: 'tools.executing',
@@ -1567,6 +2642,8 @@ export function createSessionToolHandler(config: SessionToolHandlerConfig): Tool
         toolName,
         args: normalizedArgs,
         toolCallId,
+        ...(effectRecord ? { effectId: effectRecord.id } : {}),
+        ...(effectIdempotencyKey ? { effectIdempotencyKey } : {}),
         ...(isSubAgentSession ? { subagentSessionId: sessionId } : {}),
       },
     });
@@ -1584,10 +2661,48 @@ export function createSessionToolHandler(config: SessionToolHandlerConfig): Tool
       send,
       onToolEnd,
       toolCallId,
+      effectLedger,
+      effectId: effectRecord?.id,
+      effectIdempotencyKey,
+      effectRef: approvalEffectRef,
+      incidentDiagnostics,
+      faultInjector,
     });
     if (approvalError) {
       return approvalError;
     }
+
+    const sendRecordedImmediateToolError = async (
+      result: string,
+      error: string,
+    ): Promise<string> => {
+      if (effectLedger && effectRecord) {
+        effectRecord =
+          (await effectLedger.recordOutcome({
+            effectId: effectRecord.id,
+            success: false,
+            isError: true,
+            durationMs: 0,
+            result,
+            error,
+            observedMutationsUnknown: effectKind === "shell_command",
+          })) ?? effectRecord;
+      }
+      return sendImmediateToolError({
+        send,
+        toolName,
+        result,
+        toolCallId,
+        sessionId,
+        isSubAgentSession,
+        onToolEnd,
+        hooks,
+        args: normalizedArgs,
+        hookMetadata: enrichedHookMetadata,
+        effectId: effectRecord?.id,
+        effectIdempotencyKey,
+      });
+    };
 
     let executionArgs = normalizedArgs;
     if (credentialBroker && credentialPrepared) {
@@ -1597,26 +2712,39 @@ export function createSessionToolHandler(config: SessionToolHandlerConfig): Tool
         scope: policyScope,
       });
       if (!injectionResult.ok) {
-        return sendImmediateToolError({
-          send,
-          toolName,
-          result: JSON.stringify({ error: injectionResult.error }),
-          toolCallId,
-          sessionId,
-          isSubAgentSession,
-          onToolEnd,
-          hooks,
-          args: normalizedArgs,
-          hookMetadata: enrichedHookMetadata,
-        });
+        return sendRecordedImmediateToolError(
+          JSON.stringify({ error: injectionResult.error }),
+          injectionResult.error,
+        );
       }
       executionArgs = injectionResult.args;
     }
-    executionArgs = applySessionAllowedRoots(
-      toolName,
-      executionArgs,
-      workspaceContext.additionalAllowedPaths,
+    executionArgs = applySessionAllowedRoots(toolName, executionArgs,
+      deriveSessionAllowedPaths({
+        explicitAdditionalAllowedPaths: [
+          ...(workspaceContext.additionalAllowedPaths ?? []),
+          ...(subAgentExecutionContext?.allowedReadRoots ?? []),
+          ...(subAgentExecutionContext?.allowedWriteRoots ?? []),
+        ],
+        scopedFilesystemRoot: effectiveScopedFilesystemRoot,
+        defaultWorkingDirectory: effectiveDefaultWorkingDirectory,
+      }),
     );
+
+    const subAgentEnvelopeError = isSubAgentSession
+      ? enforceSubAgentExecutionEnvelope({
+        toolName,
+        args: executionArgs,
+        executionContext: subAgentExecutionContext,
+        defaultWorkingDirectory: effectiveDefaultWorkingDirectory,
+      })
+      : undefined;
+    if (subAgentEnvelopeError) {
+      return sendRecordedImmediateToolError(
+        JSON.stringify({ error: subAgentEnvelopeError }),
+        subAgentEnvelopeError,
+      );
+    }
 
     // 5. Select handler: delegation executor or desktop-aware/base handler
     const routedHandler = desktopRouterFactory
@@ -1633,17 +2761,78 @@ export function createSessionToolHandler(config: SessionToolHandlerConfig): Tool
           lifecycleEmitter,
           verifier,
           availableToolNames,
-          defaultWorkingDirectory,
+          defaultWorkingDirectory: effectiveDefaultWorkingDirectory,
+          delegationThreshold: policyEngine?.snapshot().spawnDecisionThreshold,
           unsafeBenchmarkMode,
         })
       : routedHandler;
 
+    if (toolName === 'system.writeFile') {
+      const targetPath = resolveFilesystemTargetPath(
+        executionArgs,
+        effectiveDefaultWorkingDirectory,
+      );
+      const previousObservation =
+        targetPath ? fileObservationMap.get(targetPath) : undefined;
+      const nextContent =
+        typeof executionArgs.content === 'string' ? executionArgs.content : undefined;
+      if (
+        previousObservation?.content &&
+        nextContent &&
+        toolCallSeq - previousObservation.observedAtSeq <= DESTRUCTIVE_OVERWRITE_MAX_AGE &&
+        isPotentiallyDestructiveOverwrite(previousObservation.content, nextContent)
+      ) {
+        const destructiveOverwriteError =
+          `Refusing destructive overwrite of previously-read file "${targetPath}". ` +
+          "Preserve the existing content when revising the file, or use system.appendFile for an additive update.";
+        return sendRecordedImmediateToolError(
+          JSON.stringify({ error: destructiveOverwriteError }),
+          destructiveOverwriteError,
+        );
+      }
+    }
+
     // 6. Execute and time
+    if (effectLedger && effectRecord) {
+      effectRecord =
+        (await effectLedger.markExecuting(effectRecord.id)) ?? effectRecord;
+    }
     const start = Date.now();
     let result: string;
     try {
+      faultInjector?.maybeThrow({
+        point: "tool_timeout",
+        sessionId,
+        operation: toolName,
+      });
       result = await activeHandler(toolName, executionArgs);
     } catch (error) {
+      if (
+        error instanceof FaultInjectionError &&
+        error.point === "tool_timeout"
+      ) {
+        incidentDiagnostics?.report({
+          domain: "tool",
+          mode: "degraded",
+          severity: "warn",
+          code: "tool_timeout",
+          message: error.message,
+          sessionId,
+          ...(parentSessionId ? { runId: parentSessionId } : {}),
+        });
+      }
+      if (effectLedger && effectRecord) {
+        effectRecord =
+          (await effectLedger.recordOutcome({
+            effectId: effectRecord.id,
+            success: false,
+            isError: true,
+            durationMs: Date.now() - start,
+            result: JSON.stringify({ error: toErrorString(error) }),
+            error: toErrorString(error),
+            observedMutationsUnknown: effectKind === "shell_command",
+          })) ?? effectRecord;
+      }
       if (isSubAgentSession && lifecycleEmitter) {
         lifecycleEmitter.emit({
           type: 'subagents.failed',
@@ -1661,8 +2850,100 @@ export function createSessionToolHandler(config: SessionToolHandlerConfig): Tool
       throw error;
     }
     const durationMs = Date.now() - start;
+    incidentDiagnostics?.clearDomain("tool");
     result = canonicalizeToolFailureResult(toolName, result);
     const isError = didToolCallFail(false, result);
+    if (!isError) {
+      if (toolName === 'system.readFile') {
+        const parsed = tryParseJsonRecord(result);
+        const observedPath =
+          typeof parsed?.path === 'string'
+            ? parsed.path
+            : resolveFilesystemTargetPath(executionArgs, effectiveDefaultWorkingDirectory);
+        if (observedPath) {
+          const nextObservation: RecentFileObservation = {
+            path: observedPath,
+            content: typeof parsed?.content === 'string' ? parsed.content : undefined,
+            observedAtSeq: toolCallSeq,
+          };
+          recentFileObservations.push(nextObservation);
+          if (recentFileObservations.length > RECENT_FILE_OBSERVATION_LIMIT) {
+            recentFileObservations.splice(
+              0,
+              recentFileObservations.length - RECENT_FILE_OBSERVATION_LIMIT,
+            );
+          }
+        }
+      } else if (toolName === 'system.writeFile') {
+        const targetPath = resolveFilesystemTargetPath(
+          executionArgs,
+          effectiveDefaultWorkingDirectory,
+        );
+        if (targetPath && typeof executionArgs.content === 'string') {
+          recentFileObservations.push({
+            path: targetPath,
+            content: executionArgs.content,
+            observedAtSeq: toolCallSeq,
+          });
+          if (recentFileObservations.length > RECENT_FILE_OBSERVATION_LIMIT) {
+            recentFileObservations.splice(
+              0,
+              recentFileObservations.length - RECENT_FILE_OBSERVATION_LIMIT,
+            );
+          }
+        }
+      }
+    }
+
+    if (effectLedger && effectRecord) {
+      const postExecutionSnapshots =
+        effectPathTargets.length > 0
+          ? await Promise.all(
+              effectPathTargets.map((path) => captureFilesystemSnapshot(path)),
+            )
+          : [];
+      const compensation = buildCompensationState({
+        toolName,
+        args: executionArgs,
+        effectKind,
+        preExecutionSnapshots,
+        resultObject: tryParseJsonRecord(result),
+        effectId: effectRecord.id,
+      });
+      effectRecord =
+        (await effectLedger.recordOutcome({
+          effectId: effectRecord.id,
+          success: !isError,
+          isError,
+          durationMs,
+          result,
+          ...(isError
+            ? { error: extractToolFailureTextFromResult(result) }
+            : {}),
+          ...(postExecutionSnapshots.length > 0
+            ? { postExecutionSnapshots }
+            : {}),
+          compensation,
+          observedMutationsUnknown: effectKind === "shell_command",
+        })) ?? effectRecord;
+    }
+
+    if (effectRecord) {
+      result = enrichToolResultMetadata(
+        result,
+        buildEffectResultMetadata(effectRecord),
+      );
+    }
+
+    const verificationMetadata = buildVerificationResultMetadata({
+      toolName,
+      args: executionArgs,
+      defaultWorkingDirectory,
+      scopedFilesystemRoot,
+    });
+    if (verificationMetadata) {
+      result = enrichToolResultMetadata(result, verificationMetadata);
+    }
 
     if (launchKey && shouldMarkGuiLaunchSeen(result)) {
       seenGuiLaunches.add(launchKey);
@@ -1677,6 +2958,8 @@ export function createSessionToolHandler(config: SessionToolHandlerConfig): Tool
         durationMs,
         isError,
         toolCallId,
+        ...(effectRecord ? { effectId: effectRecord.id } : {}),
+        ...(effectIdempotencyKey ? { effectIdempotencyKey } : {}),
         ...(isSubAgentSession ? { subagentSessionId: sessionId } : {}),
       },
     });

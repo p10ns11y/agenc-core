@@ -35,12 +35,20 @@ import {
 
 export const BENCHMARK_ARTIFACT_SCHEMA_VERSION = 1 as const;
 
+export type BenchmarkExecutionMode =
+  | "fixture_replay"
+  | "live_temp_repo"
+  | "long_horizon"
+  | "safety_policy"
+  | "fault_injection";
+
 export interface BenchmarkScenarioRunArtifact {
   runId: string;
   seed: number;
   traceId: string;
   deterministicHash: string;
   passed: boolean;
+  executionMode?: BenchmarkExecutionMode;
   latencyMs?: number;
   costUnits?: number;
   policyViolations?: number;
@@ -85,6 +93,7 @@ export interface BenchmarkScenarioExecutionContext {
 
 export interface BenchmarkScenarioExecutionOutput {
   trace: unknown;
+  executionMode?: BenchmarkExecutionMode;
   recordOverrides?: Partial<EvalRunRecord>;
 }
 
@@ -185,6 +194,7 @@ export class BenchmarkRunner {
           traceId: replay.trace.traceId,
           deterministicHash: replay.deterministicHash,
           passed: record.passed,
+          executionMode: execution.executionMode,
           latencyMs: record.latencyMs,
           costUnits: record.costUnits,
           policyViolations: record.policyViolations,

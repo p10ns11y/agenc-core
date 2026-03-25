@@ -14,6 +14,10 @@ It covers message flow, policy gates, failure behavior, kill-switch controls, an
 - `runtime/src/gateway/daemon.ts`
 - `runtime/src/gateway/approvals.ts`
 
+Related guides:
+
+- [../guides/delegated-workspace-semantics.md](../guides/delegated-workspace-semantics.md)
+
 ## Message Flow
 
 ```mermaid
@@ -27,7 +31,8 @@ flowchart TD
   F -->|yes| H[SubAgentOrchestrator Materialize DAG]
   H --> I[Context Curation + Tool Scoping]
   I --> J[Spawn Child via SubAgentManager]
-  J --> K[Child Executes Scoped Task]
+  J --> J1[Canonical delegated scope + spawn-time preflight]
+  J1 --> K[Child Executes Scoped Task]
   K --> L[Collect Child Output + Usage]
   L --> M[Verifier/Critic Loop]
   M --> N[Synthesis + Parent Response]
@@ -39,6 +44,8 @@ flowchart TD
 - Delegated DAG nodes are executed through `SubAgentOrchestrator` under `DeterministicPipelineExecutor` contract.
 - Child sessions are isolated via typed session identity and bounded lifecycle retention.
 - Parent synthesis runs with child provenance and unresolved-item carryover when needed.
+- Delegated local-file execution uses one canonical execution envelope. Raw `cwd=` hints and `/workspace/...` aliases are ingestion-time compatibility only, not executable runtime truth.
+- Shared-artifact multi-writer delegated plans are denied by default unless the runtime can prove a safe ownership shape.
 
 ## Policy Gates
 
@@ -49,6 +56,7 @@ flowchart TD
 | Bandit policy tuning | `delegation-learning.ts` | Selects strategy arm per context cluster; adjusts threshold |
 | Runtime delegation policy engine | `delegation-runtime.ts` | Enforces enable/allowlist/denylist/threshold checks |
 | Child tool scoping | `SubAgentOrchestrator` | Applies least-privilege child allowlist strategy |
+| Canonical delegated scope + preflight | gateway/workflow scope builder | Rejects mixed-root or impossible delegated local-file contracts before child spawn |
 | Approval gating | `approvals.ts` | Preserves approval requirements for child tool calls |
 | Request-tree budget circuit breaker | `SubAgentOrchestrator` | Stops runaway recursion/fanout/tool/tokens |
 | Verifier policy | `ChatExecutor` | Requests bounded retries or blocks low-confidence child outputs |

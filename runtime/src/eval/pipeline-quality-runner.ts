@@ -9,6 +9,10 @@ import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { GatewayMessage } from "../gateway/message.js";
 import {
+  buildSessionStatefulOptions,
+} from "../gateway/daemon-session-state.js";
+import { SessionManager } from "../gateway/session.js";
+import {
   ChatExecutor,
   type ChatExecutorConfig,
 } from "../llm/chat-executor.js";
@@ -22,15 +26,33 @@ import {
   type StreamProgressCallback,
 } from "../llm/index.js";
 import { parseTrajectoryTrace } from "./types.js";
-import { TrajectoryReplayEngine } from "./replay.js";
+import { TrajectoryReplayEngine, evaluateReplayParity } from "./replay.js";
 import { runPipelineHttpRepro } from "./pipeline-http-repro.js";
 import { runDelegationBenchmarkSuite } from "./delegation-benchmark.js";
+import { runLiveCodingSuite } from "./live-coding-runner.js";
+import { runSafetySuite } from "./safety-suite.js";
+import { runLongHorizonSuite } from "./long-horizon-suite.js";
+import { runChaosSuite } from "./chaos-suite.js";
+import { runImplementationGateSuite } from "./implementation-gate-suite.js";
+import { runDelegatedWorkspaceGateSuite } from "./delegated-workspace-gate-suite.js";
+import {
+  ORCHESTRATION_EXPECTATION_SCHEMA_VERSION,
+  ORCHESTRATION_REGRESSION_SCENARIOS,
+  type OrchestrationRegressionExpectation,
+} from "./orchestration-scenarios.js";
 import {
   buildPipelineQualityArtifact,
   type PipelineDesktopRunArtifact,
+  type PipelineOrchestrationScenarioInput,
   type PipelineOfflineReplayFixtureArtifact,
   type PipelineQualityArtifact,
 } from "./pipeline-quality.js";
+import {
+  computeEconomicsScorecard,
+  type EconomicsScenarioRecord,
+} from "./economics-scorecard.js";
+import { buildRuntimeEconomicsPolicy } from "../llm/run-budget.js";
+import { assessDelegationDecision } from "../llm/delegation-decision.js";
 
 const DEFAULT_CONTEXT_BENCHMARK_TURNS = 24;
 const DEFAULT_DESKTOP_RUNS = 1;
@@ -142,10 +164,284 @@ function createDeterministicBenchmarkProvider(): LLMProvider {
   };
 }
 
+function createEconomicsProvider(params: {
+  readonly name: string;
+  readonly responses: readonly (
+    | { type: "tool_calls"; totalTokens: number }
+    | { type: "content"; content: string; totalTokens: number }
+    | { type: "error"; message: string }
+  )[];
+}): LLMProvider {
+  let callIndex = 0;
+  return {
+    name: params.name,
+    async chat() {
+      const next =
+        params.responses[Math.min(callIndex, params.responses.length - 1)];
+      callIndex += 1;
+      if (next.type === "error") {
+        throw new Error(next.message);
+      }
+      if (next.type === "tool_calls") {
+        return {
+          content: "",
+          finishReason: "tool_calls",
+          toolCalls: [
+            { id: `${params.name}-tool-${callIndex}`, name: "tool", arguments: "{}" },
+          ],
+          usage: {
+            promptTokens: Math.max(1, Math.floor(next.totalTokens / 2)),
+            completionTokens: Math.max(1, next.totalTokens - Math.max(1, Math.floor(next.totalTokens / 2))),
+            totalTokens: next.totalTokens,
+          },
+          model: `${params.name}-model`,
+        };
+      }
+      return {
+        content: next.content,
+        finishReason: "stop",
+        toolCalls: [],
+        usage: {
+          promptTokens: Math.max(1, Math.floor(next.totalTokens / 2)),
+          completionTokens: Math.max(1, next.totalTokens - Math.max(1, Math.floor(next.totalTokens / 2))),
+          totalTokens: next.totalTokens,
+        },
+        model: `${params.name}-model`,
+      };
+    },
+    async chatStream(messages, onChunk, options) {
+      const response = await this.chat!(messages, options);
+      onChunk({ content: response.content, done: true });
+      return response;
+    },
+    healthCheck: async () => true,
+  };
+}
+
+async function runEconomicsBenchmark(): Promise<ReturnType<typeof computeEconomicsScorecard>> {
+  const scenarios: EconomicsScenarioRecord[] = [];
+  const tinyExecutorPolicy = {
+    mode: "enforce" as const,
+    budgets: {
+      planner: {
+        runClass: "planner" as const,
+        tokenCeiling: 80,
+        latencyCeilingMs: 20_000,
+        spendCeilingUnits: 1,
+        downgradeTokenRatio: 0.7,
+        downgradeSpendRatio: 0.7,
+        downgradeLatencyRatio: 0.7,
+      },
+      executor: {
+        runClass: "executor" as const,
+        tokenCeiling: 80,
+        latencyCeilingMs: 20_000,
+        spendCeilingUnits: 1,
+        downgradeTokenRatio: 0.7,
+        downgradeSpendRatio: 0.7,
+        downgradeLatencyRatio: 0.7,
+      },
+      verifier: {
+        runClass: "verifier" as const,
+        tokenCeiling: 64,
+        latencyCeilingMs: 10_000,
+        spendCeilingUnits: 0.8,
+        downgradeTokenRatio: 0.7,
+        downgradeSpendRatio: 0.7,
+        downgradeLatencyRatio: 0.7,
+      },
+      child: {
+        runClass: "child" as const,
+        tokenCeiling: 96,
+        latencyCeilingMs: 20_000,
+        spendCeilingUnits: 1.2,
+        downgradeTokenRatio: 0.7,
+        downgradeSpendRatio: 0.7,
+        downgradeLatencyRatio: 0.7,
+      },
+    },
+    childFanoutSoftCap: 1,
+    negativeDelegationMarginUnits: 0.2,
+    negativeDelegationMarginTokens: 64,
+  };
+
+  {
+    const provider = createEconomicsProvider({
+      name: "budgeted-primary",
+      responses: [
+        { type: "tool_calls", totalTokens: 140 },
+        { type: "content", content: "should not be reached", totalTokens: 10 },
+      ],
+    });
+    const executor = new ChatExecutor({
+      providers: [provider],
+      toolHandler: async () => '{"ok":true}',
+      maxToolRounds: 3,
+      economicsPolicy: tinyExecutorPolicy,
+    });
+    const result = await executor.execute({
+      message: createBenchmarkMessage("stay within runtime budget", "economics-budget", 0),
+      history: [],
+      systemPrompt: "Budget test",
+      sessionId: "economics-budget",
+    });
+    scenarios.push({
+      scenarioId: "token_ceiling_enforced",
+      passed: result.stopReason === "budget_exceeded",
+      tokenCeilingRespected: result.stopReason === "budget_exceeded",
+      latencyCeilingRespected: true,
+      spendCeilingRespected: true,
+      negativeEconomicsApplicable: false,
+      delegationDeniedOnNegativeEconomics: true,
+      degradedProviderRerouteApplicable: false,
+      reroutedUnderDegradedProvider: false,
+      spendUnits: result.economicsSummary?.totalSpendUnits ?? 0,
+      latencyMs: 1,
+    });
+  }
+
+  {
+    const decision = assessDelegationDecision({
+      messageText:
+        "Explore the repo in parallel and produce a follow-up patch plan.",
+      plannerConfidence: 0.94,
+      complexityScore: 8,
+      totalSteps: 3,
+      synthesisSteps: 1,
+      edges: [],
+      subagentSteps: [
+        {
+          name: "explore_repo",
+          objective: "Explore the repository and collect findings.",
+          acceptanceCriteria: ["Read PLAN.md", "Return grounded findings"],
+          requiredToolCapabilities: ["system.readFile", "system.listDir"],
+          contextRequirements: [],
+          executionContext: {
+            workspaceRoot: "/workspace",
+            effectClass: "read_only",
+            verificationMode: "grounded_read",
+            requiredSourceArtifacts: ["PLAN.md"],
+            targetArtifacts: [],
+            inputArtifacts: [],
+            allowedReadRoots: ["/workspace"],
+            allowedWriteRoots: [],
+          },
+          maxBudgetHint: "15m",
+          canRunParallel: true,
+        },
+      ],
+      config: {
+        enabled: true,
+        scoreThreshold: 0,
+        maxFanoutPerTurn: 4,
+        maxDepth: 2,
+      },
+      budgetSnapshot: {
+        mode: "enforce",
+        childBudget: {
+          runClass: "child",
+          tokenCeiling: 4_000,
+          latencyCeilingMs: 120_000,
+          spendCeilingUnits: 3,
+          downgradeTokenRatio: 0.7,
+          downgradeSpendRatio: 0.7,
+          downgradeLatencyRatio: 0.7,
+        },
+        remainingTokens: 200,
+        remainingLatencyMs: 20_000,
+        remainingSpendUnits: 0.1,
+        parentTokenRatio: 0.95,
+        parentLatencyRatio: 0.2,
+        parentSpendRatio: 0.95,
+        childFanoutSoftCap: 1,
+        negativeDelegationMarginUnits: 0.3,
+        negativeDelegationMarginTokens: 128,
+      },
+    });
+    scenarios.push({
+      scenarioId: "negative_economics_delegation_denial",
+      passed: decision.reason === "negative_economics" && !decision.shouldDelegate,
+      tokenCeilingRespected: true,
+      latencyCeilingRespected: true,
+      spendCeilingRespected: true,
+      negativeEconomicsApplicable: true,
+      delegationDeniedOnNegativeEconomics:
+        decision.reason === "negative_economics" && !decision.shouldDelegate,
+      degradedProviderRerouteApplicable: false,
+      reroutedUnderDegradedProvider: false,
+      spendUnits: 0.1,
+      latencyMs: 1,
+    });
+  }
+
+  {
+    const primary = createEconomicsProvider({
+      name: "degraded-primary",
+      responses: [{ type: "error", message: "timeout" }],
+    });
+    const fallback = createEconomicsProvider({
+      name: "fallback-secondary",
+      responses: [
+        { type: "content", content: "fallback success", totalTokens: 40 },
+        { type: "content", content: "rerouted success", totalTokens: 30 },
+      ],
+    });
+    const executor = new ChatExecutor({
+      providers: [primary, fallback],
+      economicsPolicy: buildRuntimeEconomicsPolicy({
+        sessionTokenBudget: 512,
+        plannerMaxTokens: 64,
+        requestTimeoutMs: 20_000,
+        mode: "enforce",
+      }),
+    });
+    await executor.execute({
+      message: createBenchmarkMessage("trip provider cooldown", "economics-reroute", 0),
+      history: [],
+      systemPrompt: "Reroute test",
+      sessionId: "economics-reroute",
+    });
+    const rerouted = await executor.execute({
+      message: createBenchmarkMessage("run on healthy provider", "economics-reroute", 1),
+      history: [],
+      systemPrompt: "Reroute test",
+      sessionId: "economics-reroute",
+    });
+    scenarios.push({
+      scenarioId: "degraded_provider_reroute",
+      passed: (rerouted.economicsSummary?.rerouteCount ?? 0) > 0,
+      tokenCeilingRespected: true,
+      latencyCeilingRespected: true,
+      spendCeilingRespected: true,
+      negativeEconomicsApplicable: false,
+      delegationDeniedOnNegativeEconomics: true,
+      degradedProviderRerouteApplicable: true,
+      reroutedUnderDegradedProvider:
+        (rerouted.economicsSummary?.rerouteCount ?? 0) > 0,
+      spendUnits: rerouted.economicsSummary?.totalSpendUnits ?? 0,
+      latencyMs: 1,
+    });
+  }
+
+  return computeEconomicsScorecard(scenarios);
+}
+
 async function runContextAndTokenBenchmark(
   turns: number,
 ): Promise<ContextAndTokenBenchmarkResult> {
   const provider = createDeterministicBenchmarkProvider();
+  const sessionManager = new SessionManager(
+    {
+      scope: "per-channel-peer",
+      reset: { mode: "never" },
+      maxHistoryLength: 4,
+      compaction: "summarize",
+    },
+    {
+      summarizer: async () =>
+        "The benchmark is maintaining artifact-backed context for PLAN.md, tests, and repo state.",
+    },
+  );
   const config: ChatExecutorConfig = {
     providers: [provider],
     plannerEnabled: false,
@@ -161,12 +457,17 @@ async function runContextAndTokenBenchmark(
   const executor = new ChatExecutor(config);
 
   const sessionId = "phase9-context-benchmark";
+  const session = sessionManager.getOrCreate({
+    channel: "eval",
+    senderId: "phase9-user",
+    scope: "dm",
+    workspaceId: "phase9-benchmark-workspace",
+  });
   const systemPrompt = [
     "You are running a deterministic benchmark for prompt growth.",
     "Return concise acknowledgements only.",
   ].join(" ");
 
-  let history: LLMMessage[] = [];
   const promptTokenSeries: number[] = [];
   let completedTasks = 0;
   let totalPromptTokens = 0;
@@ -174,13 +475,22 @@ async function runContextAndTokenBenchmark(
   let totalTokens = 0;
 
   for (let turn = 0; turn < turns; turn++) {
-    const content = `Phase 9 context turn ${turn}: ${"x".repeat(720)}`;
+    if (
+      session.history.length >= 4 &&
+      !buildSessionStatefulOptions(session)?.artifactContext
+    ) {
+      await sessionManager.compact(session.id);
+    }
+    const content =
+      `Phase 9 context turn ${turn}: keep PLAN.md, src/main.c, parser.test.ts, ` +
+      "and the active implementation notes aligned; respond with a compact ack.";
     const result = await executor.execute({
       message: createBenchmarkMessage(content, sessionId, turn),
-      history,
+      history: session.history,
       systemPrompt,
       sessionId,
       maxToolRounds: 1,
+      stateful: buildSessionStatefulOptions(session),
     });
 
     const promptTokens = result.callUsage.reduce(
@@ -196,11 +506,14 @@ async function runContextAndTokenBenchmark(
       completedTasks++;
     }
 
-    history = [
-      ...history,
-      { role: "user", content },
-      { role: "assistant", content: result.content },
-    ];
+    sessionManager.appendMessage(session.id, { role: "user", content });
+    sessionManager.appendMessage(session.id, {
+      role: "assistant",
+      content: result.content,
+    });
+    if (session.history.length > 4) {
+      await sessionManager.compact(session.id);
+    }
   }
 
   return {
@@ -336,30 +649,171 @@ async function runOfflineReplayBenchmark(
       continue;
     }
 
-    const replayEngine = new TrajectoryReplayEngine({ strictMode: true });
-    const first = replayEngine.replay(parsed);
-    const second = replayEngine.replay(parsed);
-    const deterministicMismatch =
-      first.deterministicHash !== second.deterministicHash;
+    const parity = evaluateReplayParity(parsed, { strictMode: true });
 
-    if (first.errors.length > 0) {
+    if (parity.replayErrors > 0) {
       fixtures.push({
         fixtureId,
         ok: false,
-        replayError: first.errors.join("; "),
-        deterministicMismatch,
+        replayError: `replay produced ${String(parity.replayErrors)} errors`,
+        deterministicMismatch: !parity.deterministic,
       });
       continue;
     }
 
     fixtures.push({
       fixtureId,
-      ok: !deterministicMismatch,
-      deterministicMismatch,
+      ok: parity.ok,
+      deterministicMismatch: !parity.deterministic,
     });
   }
 
   return fixtures;
+}
+
+function parseOrchestrationExpectation(
+  value: unknown,
+  fixtureId: string,
+): OrchestrationRegressionExpectation {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${fixtureId}.expected must be an object`);
+  }
+  const record = value as Record<string, unknown>;
+  if (record.schemaVersion !== ORCHESTRATION_EXPECTATION_SCHEMA_VERSION) {
+    throw new Error(
+      `${fixtureId}.expected schemaVersion must be ${ORCHESTRATION_EXPECTATION_SCHEMA_VERSION}`,
+    );
+  }
+  const scenarioId = String(record.scenarioId ?? "");
+  const title = String(record.title ?? "");
+  const sourceTraceId = String(record.sourceTraceId ?? "");
+  const sourceArtifacts = Array.isArray(record.sourceArtifacts)
+    ? record.sourceArtifacts.map((entry) => String(entry))
+    : [];
+  const expectedReplay = record.expectedReplay as Record<string, unknown> | undefined;
+  const baselineMetrics = record.baselineMetrics as Record<string, unknown> | undefined;
+  if (!scenarioId || !title || !sourceTraceId || !expectedReplay || !baselineMetrics) {
+    throw new Error(`${fixtureId}.expected is missing required fields`);
+  }
+  return {
+    schemaVersion: ORCHESTRATION_EXPECTATION_SCHEMA_VERSION,
+    scenarioId,
+    title,
+    sourceTraceId,
+    sourceArtifacts,
+    expectedReplay: {
+      taskPda: String(expectedReplay.taskPda ?? ""),
+      finalStatus: String(expectedReplay.finalStatus ?? "") as never,
+      replayErrors: Number(expectedReplay.replayErrors ?? 0),
+      replayWarnings: Number(expectedReplay.replayWarnings ?? 0),
+      policyViolations: Number(expectedReplay.policyViolations ?? 0),
+      verifierVerdicts: Number(expectedReplay.verifierVerdicts ?? 0),
+    },
+    baselineMetrics: {
+      turns: Number(baselineMetrics.turns ?? 0),
+      toolCalls: Number(baselineMetrics.toolCalls ?? 0),
+      fallbackCount: Number(baselineMetrics.fallbackCount ?? 0),
+      spuriousSubagentCount: Number(
+        baselineMetrics.spuriousSubagentCount ?? 0,
+      ),
+      approvalCount: Number(baselineMetrics.approvalCount ?? 0),
+      restartRecoverySuccess: Boolean(
+        baselineMetrics.restartRecoverySuccess,
+      ),
+    },
+  };
+}
+
+async function runOrchestrationBaselineBenchmark(
+  fixtureDir: string,
+): Promise<PipelineOrchestrationScenarioInput[]> {
+  const entries = await readdir(fixtureDir, { withFileTypes: true });
+  const traceFiles = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".trace.json"))
+    .map((entry) => entry.name)
+    .sort((left, right) => left.localeCompare(right));
+
+  const catalogByFixture = new Map(
+    ORCHESTRATION_REGRESSION_SCENARIOS.map((entry) => [
+      `${entry.fixtureBaseName}.trace.json`,
+      entry,
+    ]),
+  );
+
+  const scenarios: PipelineOrchestrationScenarioInput[] = [];
+
+  for (const traceFile of traceFiles) {
+    const catalogEntry = catalogByFixture.get(traceFile);
+    if (!catalogEntry) continue;
+
+    const fixtureId = traceFile.replace(/\.trace\.json$/, "");
+    const tracePath = path.join(fixtureDir, traceFile);
+    const expectedPath = path.join(fixtureDir, `${fixtureId}.expected.json`);
+
+    const rawTrace = await readFile(tracePath, "utf8");
+    const rawExpected = await readFile(expectedPath, "utf8");
+    const trace = parseTrajectoryTrace(JSON.parse(rawTrace) as unknown);
+    const expected = parseOrchestrationExpectation(
+      JSON.parse(rawExpected) as unknown,
+      fixtureId,
+    );
+    const replay = new TrajectoryReplayEngine({ strictMode: true }).replay(trace);
+    const task = replay.tasks[expected.expectedReplay.taskPda];
+    const observedStatus = task?.status ?? "unknown";
+    const mismatchReasons: string[] = [];
+
+    if (observedStatus !== expected.expectedReplay.finalStatus) {
+      mismatchReasons.push(
+        `finalStatus expected ${expected.expectedReplay.finalStatus} got ${observedStatus}`,
+      );
+    }
+    if (replay.errors.length !== expected.expectedReplay.replayErrors) {
+      mismatchReasons.push(
+        `replayErrors expected ${expected.expectedReplay.replayErrors} got ${replay.errors.length}`,
+      );
+    }
+    if (replay.warnings.length !== expected.expectedReplay.replayWarnings) {
+      mismatchReasons.push(
+        `replayWarnings expected ${expected.expectedReplay.replayWarnings} got ${replay.warnings.length}`,
+      );
+    }
+    if (
+      (task?.policyViolations ?? 0) !== expected.expectedReplay.policyViolations
+    ) {
+      mismatchReasons.push(
+        `policyViolations expected ${expected.expectedReplay.policyViolations} got ${task?.policyViolations ?? 0}`,
+      );
+    }
+    if (
+      (task?.verifierVerdicts ?? 0) !== expected.expectedReplay.verifierVerdicts
+    ) {
+      mismatchReasons.push(
+        `verifierVerdicts expected ${expected.expectedReplay.verifierVerdicts} got ${task?.verifierVerdicts ?? 0}`,
+      );
+    }
+
+    scenarios.push({
+      scenarioId: expected.scenarioId,
+      title: expected.title,
+      category: catalogEntry.category,
+      sourceTraceId: expected.sourceTraceId,
+      passed: mismatchReasons.length === 0,
+      finalStatus: observedStatus,
+      replayErrors: replay.errors.length,
+      replayWarnings: replay.warnings.length,
+      policyViolations: task?.policyViolations ?? 0,
+      verifierVerdicts: task?.verifierVerdicts ?? 0,
+      turns: expected.baselineMetrics.turns,
+      toolCalls: expected.baselineMetrics.toolCalls,
+      fallbackCount: expected.baselineMetrics.fallbackCount,
+      spuriousSubagentCount: expected.baselineMetrics.spuriousSubagentCount,
+      approvalCount: expected.baselineMetrics.approvalCount,
+      restartRecoverySuccess: expected.baselineMetrics.restartRecoverySuccess,
+      mismatchReasons,
+    });
+  }
+
+  return scenarios;
 }
 
 async function withTimeout<T>(
@@ -454,12 +908,26 @@ export async function runPipelineQualitySuite(
   const incidentFixtureDir =
     config.incidentFixtureDir ?? resolveDefaultIncidentFixtureDir();
   const replayFixtures = await runOfflineReplayBenchmark(incidentFixtureDir);
+  const orchestrationBaseline = await runOrchestrationBaselineBenchmark(
+    incidentFixtureDir,
+  );
   const delegationBenchmark = await runDelegationBenchmarkSuite({
     now,
     runId: `${runId}:delegation`,
     k: config.delegationBenchmarkK,
   });
   const delegation = delegationBenchmark.summary;
+  const liveCoding = await runLiveCodingSuite({ now });
+  const safety = await runSafetySuite();
+  const longHorizon = await runLongHorizonSuite({ now });
+  const implementationGates = await runImplementationGateSuite({
+    incidentFixtureDir,
+  });
+  const delegatedWorkspaceGates = await runDelegatedWorkspaceGateSuite({
+    incidentFixtureDir,
+  });
+  const chaos = await runChaosSuite();
+  const economics = await runEconomicsBenchmark();
 
   return buildPipelineQualityArtifact({
     runId,
@@ -480,11 +948,15 @@ export async function runPipelineQualitySuite(
     offlineReplay: {
       fixtures: replayFixtures,
     },
+    orchestrationBaseline: {
+      scenarios: orchestrationBaseline,
+    },
     delegation: {
       totalCases: delegation.totalCases,
       delegatedCases: delegation.delegatedCases,
       usefulDelegations: delegation.usefulDelegations,
       harmfulDelegations: delegation.harmfulDelegations,
+      unnecessaryDelegations: delegation.unnecessaryDelegations,
       plannerExecutionMismatches: delegation.plannerExecutionMismatches,
       childTimeouts: delegation.childTimeouts,
       childFailures: delegation.childFailures,
@@ -500,5 +972,12 @@ export async function runPipelineQualitySuite(
       k: delegation.k,
       scenarioSummaries: delegation.scenarioSummaries,
     },
+    liveCoding,
+    safety,
+    longHorizon,
+    implementationGates,
+    delegatedWorkspaceGates,
+    chaos,
+    economics,
   });
 }

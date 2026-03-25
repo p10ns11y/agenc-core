@@ -1,6 +1,10 @@
 import type { LLMMessage } from "../llm/types.js";
 import type { MemoryBackend, MemoryEntry } from "../memory/types.js";
 import type { PolicyEvaluationScope } from "../policy/types.js";
+import type {
+  WorkflowProgressRequirement,
+  WorkflowProgressSnapshot,
+} from "../workflow/completion-progress.js";
 import type { BackgroundRunLineage } from "./subrun-contract.js";
 import {
   assertValidBackgroundRunLineage,
@@ -26,6 +30,7 @@ import {
   type AgentRunState,
   type AgentRunWakeReason,
 } from "./agent-run-contract.js";
+import { isCompatibleBackgroundRunStateVersion } from "./state-migrations.js";
 
 const BACKGROUND_RUN_KEY_PREFIX = "background-run:session:";
 const BACKGROUND_RUN_RECENT_KEY_PREFIX = "background-run:recent:session:";
@@ -310,6 +315,8 @@ export interface BackgroundRunRecentSnapshot {
   readonly pendingSignals: number;
   readonly carryForwardSummary?: string;
   readonly blockerSummary?: string;
+  readonly completionState?: WorkflowProgressSnapshot["completionState"];
+  readonly remainingRequirements?: readonly WorkflowProgressRequirement[];
   readonly watchCount: number;
   readonly fenceToken: number;
   readonly preferredWorkerId?: string;
@@ -336,6 +343,7 @@ export interface PersistedBackgroundRun {
   readonly lastToolEvidence?: string;
   readonly lastHeartbeatContent?: string;
   readonly lastWakeReason?: BackgroundRunWakeReason;
+  readonly completionProgress?: WorkflowProgressSnapshot;
   readonly carryForward?: BackgroundRunCarryForwardState;
   readonly blocker?: BackgroundRunBlockerState;
   readonly approvalState: BackgroundRunApprovalState;
@@ -854,7 +862,7 @@ function coerceWakeEvent(value: unknown): BackgroundRunWakeEvent | undefined {
   if (!value || typeof value !== "object") return undefined;
   const raw = value as Record<string, unknown>;
   if (
-    (raw.version !== 1 && raw.version !== AGENT_RUN_SCHEMA_VERSION) ||
+    !isCompatibleBackgroundRunStateVersion(raw.version) ||
     typeof raw.id !== "string" ||
     typeof raw.sessionId !== "string" ||
     !isAgentRunWakeReason(raw.type) ||
@@ -930,7 +938,7 @@ function coerceWakeQueue(
   if (!value || typeof value !== "object") return undefined;
   const raw = value as Record<string, unknown>;
   if (
-    (raw.version !== 1 && raw.version !== AGENT_RUN_SCHEMA_VERSION) ||
+    !isCompatibleBackgroundRunStateVersion(raw.version) ||
     typeof raw.sessionId !== "string" ||
     raw.sessionId !== sessionId
   ) {
@@ -963,7 +971,7 @@ function coerceDispatchItem(value: unknown): BackgroundRunDispatchItem | undefin
   const raw = value as Record<string, unknown>;
   const reason = raw.reason;
   if (
-    (raw.version !== 1 && raw.version !== AGENT_RUN_SCHEMA_VERSION) ||
+    !isCompatibleBackgroundRunStateVersion(raw.version) ||
     typeof raw.id !== "string" ||
     typeof raw.sessionId !== "string" ||
     typeof raw.sequence !== "number" ||
@@ -1040,7 +1048,7 @@ function coerceDispatchQueue(
   if (!value || typeof value !== "object") return undefined;
   const raw = value as Record<string, unknown>;
   if (
-    (raw.version !== 1 && raw.version !== AGENT_RUN_SCHEMA_VERSION) ||
+    !isCompatibleBackgroundRunStateVersion(raw.version) ||
     typeof raw.nextSequence !== "number" ||
     typeof raw.updatedAt !== "number"
   ) {
@@ -1075,7 +1083,7 @@ function coerceDispatchBeacon(
   if (!value || typeof value !== "object") return undefined;
   const raw = value as Record<string, unknown>;
   if (
-    (raw.version !== 1 && raw.version !== AGENT_RUN_SCHEMA_VERSION) ||
+    !isCompatibleBackgroundRunStateVersion(raw.version) ||
     typeof raw.revision !== "number" ||
     typeof raw.updatedAt !== "number" ||
     typeof raw.queueDepth !== "number"
@@ -1096,7 +1104,7 @@ function coerceWorkerRecord(value: unknown): BackgroundRunWorkerRecord | undefin
   if (!value || typeof value !== "object") return undefined;
   const raw = value as Record<string, unknown>;
   if (
-    (raw.version !== 1 && raw.version !== AGENT_RUN_SCHEMA_VERSION) ||
+    !isCompatibleBackgroundRunStateVersion(raw.version) ||
     typeof raw.workerId !== "string" ||
     (raw.state !== "active" && raw.state !== "draining") ||
     typeof raw.registeredAt !== "number" ||
@@ -1137,7 +1145,7 @@ function coerceWorkerRegistry(
   if (!value || typeof value !== "object") return undefined;
   const raw = value as Record<string, unknown>;
   if (
-    (raw.version !== 1 && raw.version !== AGENT_RUN_SCHEMA_VERSION) ||
+    !isCompatibleBackgroundRunStateVersion(raw.version) ||
     typeof raw.updatedAt !== "number"
   ) {
     return undefined;
@@ -1627,7 +1635,7 @@ function coerceRecentSnapshot(
   const state = raw.state;
   const contractKind = raw.contractKind;
   if (
-    (raw.version !== 1 && raw.version !== AGENT_RUN_SCHEMA_VERSION) ||
+    !isCompatibleBackgroundRunStateVersion(raw.version) ||
     typeof raw.runId !== "string" ||
     typeof raw.sessionId !== "string" ||
     typeof raw.objective !== "string" ||
@@ -1676,6 +1684,22 @@ function coerceRecentSnapshot(
         : undefined,
     blockerSummary:
       typeof raw.blockerSummary === "string" ? raw.blockerSummary : undefined,
+    completionState:
+      raw.completionState === "completed" ||
+      raw.completionState === "partial" ||
+      raw.completionState === "blocked" ||
+      raw.completionState === "needs_verification"
+        ? raw.completionState
+        : undefined,
+    remainingRequirements: Array.isArray(raw.remainingRequirements)
+      ? raw.remainingRequirements.filter(
+          (entry): entry is WorkflowProgressRequirement =>
+            entry === "workflow_verifier_pass" ||
+            entry === "build_verification" ||
+            entry === "behavior_verification" ||
+            entry === "review_verification",
+        )
+      : undefined,
     watchCount:
       coerceNonNegativeInteger(raw.watchCount) ?? 0,
     fenceToken:
@@ -1688,6 +1712,101 @@ function coerceRecentSnapshot(
       typeof raw.workerAffinityKey === "string"
         ? raw.workerAffinityKey
         : undefined,
+  };
+}
+
+function coerceCompletionProgress(
+  value: unknown,
+): WorkflowProgressSnapshot | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const raw = value as Record<string, unknown>;
+  const completionState =
+    raw.completionState === "completed" ||
+    raw.completionState === "partial" ||
+    raw.completionState === "blocked" ||
+    raw.completionState === "needs_verification"
+      ? raw.completionState
+      : undefined;
+  const stopReason =
+    raw.stopReason === "completed" ||
+    raw.stopReason === "tool_calls" ||
+    raw.stopReason === "validation_error" ||
+    raw.stopReason === "provider_error" ||
+    raw.stopReason === "authentication_error" ||
+    raw.stopReason === "rate_limited" ||
+    raw.stopReason === "timeout" ||
+    raw.stopReason === "tool_error" ||
+    raw.stopReason === "budget_exceeded" ||
+    raw.stopReason === "no_progress" ||
+    raw.stopReason === "cancelled"
+      ? raw.stopReason
+      : undefined;
+  if (
+    !completionState ||
+    !stopReason ||
+    typeof raw.updatedAt !== "number" ||
+    !Array.isArray(raw.requiredRequirements) ||
+    !Array.isArray(raw.satisfiedRequirements) ||
+    !Array.isArray(raw.remainingRequirements) ||
+    !Array.isArray(raw.reusableEvidence)
+  ) {
+    return undefined;
+  }
+  const parseRequirementArray = (
+    input: readonly unknown[],
+  ): WorkflowProgressRequirement[] =>
+    input.filter(
+      (entry): entry is WorkflowProgressRequirement =>
+        entry === "workflow_verifier_pass" ||
+        entry === "build_verification" ||
+        entry === "behavior_verification" ||
+        entry === "review_verification",
+    );
+  const reusableEvidence = raw.reusableEvidence
+    .map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return undefined;
+      }
+      const evidence = entry as Record<string, unknown>;
+      if (
+        (evidence.requirement !== "build_verification" &&
+          evidence.requirement !== "behavior_verification" &&
+          evidence.requirement !== "review_verification") ||
+        typeof evidence.summary !== "string" ||
+        typeof evidence.observedAt !== "number"
+      ) {
+        return undefined;
+      }
+      return {
+        requirement: evidence.requirement,
+        summary: evidence.summary,
+        observedAt: evidence.observedAt,
+      } as const;
+    })
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== undefined);
+
+  return {
+    completionState,
+    stopReason,
+    stopReasonDetail:
+      typeof raw.stopReasonDetail === "string" ? raw.stopReasonDetail : undefined,
+    validationCode:
+      typeof raw.validationCode === "string" ? raw.validationCode as never : undefined,
+    verificationContract:
+      raw.verificationContract && typeof raw.verificationContract === "object"
+        ? raw.verificationContract as never
+        : undefined,
+    completionContract:
+      raw.completionContract && typeof raw.completionContract === "object"
+        ? raw.completionContract as never
+        : undefined,
+    requiredRequirements: parseRequirementArray(raw.requiredRequirements),
+    satisfiedRequirements: parseRequirementArray(raw.satisfiedRequirements),
+    remainingRequirements: parseRequirementArray(raw.remainingRequirements),
+    reusableEvidence,
+    updatedAt: raw.updatedAt,
   };
 }
 
@@ -1755,6 +1874,7 @@ function coerceContract(
 interface CoercedRunCore {
   readonly raw: Record<string, unknown>;
   readonly contract: BackgroundRunContract;
+  readonly completionProgress?: WorkflowProgressSnapshot;
   readonly carryForward?: BackgroundRunCarryForwardState;
   readonly pendingSignals: BackgroundRunSignal[];
   readonly observedTargets: BackgroundRunObservedTarget[];
@@ -1767,7 +1887,7 @@ function coerceRunCore(value: unknown): CoercedRunCore | undefined {
     return undefined;
   }
   if (
-    (raw.version !== 1 && raw.version !== AGENT_RUN_SCHEMA_VERSION) ||
+    !isCompatibleBackgroundRunStateVersion(raw.version) ||
     typeof raw.id !== "string" ||
     typeof raw.sessionId !== "string" ||
     typeof raw.objective !== "string" ||
@@ -1788,6 +1908,7 @@ function coerceRunCore(value: unknown): CoercedRunCore | undefined {
   return {
     raw,
     contract,
+    completionProgress: coerceCompletionProgress(raw.completionProgress),
     carryForward: coerceCarryForward(raw.carryForward),
     pendingSignals: Array.isArray(raw.pendingSignals)
       ? raw.pendingSignals
@@ -1915,8 +2036,21 @@ function coerceRunLineage(value: unknown): BackgroundRunLineage | undefined {
       allowedTools: Array.isArray(scope?.allowedTools)
         ? scope.allowedTools.filter((tool): tool is string => typeof tool === "string")
         : [],
+      workspaceRoot:
+        typeof scope?.workspaceRoot === "string" ? scope.workspaceRoot : undefined,
+      allowedReadRoots: Array.isArray(scope?.allowedReadRoots)
+        ? scope.allowedReadRoots.filter((entry): entry is string => typeof entry === "string")
+        : undefined,
       allowedWriteRoots: Array.isArray(scope?.allowedWriteRoots)
         ? scope.allowedWriteRoots.filter((entry): entry is string => typeof entry === "string")
+        : undefined,
+      requiredSourceArtifacts: Array.isArray(scope?.requiredSourceArtifacts)
+        ? scope.requiredSourceArtifacts.filter(
+          (entry): entry is string => typeof entry === "string",
+        )
+        : undefined,
+      targetArtifacts: Array.isArray(scope?.targetArtifacts)
+        ? scope.targetArtifacts.filter((entry): entry is string => typeof entry === "string")
         : undefined,
       allowedHosts: Array.isArray(scope?.allowedHosts)
         ? scope.allowedHosts.filter((entry): entry is string => typeof entry === "string")
@@ -2018,6 +2152,7 @@ function coerceRun(value: unknown): PersistedBackgroundRun | undefined {
       isAgentRunWakeReason(raw.lastWakeReason)
         ? raw.lastWakeReason
         : undefined,
+    completionProgress: core.completionProgress,
     carryForward,
     blocker: durableState.blocker,
     approvalState: durableState.approvalState,

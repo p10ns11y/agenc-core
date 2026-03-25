@@ -23,6 +23,11 @@ import {
 import type { ProgressTracker } from "./progress.js";
 import type { PolicyDecision, PolicyEngine, PolicyEvaluationScope } from "../policy/index.js";
 import type { TelemetryCollector } from "../telemetry/types.js";
+import type {
+  RuntimeDependencyDomain,
+  RuntimeDependencyMode,
+  RuntimeIncidentDiagnostics,
+} from "../telemetry/incident-diagnostics.js";
 import { TELEMETRY_METRIC_NAMES } from "../telemetry/metric-names.js";
 import { startReplaySpan } from "../replay/trace.js";
 import {
@@ -33,6 +38,7 @@ import {
 } from "./agent-run-contract.js";
 import type {
   BackgroundRunControlAction,
+  BackgroundRunEventRecord,
   BackgroundRunOperatorDetail,
   BackgroundRunOperatorSummary,
 } from "./background-run-operator.js";
@@ -120,6 +126,7 @@ import type {
 import {
   toPersistedRun,
   toRecentSnapshot,
+  toStatusSnapshot,
   toActiveRun,
   toRunMessage,
   toOperatorEventRecords,
@@ -197,6 +204,14 @@ import {
   executeNativeToolCall,
 } from "./run-domain-native-tools.js";
 import { extractToolFailureText } from "../llm/chat-executor-tool-utils.js";
+import type { EffectLedger } from "../workflow/effect-ledger.js";
+import type { EffectRecord } from "../workflow/effects.js";
+import { mergeWorkflowProgressSnapshots } from "../workflow/completion-progress.js";
+import {
+  FaultInjectionError,
+  type FaultInjectionPoint,
+  type RuntimeFaultInjector,
+} from "../eval/fault-injection.js";
 
 // ---------------------------------------------------------------------------
 // Domain-dependent free functions (kept here to avoid circular deps)
@@ -231,6 +246,12 @@ function buildActorPrompt(run: ActiveBackgroundRun): string {
   const observedTargetSection = observedTargets
     ? `Runtime observed targets:\n${observedTargets}\n`
     : "";
+  const completionProgressSection = formatCompletionProgressState(
+    run.completionProgress,
+  );
+  const completionProgressText = completionProgressSection
+    ? `Completion progress:\n${completionProgressSection}\n`
+    : "";
   const domain = getRunDomain(run);
   const domainPlannerContract = domain.plannerContract(run);
   const domainVerifierContract = domain.verifierContract(run);
@@ -248,6 +269,7 @@ function buildActorPrompt(run: ActiveBackgroundRun): string {
     `Domain verifier contract:\n- ${domainVerifierContract.join("\n- ")}\n` +
     `Domain artifact contract:\n- ${domainArtifactContract.join("\n- ")}\n` +
     carryForwardSection +
+    completionProgressText +
     signalSection +
     observedTargetSection +
     recentHistory +
@@ -256,6 +278,52 @@ function buildActorPrompt(run: ActiveBackgroundRun): string {
     "Take the next best bounded step toward this objective. " +
     "Use tools when necessary. If the task is already running independently, verify its current state instead of narrating.\n"
   );
+}
+
+function formatCompletionProgressState(
+  progress: ActiveBackgroundRun["completionProgress"],
+): string | undefined {
+  if (!progress) {
+    return undefined;
+  }
+  const parts = [`Current completion state: ${progress.completionState}`];
+  if (progress.satisfiedRequirements.length > 0) {
+    parts.push(`Already satisfied: ${progress.satisfiedRequirements.join(", ")}`);
+  }
+  if (progress.remainingRequirements.length > 0) {
+    parts.push(`Still required: ${progress.remainingRequirements.join(", ")}`);
+  }
+  if (progress.reusableEvidence.length > 0) {
+    parts.push(
+      `Reusable grounded evidence: ${progress.reusableEvidence
+        .slice(-3)
+        .map((entry) => entry.summary)
+        .join(" | ")}`,
+    );
+  }
+  if (progress.stopReasonDetail) {
+    parts.push(`Latest completion detail: ${truncate(progress.stopReasonDetail, 160)}`);
+  }
+  return parts.join("\n");
+}
+
+function toOperatorEffectEventRecords(
+  effects: readonly EffectRecord[],
+): BackgroundRunEventRecord[] {
+  return effects.map((effect) => ({
+    summary: `${effect.toolName} -> ${effect.status}`,
+    timestamp: effect.updatedAt,
+    eventType: `effect.${effect.status}`,
+    data: {
+      effectId: effect.id,
+      idempotencyKey: effect.idempotencyKey,
+      toolName: effect.toolName,
+      status: effect.status,
+      kind: effect.kind,
+      effectClass: effect.effectClass,
+      compensationStatus: effect.compensation.status,
+    },
+  }));
 }
 
 function buildHeartbeatMessage(run: ActiveBackgroundRun): string {
@@ -419,6 +487,9 @@ export class BackgroundRunSupervisor {
   private readonly resolvePolicyScope?: BackgroundRunSupervisorConfig["resolvePolicyScope"];
   private readonly telemetry?: TelemetryCollector;
   private readonly notifier?: BackgroundRunNotifier;
+  private readonly effectLedger?: EffectLedger;
+  private readonly incidentDiagnostics?: RuntimeIncidentDiagnostics;
+  private readonly faultInjector?: RuntimeFaultInjector;
   private readonly wakeBus: BackgroundRunWakeBus;
   private readonly logger: Logger;
   private readonly traceProviderPayloads: boolean;
@@ -453,6 +524,9 @@ export class BackgroundRunSupervisor {
     this.resolvePolicyScope = config.resolvePolicyScope;
     this.telemetry = config.telemetry;
     this.notifier = config.notifier;
+    this.effectLedger = config.effectLedger;
+    this.incidentDiagnostics = config.incidentDiagnostics;
+    this.faultInjector = config.faultInjector;
     this.logger = config.logger ?? silentLogger;
     this.traceProviderPayloads = config.traceProviderPayloads ?? false;
     this.instanceId =
@@ -551,28 +625,13 @@ export class BackgroundRunSupervisor {
     if (!run) return this.statusSnapshots.get(sessionId);
     const scheduledCheckCount =
       run.state === "working" && run.nextCheckAt !== undefined ? 1 : 0;
-    return {
-      id: run.id,
-      sessionId: run.sessionId,
-      objective: run.objective,
-      state: run.state,
-      cycleCount: run.cycleCount,
-      lastVerifiedAt: run.lastVerifiedAt,
-      createdAt: run.createdAt,
-      updatedAt: run.updatedAt,
-      nextCheckAt: run.nextCheckAt,
-      nextHeartbeatAt: run.nextHeartbeatAt,
-      lastUserUpdate: run.lastUserUpdate,
-      lastWakeReason: run.lastWakeReason,
+    return toStatusSnapshot({
+      run,
       pendingSignals:
         run.pendingSignals.length +
         this.wakeBus.getQueuedCount(sessionId) +
         scheduledCheckCount,
-      carryForwardSummary: run.carryForward?.summary,
-      blockerSummary: run.blocker?.summary,
-      watchCount: run.watchRegistrations.length,
-      fenceToken: run.fenceToken,
-    };
+    });
   }
 
   async getRecentSnapshot(
@@ -791,7 +850,10 @@ export class BackgroundRunSupervisor {
     if (!durableRun || !snapshot) {
       return undefined;
     }
-    const eventEntries = await this.runStore.listEvents(durableRun.id, eventLimit);
+    const [eventEntries, recentEffects] = await Promise.all([
+      this.runStore.listEvents(durableRun.id, eventLimit),
+      this.effectLedger?.listRunEffects(durableRun.id, eventLimit),
+    ]);
     const summary = toOperatorSummary({
       snapshot,
       contract: durableRun.contract,
@@ -812,7 +874,11 @@ export class BackgroundRunSupervisor {
       artifacts: durableRun.carryForward?.artifacts ?? [],
       observedTargets: durableRun.observedTargets,
       watchRegistrations: durableRun.watchRegistrations,
-      recentEvents: toOperatorEventRecords(eventEntries),
+      completionProgress: durableRun.completionProgress,
+      recentEvents: [
+        ...toOperatorEventRecords(eventEntries),
+        ...(recentEffects ? toOperatorEffectEventRecords(recentEffects) : []),
+      ].sort((left, right) => right.timestamp - left.timestamp).slice(0, eventLimit),
     };
   }
 
@@ -884,29 +950,17 @@ export class BackgroundRunSupervisor {
   ): void {
     const scheduledCheckCount =
       run.state === "working" && run.nextCheckAt !== undefined ? 1 : 0;
-    this.statusSnapshots.set(run.sessionId, {
-      id: run.id,
-      sessionId: run.sessionId,
-      objective: run.objective,
-      state: run.state,
-      cycleCount: run.cycleCount,
-      lastVerifiedAt: run.lastVerifiedAt,
-      createdAt: run.createdAt,
-      updatedAt: run.updatedAt,
-      nextCheckAt: run.nextCheckAt,
-      nextHeartbeatAt: run.nextHeartbeatAt,
-      lastUserUpdate: run.lastUserUpdate,
-      lastWakeReason: run.lastWakeReason,
-      pendingSignals:
-        run.pendingSignals.length +
-        queuedWakeCount +
-        scheduledCheckCount +
-        extraPendingCount,
-      carryForwardSummary: run.carryForward?.summary,
-      blockerSummary: run.blocker?.summary,
-      watchCount: run.watchRegistrations.length,
-      fenceToken: run.fenceToken,
-    });
+    this.statusSnapshots.set(
+      run.sessionId,
+      toStatusSnapshot({
+        run,
+        pendingSignals:
+          run.pendingSignals.length +
+          queuedWakeCount +
+          scheduledCheckCount +
+          extraPendingCount,
+      }),
+    );
   }
 
   private resolveRunPolicyScope(
@@ -1139,6 +1193,76 @@ export class BackgroundRunSupervisor {
     }
   }
 
+  private getRuntimeMode(): RuntimeDependencyMode {
+    return this.incidentDiagnostics?.getSnapshot().runtimeMode ?? "healthy";
+  }
+
+  private isSafeModeActive(): boolean {
+    return this.getRuntimeMode() === "safe_mode";
+  }
+
+  private reportIncident(params: {
+    domain: RuntimeDependencyDomain;
+    mode: Exclude<RuntimeDependencyMode, "healthy">;
+    severity: "warn" | "error";
+    code: string;
+    message: string;
+    run?: Pick<ActiveBackgroundRun, "id" | "sessionId">;
+  }): void {
+    this.incidentDiagnostics?.report({
+      domain: params.domain,
+      mode: params.mode,
+      severity: params.severity,
+      code: params.code,
+      message: params.message,
+      ...(params.run?.sessionId ? { sessionId: params.run.sessionId } : {}),
+      ...(params.run?.id ? { runId: params.run.id } : {}),
+    });
+    this.recordAlert({
+      severity: params.severity,
+      code: params.code,
+      message: params.message,
+      run: params.run,
+    });
+  }
+
+  private maybeInjectFault(
+    point: FaultInjectionPoint,
+    params?: {
+      run?: Pick<ActiveBackgroundRun, "id" | "sessionId">;
+      operation?: string;
+      provider?: string;
+    },
+  ): void {
+    this.faultInjector?.maybeThrow({
+      point,
+      ...(params?.run?.sessionId ? { sessionId: params.run.sessionId } : {}),
+      ...(params?.run?.id ? { runId: params.run.id } : {}),
+      ...(params?.operation ? { operation: params.operation } : {}),
+      ...(params?.provider ? { provider: params.provider } : {}),
+    });
+  }
+
+  private classifyFaultDomain(error: unknown): RuntimeDependencyDomain | undefined {
+    if (error instanceof FaultInjectionError) {
+      switch (error.point) {
+        case "provider_timeout":
+          return "provider";
+        case "tool_timeout":
+          return "tool";
+        case "persistence_failure":
+          return "persistence";
+        case "approval_store_failure":
+          return "approval_store";
+        case "child_run_crash":
+          return "child_run";
+        case "daemon_restart":
+          return "daemon";
+      }
+    }
+    return undefined;
+  }
+
   private forgetStatusSnapshot(sessionId: string): void {
     this.statusSnapshots.delete(sessionId);
   }
@@ -1244,6 +1368,16 @@ export class BackgroundRunSupervisor {
     item: BackgroundRunDispatchItem,
   ): Promise<void> {
     try {
+      if (this.isSafeModeActive()) {
+        await this.runStore.releaseDispatch({
+          dispatchId: item.id,
+          workerId: this.instanceId,
+          now: this.now(),
+          availableAt: this.now() + DEFAULT_DISPATCH_RETRY_MS,
+          preferredWorkerId: item.preferredWorkerId,
+        });
+        return;
+      }
       const run = await this.ensureRunLoaded(item.sessionId);
       if (!run) {
         await this.runStore.completeDispatch({
@@ -1261,6 +1395,10 @@ export class BackgroundRunSupervisor {
       run.preferredWorkerId = this.instanceId;
       run.workerAffinityKey = resolveWorkerAffinityKey(run);
       await this.persistRun(run);
+      this.maybeInjectFault("child_run_crash", {
+        run,
+        operation: "execute_cycle",
+      });
       await this.executeCycle(item.sessionId);
       await this.runStore.completeDispatch({
         dispatchId: item.id,
@@ -1274,6 +1412,18 @@ export class BackgroundRunSupervisor {
         sessionId: item.sessionId,
         error: toErrorMessage(error),
       });
+      const domain = this.classifyFaultDomain(error);
+      if (domain) {
+        this.reportIncident({
+          domain,
+          mode: domain === "persistence" || domain === "approval_store"
+            ? "safe_mode"
+            : "degraded",
+          severity: "error",
+          code: `${domain}_failure`,
+          message: toErrorMessage(error),
+        });
+      }
       await this.runStore.releaseDispatch({
         dispatchId: item.id,
         workerId: this.instanceId,
@@ -1397,20 +1547,22 @@ export class BackgroundRunSupervisor {
   }
 
   async recoverRuns(): Promise<number> {
-    await this.heartbeatWorker();
-    await this.runStore.garbageCollect({ now: this.now() });
-    const persistedRuns = await this.runStore.listRuns();
-    const activeWorkers = new Map(
-      (await this.runStore.listWorkers())
-        .filter(
-          (worker) =>
-            worker.lastHeartbeatAt + worker.heartbeatTtlMs > this.now() &&
-            worker.state === "active",
-        )
-        .map((worker) => [worker.workerId, worker] as const),
-    );
-    let recovered = 0;
-    for (const persistedRun of persistedRuns) {
+    try {
+      this.maybeInjectFault("daemon_restart", { operation: "recover_runs" });
+      await this.heartbeatWorker();
+      await this.runStore.garbageCollect({ now: this.now() });
+      const persistedRuns = await this.runStore.listRuns();
+      const activeWorkers = new Map(
+        (await this.runStore.listWorkers())
+          .filter(
+            (worker) =>
+              worker.lastHeartbeatAt + worker.heartbeatTtlMs > this.now() &&
+              worker.state === "active",
+          )
+          .map((worker) => [worker.workerId, worker] as const),
+      );
+      let recovered = 0;
+      for (const persistedRun of persistedRuns) {
       if (isTerminalAgentRunState(persistedRun.state)) {
         await this.runStore.deleteRun(persistedRun.sessionId);
         continue;
@@ -1477,6 +1629,7 @@ export class BackgroundRunSupervisor {
         1,
         run,
       );
+      this.incidentDiagnostics?.clearDomain("daemon");
       this.recordAlert({
         severity: "info",
         code: "run_recovered",
@@ -1506,14 +1659,29 @@ export class BackgroundRunSupervisor {
           });
         }
       }
-      recovered += 1;
+        recovered += 1;
+      }
+      this.updateActiveGauge();
+      await this.armDispatchLoop();
+      return recovered;
+    } catch (error) {
+      this.reportIncident({
+        domain: "daemon",
+        mode: "degraded",
+        severity: "error",
+        code: "daemon_restart_failure",
+        message: toErrorMessage(error),
+      });
+      throw error;
     }
-    this.updateActiveGauge();
-    await this.armDispatchLoop();
-    return recovered;
   }
 
   async startRun(params: StartBackgroundRunParams): Promise<BackgroundRunStatusSnapshot> {
+    if (this.isSafeModeActive()) {
+      throw new Error(
+        "Background runs are paused because the runtime is in safe mode.",
+      );
+    }
     await this.cancelRun(params.sessionId, "Replaced by a new background run.");
     await this.runStore.deleteCheckpoint(params.sessionId);
     if (params.options?.lineage) {
@@ -1545,6 +1713,7 @@ export class BackgroundRunSupervisor {
       lastToolEvidence: undefined,
       lastHeartbeatContent: undefined,
       lastWakeReason: "start",
+      completionProgress: undefined,
       carryForward: undefined,
       blocker: undefined,
       approvalState: { status: "none" },
@@ -1630,25 +1799,10 @@ export class BackgroundRunSupervisor {
       availableAt: now,
       preferredWorkerId: this.instanceId,
     });
-    return {
-      id: run.id,
-      sessionId: run.sessionId,
-      objective: run.objective,
-      state: run.state,
-      cycleCount: run.cycleCount,
-      lastVerifiedAt: run.lastVerifiedAt,
-      createdAt: run.createdAt,
-      updatedAt: run.updatedAt,
-      nextCheckAt: run.nextCheckAt,
-      nextHeartbeatAt: run.nextHeartbeatAt,
-      lastUserUpdate: run.lastUserUpdate,
-      lastWakeReason: run.lastWakeReason,
+    return toStatusSnapshot({
+      run,
       pendingSignals: 0,
-      carryForwardSummary: run.carryForward?.summary,
-      blockerSummary: run.blocker?.summary,
-      watchCount: run.watchRegistrations.length,
-      fenceToken: run.fenceToken,
-    };
+    });
   }
 
   async signalRun(params: {
@@ -3200,6 +3354,11 @@ export class BackgroundRunSupervisor {
         decision = groundDecision(run, actorResult, decision, domainDecision);
       }
 
+      run.completionProgress = mergeWorkflowProgressSnapshots({
+        previous: run.completionProgress,
+        next: actorResult.completionProgress,
+      });
+
       const cycleTokens = actorResult.tokenUsage.totalTokens;
       run.budgetState = {
         ...run.budgetState,
@@ -3246,6 +3405,30 @@ export class BackgroundRunSupervisor {
       if (run.abortController?.signal.aborted) {
         throw error;
       }
+      const injectedDomain = this.classifyFaultDomain(error);
+      if (injectedDomain) {
+        this.reportIncident({
+          domain: injectedDomain,
+          mode:
+            injectedDomain === "persistence" ||
+            injectedDomain === "approval_store"
+              ? "safe_mode"
+              : "degraded",
+          severity: "error",
+          code: `${injectedDomain}_failure`,
+          message: toErrorMessage(error),
+          run,
+        });
+      } else if (/timed out/i.test(toErrorMessage(error))) {
+        this.reportIncident({
+          domain: "provider",
+          mode: "degraded",
+          severity: "warn",
+          code: "provider_timeout",
+          message: toErrorMessage(error),
+          run,
+        });
+      }
       run.consecutiveErrorCycles += 1;
       recordRunActivity(run, this.now());
       decision = {
@@ -3264,6 +3447,12 @@ export class BackgroundRunSupervisor {
             : MIN_POLL_INTERVAL_MS,
         shouldNotifyUser: true,
       };
+    }
+
+    if (decision.state !== "failed") {
+      this.incidentDiagnostics?.clearDomain("provider");
+      this.incidentDiagnostics?.clearDomain("tool");
+      this.incidentDiagnostics?.clearDomain("child_run");
     }
 
     return {
@@ -3484,6 +3673,9 @@ export class BackgroundRunSupervisor {
             objective: run.objective,
             actorResult,
             previousUpdate: run.lastUserUpdate,
+            completionProgressSummary: formatCompletionProgressState(
+              run.completionProgress,
+            ),
           }),
         },
       ], {
@@ -3747,26 +3939,43 @@ export class BackgroundRunSupervisor {
     const persistedRun = toPersistedRun(run);
     const recentSnapshot = toRecentSnapshot(run, queuedSignals);
     this.rememberStatusSnapshot(run, queuedSignals);
-    await this.runStore.saveRun(persistedRun);
-    await this.runStore.saveRecentSnapshot(recentSnapshot);
-    if (event) {
-      await this.runStore.appendEvent(persistedRun, event);
-      if (this.notifier?.isEnabled()) {
-        const summary = toOperatorSummary({
-          snapshot: recentSnapshot,
-          contract: persistedRun.contract,
-          blocker: persistedRun.blocker,
-          approvalState: persistedRun.approvalState,
-          checkpointAvailable: false,
-          now: this.now(),
-        });
-        await this.notifier.notify({
-          occurredAt: event.timestamp,
-          internalEventType: event.type,
-          summary: event.summary,
-          run: summary,
-        });
+    try {
+      this.maybeInjectFault("persistence_failure", {
+        run,
+        operation: "persist_run",
+      });
+      await this.runStore.saveRun(persistedRun);
+      await this.runStore.saveRecentSnapshot(recentSnapshot);
+      if (event) {
+        await this.runStore.appendEvent(persistedRun, event);
+        if (this.notifier?.isEnabled()) {
+          const summary = toOperatorSummary({
+            snapshot: recentSnapshot,
+            contract: persistedRun.contract,
+            blocker: persistedRun.blocker,
+            approvalState: persistedRun.approvalState,
+            checkpointAvailable: false,
+            now: this.now(),
+          });
+          await this.notifier.notify({
+            occurredAt: event.timestamp,
+            internalEventType: event.type,
+            summary: event.summary,
+            run: summary,
+          });
+        }
       }
+      this.incidentDiagnostics?.clearDomain("persistence");
+    } catch (error) {
+      this.reportIncident({
+        domain: "persistence",
+        mode: "safe_mode",
+        severity: "error",
+        code: "persistence_failure",
+        message: toErrorMessage(error),
+        run,
+      });
+      throw error;
     }
   }
 

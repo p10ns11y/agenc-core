@@ -607,6 +607,8 @@ export interface ToolExecutingResponse {
     toolCallId?: string;
     args: Record<string, unknown>;
     subagentSessionId?: string;
+    effectId?: string;
+    effectIdempotencyKey?: string;
   };
   id?: string;
 }
@@ -620,6 +622,8 @@ export interface ToolResultResponse {
     durationMs: number;
     isError?: boolean;
     subagentSessionId?: string;
+    effectId?: string;
+    effectIdempotencyKey?: string;
   };
   id?: string;
 }
@@ -909,6 +913,15 @@ export interface ApprovalRequestResponse {
     requiredApproverRoles?: readonly string[];
     parentSessionId?: string;
     subagentSessionId?: string;
+    effect?: {
+      effectId: string;
+      idempotencyKey: string;
+      effectClass?: string;
+      effectKind?: string;
+      summary?: string;
+      compensationAvailable?: boolean;
+      targets?: readonly string[];
+    };
   };
   id?: string;
 }

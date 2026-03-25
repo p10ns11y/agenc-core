@@ -4,7 +4,10 @@ import type {
   PipelineResult,
 } from "../workflow/pipeline.js";
 import type { PlannerSubAgentTaskStepIntent } from "./chat-executor-types.js";
-import { evaluateSubagentDeterministicChecks } from "./chat-executor-verifier.js";
+import {
+  buildPlannerVerifierAdmission,
+  evaluatePlannerDeterministicChecks,
+} from "./chat-executor-verifier.js";
 
 function createStep(
   overrides: Partial<PlannerSubAgentTaskStepIntent> = {},
@@ -46,6 +49,23 @@ function createPlannerContext(): PipelinePlannerContext {
     memory: [],
     toolOutputs: [],
   };
+}
+
+function evaluateSubagentDeterministicChecks(
+  steps: readonly PlannerSubAgentTaskStepIntent[],
+  pipelineResult: PipelineResult,
+  plannerContext: PipelinePlannerContext,
+) {
+  const { verifierWorkItems } = buildPlannerVerifierAdmission({
+    subagentSteps: steps,
+    deterministicSteps: [],
+  });
+  return evaluatePlannerDeterministicChecks(
+    verifierWorkItems,
+    pipelineResult,
+    plannerContext,
+    [],
+  );
 }
 
 describe("evaluateSubagentDeterministicChecks", () => {

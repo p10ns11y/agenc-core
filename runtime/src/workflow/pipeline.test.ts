@@ -9,6 +9,8 @@ import type { MemoryBackend } from "../memory/types.js";
 import type { ApprovalEngine } from "../gateway/approvals.js";
 import type { ProgressTracker } from "../gateway/progress.js";
 import { createMockMemoryBackend } from "../memory/test-utils.js";
+import { WorkflowStateError } from "./errors.js";
+import { RuntimeSchemaCompatibilityError } from "./schema-version.js";
 
 // ============================================================================
 // Helpers
@@ -112,6 +114,14 @@ describe("PipelineExecutor", () => {
       expect(events).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
+            type: "step_state_changed",
+            pipelineId: "test-pipeline",
+            stepName: "step-a",
+            state: "running",
+            tool: "tool.a",
+            args: { value: 1 },
+          }),
+          expect.objectContaining({
             type: "step_started",
             pipelineId: "test-pipeline",
             stepName: "step-a",
@@ -125,6 +135,15 @@ describe("PipelineExecutor", () => {
             tool: "tool.a",
             args: { value: 1 },
             result: "a-result",
+          }),
+          expect.objectContaining({
+            type: "step_state_changed",
+            pipelineId: "test-pipeline",
+            stepName: "step-a",
+            state: "completed",
+            previousState: "running",
+            tool: "tool.a",
+            args: { value: 1 },
           }),
         ]),
       );
@@ -233,6 +252,7 @@ describe("PipelineExecutor", () => {
     });
 
     it("fails after exhausting retries", async () => {
+      const events: Array<Record<string, unknown>> = [];
       const handler = vi.fn(async () => {
         throw new Error("always fails");
       });
@@ -241,11 +261,30 @@ describe("PipelineExecutor", () => {
         { name: "bad", tool: "bad", args: {}, onError: "retry", maxRetries: 2 },
       ]);
 
-      const result = await executor.execute(pipeline);
+      const result = await executor.execute(pipeline, 0, {
+        onEvent: (event) => {
+          events.push(event as unknown as Record<string, unknown>);
+        },
+      });
 
       expect(result.status).toBe("failed");
       // Initial call + 2 retries = 3 total calls
       expect(handler).toHaveBeenCalledTimes(3);
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "step_state_changed",
+            stepName: "bad",
+            state: "retry_pending",
+          }),
+          expect.objectContaining({
+            type: "step_state_changed",
+            stepName: "bad",
+            state: "failed",
+            previousState: "running",
+          }),
+        ]),
+      );
     });
 
     it("rejects concurrent execution of same pipeline", async () => {
@@ -278,6 +317,7 @@ describe("PipelineExecutor", () => {
     });
 
     it("halts when step requires approval and rule matches", async () => {
+      const events: Array<Record<string, unknown>> = [];
       const approvalEngine = {
         requiresApproval: vi.fn().mockReturnValue({ tool: "wallet.*", description: "needs approval" }),
       } as unknown as ApprovalEngine;
@@ -288,11 +328,25 @@ describe("PipelineExecutor", () => {
         { name: "dangerous", tool: "wallet.sign", args: {}, requiresApproval: true },
       ]);
 
-      const result = await executor.execute(pipeline);
+      const result = await executor.execute(pipeline, 0, {
+        onEvent: (event) => {
+          events.push(event as unknown as Record<string, unknown>);
+        },
+      });
 
       expect(result.status).toBe("halted");
       expect(result.resumeFrom).toBe(1);
       expect(result.completedSteps).toBe(1);
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "step_state_changed",
+            stepName: "dangerous",
+            state: "blocked_on_approval",
+            reason: 'Approval required for tool "wallet.sign"',
+          }),
+        ]),
+      );
     });
 
     it("continues when requiresApproval but no matching rule", async () => {
@@ -381,9 +435,11 @@ describe("PipelineExecutor", () => {
         toolHandler: handler,
         memoryBackend: backend,
       });
+      const updatedAt = Date.now();
 
       // Manually insert a checkpoint
       await backend.set("pipeline:p1", {
+        schemaVersion: 1,
         pipelineId: "p1",
         pipeline: {
           id: "p1",
@@ -397,7 +453,13 @@ describe("PipelineExecutor", () => {
         stepIndex: 1,
         context: { results: { a: "old-a" } },
         status: "halted",
-        updatedAt: Date.now(),
+        updatedAt,
+        provenance: {
+          schemaVersion: 1,
+          source: "live_runtime",
+          trust: "trusted",
+          recordedAt: updatedAt,
+        },
       });
 
       const result = await executor.resume("p1");
@@ -405,6 +467,106 @@ describe("PipelineExecutor", () => {
       expect(result.status).toBe("completed");
       expect(result.context.results["a"]).toBe("old-a");
       expect(result.context.results["b"]).toBe("resumed-b");
+    });
+
+    it("migrates legacy unversioned checkpoints during listing and rewrites them with schema versions", async () => {
+      const backend = createMockMemoryBackend();
+      const executor = createExecutor({
+        memoryBackend: backend,
+      });
+      const updatedAt = Date.now();
+
+      await backend.set("pipeline:p-migrate", {
+        pipelineId: "p-migrate",
+        pipeline: {
+          id: "p-migrate",
+          steps: [
+            { name: "a", tool: "tool.a", args: {} },
+            { name: "b", tool: "tool.b", args: {} },
+          ],
+          context: { results: {} },
+          createdAt: Date.now(),
+        },
+        stepIndex: 1,
+        context: { results: { a: "old-a" } },
+        status: "halted",
+        updatedAt,
+      });
+
+      (executor as unknown as { active: Set<string> }).active.add("p-migrate");
+      const active = await executor.listActive();
+      expect(active).toHaveLength(1);
+      expect(active[0]?.provenance?.trust).toBe("needs_revalidation");
+      const persisted = await backend.get<{ schemaVersion?: number }>(
+        "pipeline:p-migrate",
+      );
+      expect(persisted?.schemaVersion).toBe(1);
+    });
+
+    it("rejects migrated checkpoints before resume and persists revalidation provenance", async () => {
+      const backend = createMockMemoryBackend();
+      const executor = createExecutor({ memoryBackend: backend });
+
+      await backend.set("pipeline:p-legacy", {
+        pipelineId: "p-legacy",
+        pipeline: {
+          id: "p-legacy",
+          steps: [
+            { name: "a", tool: "tool.a", args: {} },
+            { name: "b", tool: "tool.b", args: {} },
+          ],
+          context: { results: {} },
+          createdAt: Date.now(),
+        },
+        stepIndex: 1,
+        context: { results: { a: "old-a" } },
+        status: "halted",
+        updatedAt: Date.now(),
+      });
+
+      await expect(executor.resume("p-legacy")).rejects.toBeInstanceOf(
+        WorkflowStateError,
+      );
+      await expect(executor.resume("p-legacy")).rejects.toThrow(
+        /requires provenance revalidation before resume/,
+      );
+
+      const persisted = await backend.get<{
+        schemaVersion?: number;
+        provenance?: {
+          trust?: string;
+          source?: string;
+          reasons?: readonly string[];
+        };
+      }>("pipeline:p-legacy");
+      expect(persisted?.schemaVersion).toBe(1);
+      expect(persisted?.provenance?.source).toBe("migrated_checkpoint");
+      expect(persisted?.provenance?.trust).toBe("needs_revalidation");
+      expect(persisted?.provenance?.reasons).toContain("schema_migrated");
+    });
+
+    it("fails loudly when a persisted checkpoint uses an unsupported schema version", async () => {
+      const backend = createMockMemoryBackend();
+      const executor = createExecutor({ memoryBackend: backend });
+
+      await backend.set("pipeline:p-bad", {
+        schemaVersion: 999,
+        pipelineId: "p-bad",
+        pipeline: {
+          id: "p-bad",
+          steps: [{ name: "a", tool: "tool.a", args: {} }],
+          context: { results: {} },
+          createdAt: Date.now(),
+        },
+        stepIndex: 0,
+        context: { results: {} },
+        status: "halted",
+        updatedAt: Date.now(),
+      });
+
+      await expect(executor.resume("p-bad")).rejects.toBeInstanceOf(
+        RuntimeSchemaCompatibilityError,
+      );
     });
 
     it("throws WorkflowStateError when no checkpoint found", async () => {
@@ -423,8 +585,10 @@ describe("PipelineExecutor", () => {
         toolHandler: baseHandler,
         memoryBackend: backend,
       });
+      const updatedAt = Date.now();
 
       await backend.set("pipeline:p2", {
+        schemaVersion: 1,
         pipelineId: "p2",
         pipeline: {
           id: "p2",
@@ -438,7 +602,13 @@ describe("PipelineExecutor", () => {
         stepIndex: 1,
         context: { results: { a: "old-a" } },
         status: "halted",
-        updatedAt: Date.now(),
+        updatedAt,
+        provenance: {
+          schemaVersion: 1,
+          source: "live_runtime",
+          trust: "trusted",
+          recordedAt: updatedAt,
+        },
       });
 
       const result = await executor.resume("p2", {
@@ -449,6 +619,59 @@ describe("PipelineExecutor", () => {
       expect(result.context.results["b"]).toBe("override-b");
       expect(overrideHandler).toHaveBeenCalledWith("tool.b", {});
       expect(baseHandler).not.toHaveBeenCalled();
+    });
+
+    it("emits resumed lifecycle state when continuing from a checkpoint", async () => {
+      const backend = createMockMemoryBackend();
+      const events: Array<Record<string, unknown>> = [];
+      const handler = createMockToolHandler({ "tool.b": "resumed-b" });
+      const executor = createExecutor({
+        toolHandler: handler,
+        memoryBackend: backend,
+      });
+      const updatedAt = Date.now();
+
+      await backend.set("pipeline:p3", {
+        schemaVersion: 1,
+        pipelineId: "p3",
+        pipeline: {
+          id: "p3",
+          steps: [
+            { name: "a", tool: "tool.a", args: {} },
+            { name: "b", tool: "tool.b", args: {} },
+          ],
+          context: { results: {} },
+          createdAt: Date.now(),
+        },
+        stepIndex: 1,
+        context: { results: { a: "old-a" } },
+        status: "halted",
+        updatedAt,
+        provenance: {
+          schemaVersion: 1,
+          source: "live_runtime",
+          trust: "trusted",
+          recordedAt: updatedAt,
+        },
+      });
+
+      await executor.resume("p3", {
+        onEvent: (event) => {
+          events.push(event as unknown as Record<string, unknown>);
+        },
+      });
+
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "step_state_changed",
+            pipelineId: "p3",
+            stepName: "b",
+            state: "resumed",
+            reason: "Resumed deterministic execution from step 2",
+          }),
+        ]),
+      );
     });
   });
 

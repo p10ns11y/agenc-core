@@ -30,9 +30,11 @@ export {
 
 export {
   TrajectoryReplayEngine,
+  evaluateReplayParity,
   type ReplayTaskStatus,
   type ReplayTaskState,
   type ReplaySummary,
+  type ReplayParityArtifact,
   type TrajectoryReplayResult,
   type TrajectoryReplayConfig,
 } from "./replay.js";
@@ -133,6 +135,7 @@ export {
   BenchmarkRunner,
   serializeBenchmarkArtifact,
   writeBenchmarkArtifact,
+  type BenchmarkExecutionMode,
   type BenchmarkScenarioRunArtifact,
   type BenchmarkMetricDelta,
   type BenchmarkScenarioReportArtifact,
@@ -183,6 +186,15 @@ export {
 } from "./mutation-gates.js";
 
 export {
+  ORCHESTRATION_EXPECTATION_SCHEMA_VERSION,
+  ORCHESTRATION_REGRESSION_SCENARIOS,
+  type OrchestrationRegressionCatalogEntry,
+  type OrchestrationExpectedReplay,
+  type OrchestrationBaselineMetrics,
+  type OrchestrationRegressionExpectation,
+} from "./orchestration-scenarios.js";
+
+export {
   PIPELINE_QUALITY_ARTIFACT_SCHEMA_VERSION,
   buildPipelineQualityArtifact,
   parsePipelineQualityArtifact,
@@ -197,6 +209,24 @@ export {
   type PipelineDelegationScenarioMode,
   type PipelineDelegationScenarioArtifact,
   type PipelineDelegationArtifact,
+  type PipelineOrchestrationScenarioArtifact,
+  type PipelineOrchestrationBaselineArtifact,
+  type PipelineLiveCodingScenarioArtifact,
+  type PipelineLiveCodingArtifact,
+  type PipelineSafetyAttackClass,
+  type PipelineSafetyScenarioArtifact,
+  type PipelineSafetyArtifact,
+  type PipelineLongHorizonScenarioCategory,
+  type PipelineLongHorizonScenarioArtifact,
+  type PipelineLongHorizonArtifact,
+  type PipelineImplementationGateScenarioCategory,
+  type PipelineImplementationGateExecutionMode,
+  type PipelineImplementationGateScenarioArtifact,
+  type PipelineImplementationGateArtifact,
+  type PipelineDelegatedWorkspaceGateScenarioCategory,
+  type PipelineDelegatedWorkspaceGateExecutionMode,
+  type PipelineDelegatedWorkspaceGateScenarioArtifact,
+  type PipelineDelegatedWorkspaceGateArtifact,
   type PipelineQualityArtifact,
   type PipelineContextGrowthInput,
   type PipelineToolTurnInput,
@@ -205,8 +235,44 @@ export {
   type PipelineOfflineReplayInput,
   type PipelineDelegationScenarioInput,
   type PipelineDelegationInput,
+  type PipelineOrchestrationScenarioInput,
+  type PipelineOrchestrationBaselineInput,
   type PipelineQualityArtifactInput,
 } from "./pipeline-quality.js";
+
+export {
+  evaluateEffectLedgerCompleteness,
+  type EffectLedgerCompletenessArtifact,
+} from "./effect-ledger-checks.js";
+
+export {
+  runLiveCodingSuite,
+  type PipelineLiveCodingRunnerConfig,
+} from "./live-coding-runner.js";
+
+export { runSafetySuite } from "./safety-suite.js";
+
+export {
+  runLongHorizonSuite,
+  type PipelineLongHorizonRunnerConfig,
+} from "./long-horizon-suite.js";
+
+export {
+  runImplementationGateSuite,
+  type PipelineImplementationGateSuiteConfig,
+} from "./implementation-gate-suite.js";
+
+export {
+  runDelegatedWorkspaceGateSuite,
+  type PipelineDelegatedWorkspaceGateSuiteConfig,
+} from "./delegated-workspace-gate-suite.js";
+
+export {
+  runChaosSuite,
+  type ChaosScenarioCategory,
+  type ChaosScenarioArtifact,
+  type ChaosSuiteArtifact,
+} from "./chaos-suite.js";
 
 export {
   DEFAULT_PIPELINE_QUALITY_GATE_THRESHOLDS,

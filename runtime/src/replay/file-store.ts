@@ -16,11 +16,11 @@ import {
   type ReplayTimelineRecord,
   type ReplayTimelineStore,
 } from "./types.js";
-
-interface StoredTimelineState {
-  cursor: ReplayEventCursor | null;
-  records: Array<ReplayTimelineRecord>;
-}
+import {
+  migratePersistedReplayTimelineState,
+  REPLAY_FILE_STATE_SCHEMA_VERSION,
+  type PersistedReplayTimelineState,
+} from "./migrations.js";
 
 export class FileReplayTimelineStore implements ReplayTimelineStore {
   private readonly fallback = new InMemoryReplayTimelineStore();
@@ -31,10 +31,13 @@ export class FileReplayTimelineStore implements ReplayTimelineStore {
   async save(
     records: readonly ReplayTimelineRecord[],
   ): Promise<ReplayStorageWriteResult> {
-    const state = await this.getState();
+    await this.getState();
     const result = await this.fallback.save(records);
-    state.records = [...(await this.fallback.query())];
-    await this.persist(state);
+    await this.persist({
+      schemaVersion: REPLAY_FILE_STATE_SCHEMA_VERSION,
+      cursor: await this.fallback.getCursor(),
+      records: [...(await this.fallback.query())],
+    });
     return result;
   }
 
@@ -52,13 +55,20 @@ export class FileReplayTimelineStore implements ReplayTimelineStore {
 
   async saveCursor(cursor: ReplayEventCursor | null): Promise<void> {
     const state = await this.getState();
-    state.cursor = cursor;
-    await this.persist(state);
+    await this.persist({
+      schemaVersion: REPLAY_FILE_STATE_SCHEMA_VERSION,
+      cursor,
+      records: state.records,
+    });
     await this.fallback.saveCursor(cursor);
   }
 
   async clear(): Promise<void> {
-    await this.persist({ cursor: null, records: [] });
+    await this.persist({
+      schemaVersion: REPLAY_FILE_STATE_SCHEMA_VERSION,
+      cursor: null,
+      records: [],
+    });
     await this.fallback.clear();
   }
 
@@ -76,9 +86,10 @@ export class FileReplayTimelineStore implements ReplayTimelineStore {
     await this.persist(state);
   }
 
-  private async getState(): Promise<StoredTimelineState> {
+  private async getState(): Promise<PersistedReplayTimelineState> {
     if (this.loaded) {
       return {
+        schemaVersion: REPLAY_FILE_STATE_SCHEMA_VERSION,
         cursor: await this.fallback.getCursor(),
         records: [...(await this.fallback.query())],
       };
@@ -86,7 +97,11 @@ export class FileReplayTimelineStore implements ReplayTimelineStore {
 
     await this.fallback.clear();
     if (!existsSync(this.filePath)) {
-      const empty: StoredTimelineState = { cursor: null, records: [] };
+      const empty: PersistedReplayTimelineState = {
+        schemaVersion: REPLAY_FILE_STATE_SCHEMA_VERSION,
+        cursor: null,
+        records: [],
+      };
       await this.persist(empty);
       this.loaded = true;
       return empty;
@@ -94,22 +109,29 @@ export class FileReplayTimelineStore implements ReplayTimelineStore {
 
     try {
       const raw = await readFile(this.filePath, "utf8");
-      const parsed = JSON.parse(raw) as StoredTimelineState | null;
-      const cursor = parsed?.cursor ?? null;
-      const records = Array.isArray(parsed?.records) ? [...parsed.records] : [];
+      const migration = migratePersistedReplayTimelineState(
+        JSON.parse(raw) as PersistedReplayTimelineState | null,
+      );
+      const parsed = migration.value;
+      const cursor = parsed.cursor ?? null;
+      const records = [...parsed.records];
       await this.fallback.clear();
       if (records.length > 0) {
         await this.fallback.save(records);
       }
       await this.fallback.saveCursor(cursor);
+      if (migration.migrated) {
+        await this.persist(parsed);
+      }
       this.loaded = true;
-      return {
-        cursor,
-        records,
-      };
+      return parsed;
     } catch (error) {
       if ((error as { code?: string }).code === "ENOENT") {
-        const empty: StoredTimelineState = { cursor: null, records: [] };
+        const empty: PersistedReplayTimelineState = {
+          schemaVersion: REPLAY_FILE_STATE_SCHEMA_VERSION,
+          cursor: null,
+          records: [],
+        };
         this.loaded = true;
         return empty;
       }
@@ -117,9 +139,10 @@ export class FileReplayTimelineStore implements ReplayTimelineStore {
     }
   }
 
-  private async persist(state: StoredTimelineState): Promise<void> {
+  private async persist(state: PersistedReplayTimelineState): Promise<void> {
     await mkdir(dirname(this.filePath), { recursive: true });
     const payload = JSON.stringify({
+      schemaVersion: REPLAY_FILE_STATE_SCHEMA_VERSION,
       cursor: state.cursor,
       records: state.records,
     });

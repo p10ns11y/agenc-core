@@ -81,6 +81,7 @@ function makeHealthyDelegationBenchmark(): DelegationBenchmarkSummary {
     delegatedCases: 6,
     usefulDelegations: 7,
     harmfulDelegations: 1,
+    unnecessaryDelegations: 1,
     plannerExecutionMismatches: 0,
     childTimeouts: 0,
     childFailures: 0,

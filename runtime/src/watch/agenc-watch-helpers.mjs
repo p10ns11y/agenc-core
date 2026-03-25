@@ -146,6 +146,8 @@ const BACKGROUND_RUN_STATES = new Set([
   "running",
   "working",
   "blocked",
+  "partial",
+  "needs_verification",
   "paused",
   "completed",
   "failed",

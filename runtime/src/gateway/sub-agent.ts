@@ -15,12 +15,13 @@ import type {
 } from "./session-isolation.js";
 import { createGatewayMessage } from "./message.js";
 import { ChatExecutor } from "../llm/chat-executor.js";
+import { buildModelRoutingPolicy } from "../llm/model-routing-policy.js";
 import type { PromptBudgetConfig } from "../llm/prompt-budget.js";
+import { buildRuntimeEconomicsPolicy } from "../llm/run-budget.js";
 import type {
   ChatExecutorResult,
   ToolCallRecord,
 } from "../llm/chat-executor-types.js";
-import { didToolCallFail } from "../llm/chat-executor-tool-utils.js";
 import type {
   LLMProvider,
   LLMProviderExecutionProfile,
@@ -41,10 +42,6 @@ import type {
   DelegationContractSpec,
   DelegationOutputValidationCode,
 } from "../utils/delegation-validation.js";
-import {
-  getMissingSuccessfulToolEvidenceMessage,
-  validateDelegatedOutputContract,
-} from "../utils/delegation-validation.js";
 import { SubAgentSpawnError } from "./errors.js";
 
 // ============================================================================
@@ -63,7 +60,8 @@ const DEFAULT_SUB_AGENT_SYSTEM_PROMPT =
   "You are a sub-agent. Execute only the assigned phase, stay within the provided scope, " +
   "and report the result concisely. Do not reinterpret the broader parent request into a " +
   "new multi-step plan, do not attempt sibling phases, and do not delegate unless the " +
-  "task explicitly grants that authority.";
+  "task explicitly grants that authority. Honor the declared isolation reason, " +
+  "owned artifacts, and verifier obligations for the delegated phase.";
 
 const ABORT_SENTINEL = Symbol("abort");
 const TIMEOUT_SENTINEL = Symbol("timeout");
@@ -138,7 +136,7 @@ export interface SubAgentConfig {
   readonly timeoutMs?: number;
   readonly toolBudgetPerRequest?: number;
   readonly workingDirectory?: string;
-  readonly workingDirectorySource?: "context_requirement" | "task_text";
+  readonly workingDirectorySource?: "execution_envelope";
   readonly workspace?: string;
   readonly tools?: readonly string[];
   readonly requiredCapabilities?: readonly string[];
@@ -156,6 +154,8 @@ export interface SubAgentResult {
   readonly providerEvidence?: LLMProviderEvidence;
   readonly tokenUsage?: LLMUsage;
   readonly providerName?: string;
+  readonly completionState?: ChatExecutorResult["completionState"];
+  readonly completionProgress?: ChatExecutorResult["completionProgress"];
   readonly stopReason?: ChatExecutorResult["stopReason"];
   readonly stopReasonDetail?: string;
   readonly validationCode?: DelegationOutputValidationCode;
@@ -182,6 +182,7 @@ export interface SubAgentManagerConfig {
     task: string;
     allowedToolNames?: readonly string[];
     workingDirectory?: string;
+    executionContext?: DelegationContractSpec["executionContext"];
     desktopRoutingSessionId: string;
   }) => ToolHandler;
   readonly selectLLMProvider?: (params: {
@@ -246,12 +247,13 @@ interface SubAgentHandle {
   finishedAt: number | null;
 }
 
-function mapChatStopReasonToSubAgentStatus(
-  stopReason: ChatExecutorResult["stopReason"],
-): Exclude<SubAgentStatus, "running"> {
-  if (stopReason === "completed") return "completed";
-  if (stopReason === "timeout") return "timed_out";
-  if (stopReason === "cancelled") return "cancelled";
+function mapChatCompletionToSubAgentStatus(input: {
+  readonly completionState?: ChatExecutorResult["completionState"];
+  readonly stopReason?: ChatExecutorResult["stopReason"];
+}): Exclude<SubAgentStatus, "running"> {
+  if (input.stopReason === "timeout") return "timed_out";
+  if (input.stopReason === "cancelled") return "cancelled";
+  if (input.completionState === "completed") return "completed";
   return "failed";
 }
 
@@ -386,6 +388,13 @@ export class SubAgentManager {
     };
   }
 
+  getExecutionContext(
+    sessionId: string,
+  ): DelegationContractSpec["executionContext"] | undefined {
+    this.pruneTerminalHandles();
+    return this.handles.get(sessionId)?.config.delegationSpec?.executionContext;
+  }
+
   cancel(sessionId: string): boolean {
     this.pruneTerminalHandles();
     const handle = this.handles.get(sessionId);
@@ -396,6 +405,7 @@ export class SubAgentManager {
       sessionId,
       output: "Sub-agent was cancelled",
       success: false,
+      completionState: "blocked",
       durationMs: Date.now() - handle.startedAt,
       toolCalls: [],
       tokenUsage: {
@@ -451,7 +461,7 @@ export class SubAgentManager {
       if (
         handle.parentSessionId !== parentSessionId ||
         handle.status !== "completed" ||
-        !handle.result?.success
+        handle.result?.completionState !== "completed"
       ) {
         continue;
       }
@@ -477,6 +487,7 @@ export class SubAgentManager {
           sessionId: handle.sessionId,
           output: "Sub-agent was cancelled",
           success: false,
+          completionState: "blocked",
           durationMs: Date.now() - handle.startedAt,
           toolCalls: [],
           tokenUsage: {
@@ -517,6 +528,7 @@ export class SubAgentManager {
           sessionId: handle.sessionId,
           output: `Sub-agent timed out after ${timeoutMs}ms`,
           success: false,
+          completionState: "blocked",
           durationMs: Date.now() - handle.startedAt,
           toolCalls: [],
           tokenUsage: {
@@ -567,6 +579,7 @@ export class SubAgentManager {
             output:
               `Sub-agent context startup timed out after ${startupTimeoutMs}ms`,
             success: false,
+            completionState: "blocked",
             durationMs: Date.now() - handle.startedAt,
             toolCalls: [],
             tokenUsage: {
@@ -640,6 +653,14 @@ export class SubAgentManager {
           Number.isFinite(handle.config.toolBudgetPerRequest)
           ? Math.max(1, Math.floor(handle.config.toolBudgetPerRequest))
           : undefined;
+      const economicsPolicy = buildRuntimeEconomicsPolicy({
+        sessionTokenBudget: resolvedSessionTokenBudget,
+        requestTimeoutMs: handle.config.timeoutMs,
+        childTimeoutMs: handle.config.timeoutMs,
+        childTokenBudget: resolvedSessionTokenBudget,
+        maxFanoutPerTurn: 1,
+        mode: "enforce",
+      });
       const executor = new ChatExecutor({
         providers: [selectedProvider],
         toolHandler,
@@ -650,6 +671,14 @@ export class SubAgentManager {
         sessionTokenBudget: resolvedSessionTokenBudget,
         onCompaction: this.config.onCompaction,
         delegationNestingDepth: handle.depth,
+        defaultRunClass: "child",
+        economicsPolicy,
+        modelRoutingPolicy: buildModelRoutingPolicy({
+          providers: [selectedProvider],
+          economicsPolicy,
+        }),
+        resolveHostWorkspaceRoot: () =>
+          handle.config.workingDirectory ?? null,
         ...(typeof effectiveMaxToolRounds === "number"
           ? { maxToolRounds: effectiveMaxToolRounds }
           : {}),
@@ -731,7 +760,7 @@ export class SubAgentManager {
         });
       }
 
-        const resultOrAbort = await raceAbort(
+      const resultOrAbort = await raceAbort(
         executor.execute({
           message,
           history: handle.history,
@@ -740,10 +769,11 @@ export class SubAgentManager {
           ...(typeof effectiveToolBudgetPerRequest === "number"
             ? { toolBudgetPerRequest: effectiveToolBudgetPerRequest }
             : {}),
-          requiredToolEvidence: handle.config.requireToolCall
+          requiredToolEvidence: handle.config.delegationSpec
             ? {
-              maxCorrectionAttempts: 1,
+              maxCorrectionAttempts: handle.config.requireToolCall ? 1 : 0,
               delegationSpec: handle.config.delegationSpec,
+              unsafeBenchmarkMode,
             }
             : undefined,
           ...(providerTrace ? { trace: providerTrace } : {}),
@@ -755,53 +785,15 @@ export class SubAgentManager {
       if (resultOrAbort === ABORT_SENTINEL || handle.status !== "running")
         return;
 
-      const successfulToolCalls = resultOrAbort.toolCalls.filter((toolCall) =>
-        !didToolCallFail(toolCall.isError, toolCall.result)
-      );
-      const delegatedOutputValidation =
-        handle.config.delegationSpec &&
-          resultOrAbort.stopReason === "completed" &&
-          !unsafeBenchmarkMode
-        ? validateDelegatedOutputContract({
-            spec: handle.config.delegationSpec,
-            output: resultOrAbort.content,
-            toolCalls: resultOrAbort.toolCalls,
-            providerEvidence: resultOrAbort.providerEvidence,
-            unsafeBenchmarkMode,
-          })
-          : undefined;
-      const requireToolCallFailure = handle.config.requireToolCall === true &&
-        resultOrAbort.stopReason === "completed" &&
-        successfulToolCalls.length === 0 &&
-        !delegatedOutputValidation?.error;
-      const requireToolCallFailureDetail = requireToolCallFailure
-        ? getMissingSuccessfulToolEvidenceMessage(
-          resultOrAbort.toolCalls,
-          handle.config.delegationSpec,
-          resultOrAbort.providerEvidence,
-        )
-        : undefined;
-      const enforcedStopReason = requireToolCallFailure ||
-          delegatedOutputValidation?.error
-        ? "validation_error"
-        : resultOrAbort.stopReason;
-      const enforcedStopReasonDetail = requireToolCallFailure
-        ? requireToolCallFailureDetail
-        : (delegatedOutputValidation?.error ?? resultOrAbort.stopReasonDetail);
-      const validationCode = resultOrAbort.validationCode ??
-        (delegatedOutputValidation?.error
-          ? delegatedOutputValidation.code
-          : (requireToolCallFailure
-            ? "missing_successful_tool_evidence"
-            : undefined));
-      const terminalStatus = mapChatStopReasonToSubAgentStatus(
-        enforcedStopReason,
-      );
-      const success = enforcedStopReason === "completed";
+      const terminalStatus = mapChatCompletionToSubAgentStatus({
+        completionState: resultOrAbort.completionState,
+        stopReason: resultOrAbort.stopReason,
+      });
+      const success = resultOrAbort.completionState === "completed";
       const output =
-        success || !enforcedStopReasonDetail
+        success || !resultOrAbort.stopReasonDetail
           ? resultOrAbort.content
-          : enforcedStopReasonDetail;
+          : resultOrAbort.stopReasonDetail;
 
       if (success) {
         handle.history = [
@@ -820,19 +812,22 @@ export class SubAgentManager {
         providerEvidence: resultOrAbort.providerEvidence,
         tokenUsage: resultOrAbort.tokenUsage,
         providerName: selectedProvider.name,
-        stopReason: enforcedStopReason,
-        stopReasonDetail: enforcedStopReasonDetail,
-        validationCode,
+        completionState: resultOrAbort.completionState,
+        completionProgress: resultOrAbort.completionProgress,
+        stopReason: resultOrAbort.stopReason,
+        stopReasonDetail: resultOrAbort.stopReasonDetail,
+        validationCode: resultOrAbort.validationCode,
       });
 
       if (success) {
         this.logger.info(`Sub-agent ${handle.sessionId} completed successfully`);
       } else {
         this.logger.warn(
-          `Sub-agent ${handle.sessionId} stopped before completion (${enforcedStopReason})`,
+          `Sub-agent ${handle.sessionId} stopped before completion (${resultOrAbort.stopReason})`,
           {
-            stopReason: enforcedStopReason,
-            stopReasonDetail: enforcedStopReasonDetail,
+            stopReason: resultOrAbort.stopReason,
+            stopReasonDetail: resultOrAbort.stopReasonDetail,
+            completionState: resultOrAbort.completionState,
           },
         );
       }
@@ -845,6 +840,7 @@ export class SubAgentManager {
         sessionId: handle.sessionId,
         output: failedOutput,
         success: false,
+        completionState: "blocked",
         durationMs: Date.now() - handle.startedAt,
         toolCalls: [],
         tokenUsage: {
@@ -969,6 +965,7 @@ export class SubAgentManager {
         ? [...handle.config.tools]
         : undefined,
       workingDirectory: handle.config.workingDirectory,
+      executionContext: handle.config.delegationSpec?.executionContext,
       desktopRoutingSessionId: this.resolveDesktopRoutingSessionId(
         handle.parentSessionId,
       ),

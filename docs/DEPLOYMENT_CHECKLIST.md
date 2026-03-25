@@ -55,22 +55,26 @@ All checks PASS
 - [ ] Dependencies installed
 
 **Steps**
-1. LiteSVM fast integration suite:
+1. Run the default required runtime validation lane from the `agenc-core` root:
    ```bash
-   npm run test:fast
+   npm run validate:runtime
    ```
-2. Runtime unit tests:
-   ```bash
-   cd runtime && npm run test
-   ```
-3. Runtime mutation gates:
-   ```bash
-   cd runtime && npm run mutation:ci && npm run mutation:gates
-   ```
-4. Runtime pipeline quality suite + gates:
-   ```bash
-   cd runtime && npm run benchmark:pipeline:ci && npm run benchmark:pipeline:gates
-   ```
+
+This is the same runtime gate lane enforced by the default PR validation workflows.
+
+**Runtime gates included in `npm run validate:runtime`**
+- Runtime unit/regression suite (`npm --prefix runtime run test`)
+- Runtime mutation artifact + gate evaluation
+- Runtime pipeline quality artifact + gate evaluation
+- Runtime delegation quality artifact + gate evaluation
+- Runtime background-run quality artifact + gate evaluation
+- Runtime autonomy rollout gates
+
+**Optional deeper local checks**
+- LiteSVM fast integration suite:
+  ```bash
+  npm run test:fast
+  ```
 
 ### Build artifact verification (verifiable build)
 
@@ -95,7 +99,9 @@ All checks PASS
 - [ ] Replay failure is observed when either `bindingSpend` or `nullifierSpend` already exists
 - [ ] Trusted-selector mismatch and trusted-image mismatch fail closed
 - [ ] Pipeline quality artifact (`runtime/benchmarks/artifacts/pipeline-quality.ci.json`) is generated and reviewed
+- [ ] Background-run quality artifact (`runtime/benchmarks/artifacts/background-run-quality.ci.json`) is generated and reviewed
 - [ ] Pipeline gates report `PASS` for context growth, tool-turn forwarding, desktop timeout regressions, and token-efficiency thresholds
+- [ ] Background-run gates and autonomy rollout gates report `PASS`
 
 ## Rollback plan
 
@@ -106,5 +112,5 @@ If any private verification gate fails:
 3. Patch config/code and rerun:
    - `anchor build`
    - `npm --prefix sdk test`
-   - `npm --prefix runtime test`
+   - `npm run validate:runtime`
 4. Resume deployment only after all checks pass.

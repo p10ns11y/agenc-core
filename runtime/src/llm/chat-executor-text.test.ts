@@ -5,6 +5,7 @@ import {
   generateFallbackContent,
   reconcileDirectShellObservationContent,
   reconcileExactResponseContract,
+  reconcileTerminalCompletionStateContent,
   reconcileStructuredToolOutcome,
   reconcileVerifiedFileWorkflowContent,
   reconcileTerminalFailureContent,
@@ -116,6 +117,49 @@ describe("chat-executor-text", () => {
     );
 
     expect(content).toBe("Current directory: /workspace");
+  });
+
+  it("rewrites contradictory success copy when the honest state is needs_verification", () => {
+    const content = reconcileTerminalCompletionStateContent({
+      content:
+        "Implemented. The shell is fully functional and matches the spec.",
+      completionState: "needs_verification",
+      stopReason: "completed",
+      toolCalls: [
+        {
+          name: "system.writeFile",
+          args: { path: "/workspace/src/main.c" },
+          result: JSON.stringify({ ok: true }),
+          isError: false,
+          durationMs: 7,
+        },
+      ],
+    });
+
+    expect(content).toContain("needs verification");
+    expect(content).not.toContain("fully functional");
+  });
+
+  it("keeps explicit partial summaries honest when the run only partially completed", () => {
+    const content = reconcileTerminalCompletionStateContent({
+      content:
+        "Partial implementation complete: parser and build files are in place, but pipelines remain unfinished.",
+      completionState: "partial",
+      stopReason: "validation_error",
+      stopReasonDetail: "Behavior checks still missing",
+      toolCalls: [
+        {
+          name: "system.writeFile",
+          args: { path: "/workspace/src/parser.c" },
+          result: JSON.stringify({ ok: true }),
+          isError: false,
+          durationMs: 9,
+        },
+      ],
+    });
+
+    expect(content).toContain("Partial implementation");
+    expect(content).toContain("Behavior checks still missing");
   });
 
   it("reconciles verified file workflow output when final synthesis mangles the absolute path", () => {

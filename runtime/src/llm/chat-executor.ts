@@ -20,6 +20,7 @@ import type {
   StreamProgressCallback,
   ToolHandler,
 } from "./types.js";
+import type { ArtifactCompactionState } from "../memory/artifact-store.js";
 import type { DelegationOutputValidationCode } from "../utils/delegation-validation.js";
 import type {
   PromptBudgetConfig,
@@ -36,6 +37,13 @@ import type {
   PipelineResult,
 } from "../workflow/pipeline.js";
 import type { HostToolingProfile } from "../gateway/host-tooling.js";
+import { resolveWorkflowCompletionState } from "../workflow/completion-state.js";
+import { deriveWorkflowProgressSnapshot } from "../workflow/completion-progress.js";
+import {
+  buildModelRoutingPolicy,
+  resolveModelRoute,
+  type ModelRoutingPolicy,
+} from "./model-routing-policy.js";
 import {
   resolveDelegationDecisionConfig,
   type ResolvedDelegationDecisionConfig,
@@ -77,6 +85,16 @@ import type {
   ExecutionContext,
 } from "./chat-executor-types.js";
 import {
+  buildDelegationBudgetSnapshot,
+  buildRuntimeEconomicsPolicy,
+  buildRuntimeEconomicsSummary,
+  getRuntimeBudgetPressure,
+  mapPhaseToRunClass,
+  recordRuntimeModelCall,
+  type RuntimeEconomicsPolicy,
+  type RuntimeRunClass,
+} from "./run-budget.js";
+import {
   MAX_EVAL_USER_CHARS,
   MAX_EVAL_RESPONSE_CHARS,
   MAX_CONTEXT_INJECTION_CHARS,
@@ -102,6 +120,7 @@ import {
   canRetryDelegatedOutputWithoutAdditionalToolCalls,
   resolveCorrectionAllowedToolNames,
   resolveExecutionToolContractGuidance,
+  resolveLegacyCompletionCompatibility,
   validateRequiredToolEvidence,
 } from "./chat-executor-contract-flow.js";
 import type { ToolContractGuidance } from "./chat-executor-contract-guidance.js";
@@ -114,6 +133,8 @@ import {
   resolveEffectiveRoutedToolNames,
 } from "./chat-executor-routing-state.js";
 import { ToolFailureCircuitBreaker } from "./tool-failure-circuit-breaker.js";
+import { compactHistoryIntoArtifactContext } from "./context-compaction.js";
+import { selectRelevantArtifactRefs } from "./context-pruning.js";
 
 function shouldUseSessionStatefulContinuationForPhase(
   phase: ChatCallUsageRecord["phase"],
@@ -237,6 +258,7 @@ import {
   sanitizeFinalContent,
   reconcileDirectShellObservationContent,
   reconcileExactResponseContract,
+  reconcileTerminalCompletionStateContent,
   reconcileVerifiedFileWorkflowContent,
   reconcileStructuredToolOutcome,
   reconcileTerminalFailureContent,
@@ -343,6 +365,10 @@ export class ChatExecutor {
   private readonly retryPolicyMatrix: LLMRetryPolicyMatrix;
   private readonly toolFailureBreaker: ToolFailureCircuitBreaker;
   private readonly resolveHostToolingProfile?: () => HostToolingProfile | null;
+  private readonly resolveHostWorkspaceRoot?: () => string | null;
+  private readonly economicsPolicy: RuntimeEconomicsPolicy;
+  private readonly modelRoutingPolicy: ModelRoutingPolicy;
+  private readonly defaultRunClass?: RuntimeRunClass;
 
   private readonly cooldowns = new Map<string, CooldownEntry>();
   private readonly sessionTokens = new Map<string, number>();
@@ -405,6 +431,7 @@ export class ChatExecutor {
     );
     this.resolveDelegationScoreThreshold = config.resolveDelegationScoreThreshold;
     this.resolveHostToolingProfile = config.resolveHostToolingProfile;
+    this.resolveHostWorkspaceRoot = config.resolveHostWorkspaceRoot;
     this.subagentVerifierConfig = ChatExecutor.resolveSubagentVerifierConfig(
       config.subagentVerifier,
     );
@@ -461,6 +488,17 @@ export class ChatExecutor {
       ),
       maxTrackedSessions: this.maxTrackedSessions,
     });
+    this.economicsPolicy = config.economicsPolicy ?? buildRuntimeEconomicsPolicy({
+      sessionTokenBudget: this.sessionTokenBudget,
+      plannerMaxTokens: this.plannerMaxTokens,
+      requestTimeoutMs: this.requestTimeoutMs,
+      mode: "enforce",
+    });
+    this.modelRoutingPolicy = config.modelRoutingPolicy ?? buildModelRoutingPolicy({
+      providers: this.providers,
+      economicsPolicy: this.economicsPolicy,
+    });
+    this.defaultRunClass = config.defaultRunClass;
   }
 
   private static resolveSubagentVerifierConfig(
@@ -508,13 +546,18 @@ export class ChatExecutor {
       await this.executeToolCallLoop(ctx);
     }
 
+    this.enforceLegacyCompletionCompatibilityBeforeFinalization(ctx);
+
     this.checkRequestTimeout(ctx, "finalization");
     this.trackTokenUsage(ctx.sessionId, ctx.cumulativeUsage.totalTokens);
+    this.synchronizeCompletionState(ctx);
 
     // Optional response evaluation (critic)
-    if (this.evaluator && ctx.finalContent && ctx.stopReason === "completed") {
+    if (this.evaluator && ctx.finalContent && ctx.completionState === "completed") {
       await this.evaluateAndRetryResponse(ctx);
     }
+
+    this.synchronizeCompletionState(ctx);
 
     // Finalization, trajectory recording, bandit outcome
     const { plannerSummary, durationMs } = this.recordOutcomeAndFinalize(ctx);
@@ -550,6 +593,13 @@ export class ChatExecutor {
       stopReasonDetail: ctx.stopReasonDetail,
       toolCalls: ctx.allToolCalls,
     });
+    ctx.finalContent = reconcileTerminalCompletionStateContent({
+      content: ctx.finalContent,
+      completionState: ctx.completionState,
+      stopReason: ctx.stopReason,
+      stopReasonDetail: ctx.stopReasonDetail,
+      toolCalls: ctx.allToolCalls,
+    });
     ctx.finalContent = sanitizeFinalContent(ctx.finalContent);
 
     return {
@@ -574,7 +624,25 @@ export class ChatExecutor {
         }
         : undefined,
       plannerSummary,
+      economicsSummary: buildRuntimeEconomicsSummary(
+        this.economicsPolicy,
+        ctx.economicsState,
+      ),
       stopReason: ctx.stopReason,
+      completionState: ctx.completionState,
+      completionProgress: deriveWorkflowProgressSnapshot({
+        stopReason: ctx.stopReason,
+        completionState: ctx.completionState,
+        stopReasonDetail: ctx.stopReasonDetail,
+        validationCode: ctx.validationCode,
+        toolCalls: ctx.allToolCalls,
+        plannerUsed: ctx.plannerSummaryState.used,
+        deterministicStepsExecuted:
+          ctx.plannerSummaryState.deterministicStepsExecuted,
+        verificationContract: ctx.requiredToolEvidence?.verificationContract,
+        completionContract: ctx.requiredToolEvidence?.completionContract,
+        updatedAt: Date.now(),
+      }),
       stopReasonDetail: ctx.stopReasonDetail,
       validationCode: ctx.validationCode,
       evaluation: ctx.evaluation,
@@ -609,6 +677,23 @@ export class ChatExecutor {
     }
   }
 
+  private synchronizeCompletionState(ctx: ExecutionContext): void {
+    ctx.completionState = resolveWorkflowCompletionState({
+      stopReason: ctx.stopReason,
+      toolCalls: ctx.allToolCalls,
+      plannerUsed: ctx.plannerSummaryState.used,
+      deterministicStepsExecuted:
+        ctx.plannerSummaryState.deterministicStepsExecuted,
+      verificationContract: ctx.requiredToolEvidence?.verificationContract,
+      completionContract: ctx.requiredToolEvidence?.completionContract,
+      validationCode: ctx.validationCode,
+      verifier: {
+        performed: ctx.plannerSummaryState.subagentVerification.performed,
+        overall: ctx.plannerSummaryState.subagentVerification.overall,
+      },
+    });
+  }
+
   private timeoutDetail(
     stage: string,
     requestTimeoutMs = this.requestTimeoutMs,
@@ -640,6 +725,46 @@ export class ChatExecutor {
     if (ctx.modelCalls === 0) return true;
     if (ctx.effectiveMaxModelRecalls <= 0) return true;
     return ctx.modelCalls - 1 < ctx.effectiveMaxModelRecalls;
+  }
+
+  private resolveRunClassForPhase(
+    ctx: ExecutionContext,
+    phase: ChatCallUsageRecord["phase"],
+  ): RuntimeRunClass {
+    return ctx.defaultRunClass ?? this.defaultRunClass ?? mapPhaseToRunClass(phase);
+  }
+
+  private resolveRoutingDecision(
+    ctx: ExecutionContext,
+    phase: ChatCallUsageRecord["phase"],
+  ) {
+    const runClass = this.resolveRunClassForPhase(ctx, phase);
+    const pressure = getRuntimeBudgetPressure(
+      this.economicsPolicy,
+      ctx.economicsState,
+      runClass,
+    );
+    return {
+      runClass,
+      pressure,
+      route: resolveModelRoute({
+        policy: this.modelRoutingPolicy,
+        runClass,
+        pressure,
+        degradedProviderNames: this.buildDegradedProviderNames(),
+      }),
+    };
+  }
+
+  private buildDegradedProviderNames(): readonly string[] {
+    const now = Date.now();
+    const names: string[] = [];
+    for (const [providerName, cooldown] of this.cooldowns.entries()) {
+      if (cooldown.availableAt > now) {
+        names.push(providerName);
+      }
+    }
+    return names;
   }
 
   private getRemainingRequestMs(ctx: ExecutionContext): number {
@@ -690,6 +815,15 @@ export class ChatExecutor {
       | "planner_verifier_round_finished",
     payload: Record<string, unknown>,
   ): void {
+    if (type === "planner_path_finished") {
+      this.synchronizeCompletionState(ctx);
+      if (payload.completionState === undefined) {
+        payload = {
+          ...payload,
+          completionState: ctx.completionState,
+        };
+      }
+    }
     this.emitExecutionTrace(ctx, {
       type,
       phase: "planner",
@@ -702,6 +836,25 @@ export class ChatExecutor {
     ctx: ExecutionContext,
     event: PipelineExecutionEvent,
   ): void {
+    if (event.type === "step_state_changed") {
+      this.emitExecutionTrace(ctx, {
+        type: "planner_step_state_changed",
+        phase: "planner",
+        callIndex: ctx.callIndex + 1,
+        payload: {
+          pipelineId: event.pipelineId,
+          stepName: event.stepName,
+          stepIndex: event.stepIndex,
+          state: event.state,
+          previousState: event.previousState,
+          tool: event.tool,
+          args: event.args,
+          reason: event.reason,
+          blockingDependencies: event.blockingDependencies,
+        },
+      });
+      return;
+    }
     if (event.type === "step_started") {
       this.emitExecutionTrace(ctx, {
         type: "tool_dispatch_started",
@@ -1255,6 +1408,77 @@ export class ChatExecutor {
     return true;
   }
 
+  private enforceLegacyCompletionCompatibilityBeforeFinalization(
+    ctx: ExecutionContext,
+  ): void {
+    if (ctx.stopReason !== "completed") {
+      return;
+    }
+    if (
+      ctx.requiredToolEvidence?.verificationContract ||
+      ctx.requiredToolEvidence?.completionContract
+    ) {
+      this.emitExecutionTrace(ctx, {
+        type: "completion_gate_checked",
+        phase: "tool_followup",
+        callIndex: ctx.callIndex,
+        payload: {
+          gate: "legacy_completion_compatibility",
+          decision: "not_required",
+          reason: "workflow_verification_contract_present",
+        },
+      });
+      return;
+    }
+    if (ctx.requiredToolEvidence?.delegationSpec) {
+      this.emitExecutionTrace(ctx, {
+        type: "completion_gate_checked",
+        phase: "tool_followup",
+        callIndex: ctx.callIndex,
+        payload: {
+          gate: "legacy_completion_compatibility",
+          decision: "not_required",
+          reason: "delegated_child_output_contract_present",
+        },
+      });
+      return;
+    }
+    if (
+      ctx.plannerSummaryState.subagentVerification.performed === true &&
+      ctx.plannerSummaryState.subagentVerification.overall === "pass"
+    ) {
+      this.emitExecutionTrace(ctx, {
+        type: "completion_gate_checked",
+        phase: "tool_followup",
+        callIndex: ctx.callIndex,
+        payload: {
+          gate: "legacy_completion_compatibility",
+          decision: "not_required",
+          reason: "planner_verifier_passed",
+        },
+      });
+      return;
+    }
+
+    const decision = resolveLegacyCompletionCompatibility({ ctx });
+    this.emitExecutionTrace(ctx, {
+      type: "completion_gate_checked",
+      phase: "tool_followup",
+      callIndex: ctx.callIndex,
+      payload: {
+        gate: "legacy_completion_compatibility",
+        decision: decision.allowed ? "accept" : "fail",
+        compatibilityClass: decision.compatibilityClass,
+        reason: decision.reason,
+      },
+    });
+    if (decision.allowed) {
+      return;
+    }
+    this.setStopReason(ctx, "validation_error", decision.reason);
+    ctx.finalContent = decision.reason;
+  }
+
   private async callModelForPhase(
     ctx: ExecutionContext,
     input: {
@@ -1308,6 +1532,18 @@ export class ChatExecutor {
     const effectiveCallSections = groundingMessage && input.callSections
       ? [...input.callSections, "system_runtime" as const]
       : input.callSections;
+    const routingDecision = this.resolveRoutingDecision(ctx, input.phase);
+    if (
+      this.economicsPolicy.mode === "enforce" &&
+      routingDecision.pressure.hardExceeded
+    ) {
+      this.setStopReason(
+        ctx,
+        "budget_exceeded",
+        `${routingDecision.runClass} budget ceiling reached before ${input.phase} model call`,
+      );
+      return undefined;
+    }
     this.emitExecutionTrace(ctx, {
       type: "model_call_prepared",
       phase: input.phase,
@@ -1335,6 +1571,16 @@ export class ChatExecutor {
         groundingMessageAdded: Boolean(groundingMessage),
         activeRouteMisses: ctx.routedToolMisses,
         routedToolsExpanded: ctx.routedToolsExpanded,
+        economicsRunClass: routingDecision.runClass,
+        providerRoute: routingDecision.route.providers.map((provider) => provider.name),
+        providerRouteReason: routingDecision.route.reason,
+        budgetPressure: {
+          tokenRatio: Number(routingDecision.pressure.tokenRatio.toFixed(4)),
+          latencyRatio: Number(routingDecision.pressure.latencyRatio.toFixed(4)),
+          spendRatio: Number(routingDecision.pressure.spendRatio.toFixed(4)),
+          hardExceeded: routingDecision.pressure.hardExceeded,
+          downgraded: routingDecision.route.downgraded,
+        },
       },
     });
     let next: FallbackResult;
@@ -1372,6 +1618,7 @@ export class ChatExecutor {
               callPhase: input.phase,
             }
             : {}),
+          providersOverride: routingDecision.route.providers,
         },
       );
     } catch (error) {
@@ -1391,12 +1638,30 @@ export class ChatExecutor {
     );
     if (next.usedFallback) ctx.usedFallback = true;
     this.accumulateUsage(ctx.cumulativeUsage, next.response.usage);
+    recordRuntimeModelCall({
+      policy: this.economicsPolicy,
+      state: ctx.economicsState,
+      runClass: routingDecision.runClass,
+      provider: next.providerName,
+      model: next.response.model,
+      usage: next.response.usage,
+      durationMs: next.durationMs,
+      rerouted: routingDecision.route.rerouted || next.usedFallback,
+      downgraded: routingDecision.route.downgraded,
+      phase: input.phase,
+      reason: routingDecision.route.reason,
+    });
+    ctx.delegationBudgetSnapshot = buildDelegationBudgetSnapshot(
+      this.economicsPolicy,
+      ctx.economicsState,
+    );
     ctx.callUsage.push(
       this.createCallUsageRecord({
         callIndex: ++ctx.callIndex,
         phase: input.phase,
         providerName: next.providerName,
         response: next.response,
+        durationMs: next.durationMs,
         beforeBudget: next.beforeBudget,
         afterBudget: next.afterBudget,
         budgetDiagnostics: next.budgetDiagnostics,
@@ -1533,11 +1798,19 @@ export class ChatExecutor {
 
     // Pre-check token budget — attempt compaction instead of hard fail
     let compacted = false;
+    let compactedArtifactContext = params.stateful?.artifactContext;
     if (this.sessionTokenBudget !== undefined) {
       const used = this.sessionTokens.get(sessionId) ?? 0;
       if (used >= this.sessionTokenBudget) {
         try {
-          history = await this.compactHistory(history, sessionId, params.trace);
+          const compactedResult = await this.compactHistory(
+            history,
+            sessionId,
+            params.trace,
+            params.stateful?.artifactContext,
+          );
+          history = compactedResult.history;
+          compactedArtifactContext = compactedResult.artifactContext;
           this.resetSessionTokens(sessionId);
           compacted = true;
         } catch {
@@ -1563,7 +1836,16 @@ export class ChatExecutor {
         toolHandler: params.toolHandler ?? this.toolHandler,
         streamCallback: params.onStreamChunk ?? this.onStreamChunk,
         toolRouting: params.toolRouting,
-        stateful: params.stateful,
+        stateful:
+          params.stateful || compactedArtifactContext
+            ? {
+                ...params.stateful,
+                ...(compacted ? { historyCompacted: true } : {}),
+                ...(compactedArtifactContext
+                  ? { artifactContext: compactedArtifactContext }
+                  : {}),
+              }
+            : undefined,
         trace: params.trace,
         requiredToolEvidence: params.requiredToolEvidence,
         initialRoutedToolNames,
@@ -1583,25 +1865,32 @@ export class ChatExecutor {
         subagentVerifierEnabled: this.subagentVerifierConfig.enabled,
         delegationBanditTunerEnabled: Boolean(this.delegationBanditTuner),
         delegationScoreThreshold: this.delegationDecisionConfig.scoreThreshold,
+        defaultRunClass: this.defaultRunClass,
+        economicsPolicy: this.economicsPolicy,
       },
     );
 
     // Build messages array with explicit section tags for prompt budgeting.
     this.pushMessage(ctx, { role: "system", content: ctx.systemPrompt }, "system_anchor");
 
+    const enableSkillContext = params.contextInjection?.skills !== false;
+    const enableMemoryContext = params.contextInjection?.memory !== false;
+
     // Context injection — skill, memory, and learning (all best-effort)
-    await this.injectContext(
-      ctx,
-      this.skillInjector,
-      ctx.messageText,
-      ctx.sessionId,
-      ctx.messages,
-      ctx.messageSections,
-      "system_runtime",
-    );
+    if (enableSkillContext) {
+      await this.injectContext(
+        ctx,
+        this.skillInjector,
+        ctx.messageText,
+        ctx.sessionId,
+        ctx.messages,
+        ctx.messageSections,
+        "system_runtime",
+      );
+    }
     // Session-scoped persistence should not bleed into truly fresh chats.
     // For the first turn, only inject static skill context.
-    if (ctx.hasHistory) {
+    if (enableMemoryContext && ctx.hasHistory) {
       await this.injectContext(
         ctx,
         this.memoryRetriever,
@@ -1629,6 +1918,32 @@ export class ChatExecutor {
         ctx.messageSections,
         "memory_working",
       );
+    }
+
+    if (ctx.stateful?.artifactContext?.artifactRefs?.length) {
+      const artifactLines = selectRelevantArtifactRefs({
+        artifacts: ctx.stateful.artifactContext.artifactRefs,
+        query: ctx.messageText,
+        maxChars: Math.max(
+          600,
+          Math.floor(
+            (this.promptBudget.hardMaxPromptChars ?? MAX_PROMPT_CHARS_BUDGET) *
+              0.08,
+          ),
+        ),
+      });
+      if (artifactLines.length > 0) {
+        this.pushMessage(
+          ctx,
+          {
+            role: "system",
+            content: `Compacted artifact context:\n${artifactLines
+              .map((line) => `- ${line}`)
+              .join("\n")}`,
+          },
+          "memory_working",
+        );
+      }
     }
 
     // Append history and user message
@@ -1661,7 +1976,7 @@ export class ChatExecutor {
     const durationMs = Date.now() - ctx.startTime;
     const verifierSnapshot = ctx.plannerSummaryState.subagentVerification;
     const qualityProxy = computeQualityProxy({
-      stopReason: ctx.stopReason,
+      completionState: ctx.completionState,
       verifierPerformed: verifierSnapshot.performed,
       verifierOverall: verifierSnapshot.overall,
       evaluation: ctx.evaluation,
@@ -1672,7 +1987,7 @@ export class ChatExecutor {
       tokenCost: ctx.cumulativeUsage.totalTokens,
       latencyMs: durationMs,
       errorCount:
-        ctx.failedToolCalls + (ctx.stopReason === "completed" ? 0 : 1),
+        ctx.failedToolCalls + (ctx.completionState === "completed" ? 0 : 1),
     });
     const estimatedRecallsAvoided = ctx.plannerSummaryState.used
       ? Math.max(
@@ -1685,7 +2000,7 @@ export class ChatExecutor {
       ctx.plannerSummaryState.delegationDecision?.shouldDelegate === true;
     const usefulnessProxy = computeUsefulDelegationProxy({
       delegated: delegatedThisTurn,
-      stopReason: ctx.stopReason,
+      completionState: ctx.completionState,
       failedToolCalls: ctx.failedToolCalls,
       estimatedRecallsAvoided,
       verifier: {
@@ -1772,6 +2087,7 @@ export class ChatExecutor {
       }
 
       const evalResult = await this.evaluateResponse(
+        ctx,
         currentContent,
         ctx.messageText,
         ctx.trace,
@@ -1781,12 +2097,30 @@ export class ChatExecutor {
       if (evalResult.usedFallback) ctx.usedFallback = true;
       this.accumulateUsage(ctx.cumulativeUsage, evalResult.response.usage);
       this.trackTokenUsage(ctx.sessionId, evalResult.response.usage.totalTokens);
+      recordRuntimeModelCall({
+        policy: this.economicsPolicy,
+        state: ctx.economicsState,
+        runClass: this.resolveRunClassForPhase(ctx, "evaluator"),
+        provider: evalResult.providerName,
+        model: evalResult.response.model,
+        usage: evalResult.response.usage,
+        durationMs: evalResult.durationMs,
+        rerouted: evalResult.rerouted,
+        downgraded: evalResult.downgraded,
+        phase: "evaluator",
+        reason: evalResult.routeReason,
+      });
+      ctx.delegationBudgetSnapshot = buildDelegationBudgetSnapshot(
+        this.economicsPolicy,
+        ctx.economicsState,
+      );
       ctx.callUsage.push(
         this.createCallUsageRecord({
           callIndex: ++ctx.callIndex,
           phase: "evaluator",
           providerName: evalResult.providerName,
           response: evalResult.response,
+          durationMs: evalResult.durationMs,
           beforeBudget: evalResult.beforeBudget,
           afterBudget: evalResult.afterBudget,
           budgetDiagnostics: evalResult.budgetDiagnostics,
@@ -1830,6 +2164,10 @@ export class ChatExecutor {
       if (this.checkRequestTimeout(ctx, "evaluator retry")) {
         break;
       }
+      const retryRoutingDecision = this.resolveRoutingDecision(
+        ctx,
+        "evaluator_retry",
+      );
       let retry: FallbackResult;
       try {
         retry = await this.callWithFallback(
@@ -1851,6 +2189,7 @@ export class ChatExecutor {
                 callPhase: "evaluator_retry" as const,
               }
               : {}),
+            providersOverride: retryRoutingDecision.route.providers,
           },
         );
       } catch (error) {
@@ -1864,12 +2203,30 @@ export class ChatExecutor {
       ctx.modelCalls++;
       this.accumulateUsage(ctx.cumulativeUsage, retry.response.usage);
       this.trackTokenUsage(ctx.sessionId, retry.response.usage.totalTokens);
+      recordRuntimeModelCall({
+        policy: this.economicsPolicy,
+        state: ctx.economicsState,
+        runClass: this.resolveRunClassForPhase(ctx, "evaluator_retry"),
+        provider: retry.providerName,
+        model: retry.response.model,
+        usage: retry.response.usage,
+        durationMs: retry.durationMs,
+        rerouted: retryRoutingDecision.route.rerouted || retry.usedFallback,
+        downgraded: retryRoutingDecision.route.downgraded,
+        phase: "evaluator_retry",
+        reason: retryRoutingDecision.route.reason,
+      });
+      ctx.delegationBudgetSnapshot = buildDelegationBudgetSnapshot(
+        this.economicsPolicy,
+        ctx.economicsState,
+      );
       ctx.callUsage.push(
         this.createCallUsageRecord({
           callIndex: ++ctx.callIndex,
           phase: "evaluator_retry",
           providerName: retry.providerName,
           response: retry.response,
+          durationMs: retry.durationMs,
           beforeBudget: retry.beforeBudget,
           afterBudget: retry.afterBudget,
           budgetDiagnostics: retry.budgetDiagnostics,
@@ -1935,6 +2292,7 @@ export class ChatExecutor {
       allowedTools: this.allowedTools,
       delegationBanditTuner: this.delegationBanditTuner,
       resolveHostToolingProfile: this.resolveHostToolingProfile,
+      resolveHostWorkspaceRoot: this.resolveHostWorkspaceRoot,
     }, {
       emitPlannerTrace: (c, type, payload) => this.emitPlannerTrace(c, type, payload),
       setStopReason: (c, reason, detail) => this.setStopReason(c, reason, detail),
@@ -1983,6 +2341,7 @@ export class ChatExecutor {
     onStreamChunk?: StreamProgressCallback,
     messageSections?: readonly PromptBudgetSection[],
     options?: {
+      providersOverride?: readonly LLMProvider[];
       statefulSessionId?: string;
       statefulResumeAnchor?: LLMStatefulResumeAnchor;
       statefulHistoryCompacted?: boolean;
@@ -1996,9 +2355,10 @@ export class ChatExecutor {
       callPhase?: ChatCallUsageRecord["phase"];
     },
   ): Promise<FallbackResult> {
-    return callWithFallbackFn(
+    const startedAt = Date.now();
+    const result = await callWithFallbackFn(
       {
-        providers: this.providers,
+        providers: options?.providersOverride ?? this.providers,
         cooldowns: this.cooldowns,
         promptBudget: this.promptBudget,
         retryPolicyMatrix: this.retryPolicyMatrix,
@@ -2010,6 +2370,10 @@ export class ChatExecutor {
       messageSections,
       options,
     );
+    return {
+      ...result,
+      durationMs: Math.max(1, Date.now() - startedAt),
+    };
   }
 
 
@@ -2153,6 +2517,7 @@ export class ChatExecutor {
     beforeBudget: ChatPromptShape;
     afterBudget: ChatPromptShape;
     budgetDiagnostics?: PromptBudgetDiagnostics;
+    durationMs: number;
   }): ChatCallUsageRecord {
     return {
       callIndex: input.callIndex,
@@ -2161,6 +2526,7 @@ export class ChatExecutor {
       model: input.response.model,
       finishReason: input.response.finishReason,
       usage: input.response.usage,
+      durationMs: input.durationMs,
       beforeBudget: input.beforeBudget,
       afterBudget: input.afterBudget,
       providerRequestMetrics: input.response.requestMetrics,
@@ -2176,6 +2542,7 @@ export class ChatExecutor {
 
 
   private async evaluateResponse(
+    ctx: ExecutionContext,
     content: string,
     userMessage: string,
     trace?: ChatExecuteParams["trace"],
@@ -2186,11 +2553,16 @@ export class ChatExecutor {
     response: LLMResponse;
     providerName: string;
     usedFallback: boolean;
+    durationMs: number;
+    rerouted: boolean;
+    downgraded: boolean;
+    routeReason: string;
     beforeBudget: ChatPromptShape;
     afterBudget: ChatPromptShape;
     budgetDiagnostics: PromptBudgetDiagnostics;
   }> {
     const rubric = this.evaluator?.rubric ?? DEFAULT_EVAL_RUBRIC;
+    const routingDecision = this.resolveRoutingDecision(ctx, "evaluator");
     let fallbackResult: FallbackResult;
     try {
       fallbackResult = await this.callWithFallback([
@@ -2207,6 +2579,7 @@ export class ChatExecutor {
             callPhase: "evaluator" as const,
           }
           : {}),
+        providersOverride: routingDecision.route.providers,
       });
     } catch (error) {
       throw annotateFailureError(error, "response evaluation").error;
@@ -2234,6 +2607,10 @@ export class ChatExecutor {
         response,
         providerName,
         usedFallback,
+        durationMs: fallbackResult.durationMs,
+        rerouted: routingDecision.route.rerouted || fallbackResult.usedFallback,
+        downgraded: routingDecision.route.downgraded,
+        routeReason: routingDecision.route.reason,
         beforeBudget,
         afterBudget,
         budgetDiagnostics,
@@ -2245,6 +2622,10 @@ export class ChatExecutor {
         response,
         providerName,
         usedFallback,
+        durationMs: fallbackResult.durationMs,
+        rerouted: routingDecision.route.rerouted || fallbackResult.usedFallback,
+        downgraded: routingDecision.route.downgraded,
+        routeReason: routingDecision.route.reason,
         beforeBudget,
         afterBudget,
         budgetDiagnostics,
@@ -2262,75 +2643,84 @@ export class ChatExecutor {
     history: readonly LLMMessage[],
     sessionId: string,
     trace?: ChatExecuteParams["trace"],
-  ): Promise<LLMMessage[]> {
-    if (history.length <= 5) return [...history];
+    existingArtifactContext?: ArtifactCompactionState,
+  ): Promise<{ history: readonly LLMMessage[]; artifactContext?: ArtifactCompactionState }> {
+    if (history.length <= 5) {
+      return {
+        history: [...history],
+        artifactContext: existingArtifactContext,
+      };
+    }
 
-    const keepCount = 5;
-    const toSummarize = history.slice(0, history.length - keepCount);
-    const toKeep = history.slice(-keepCount);
-
+    let narrativeSummary: string | undefined;
+    const toSummarize = history.slice(0, history.length - 5);
     let historyText = toSummarize
-      .map((m) => {
+      .map((message) => {
         const content =
-          typeof m.content === "string"
-            ? m.content
-            : (m.content as Array<{ type: string; text?: string }>)
-                .filter(
-                  (p): p is { type: "text"; text: string } =>
-                    p.type === "text",
-                )
-                .map((p) => p.text)
+          typeof message.content === "string"
+            ? message.content
+            : message.content
+                .filter((part): part is { type: "text"; text: string } => part.type === "text")
+                .map((part) => part.text)
                 .join(" ");
-        return `[${m.role}] ${content.slice(0, 500)}`;
+        return `[${message.role}] ${content.slice(0, 500)}`;
       })
       .join("\n");
-
     if (historyText.length > MAX_COMPACT_INPUT) {
       historyText = historyText.slice(-MAX_COMPACT_INPUT);
     }
-
-    let compactResponse: FallbackResult;
     try {
-      compactResponse = await this.callWithFallback([
+      const compactResponse = await this.callWithFallback(
+        [
+          {
+            role: "system",
+            content:
+              "Summarize only the durable task state from this history. Preserve key decisions, important tool outcomes, current artifacts, and unresolved work. Omit pleasantries.",
+          },
+          { role: "user", content: historyText },
+        ],
+        undefined,
+        undefined,
         {
-          role: "system",
-          content:
-            "Summarize this conversation history concisely. Preserve: key decisions made, " +
-            "tool results and their outcomes, unresolved questions, and important context. " +
-            "Omit pleasantries and redundant exchanges. Output only the summary.",
+          ...(trace
+            ? {
+                trace,
+                callIndex: 0,
+                callPhase: "compaction" as const,
+              }
+            : {}),
         },
-        { role: "user", content: historyText },
-      ], undefined, undefined, {
-        ...(trace
-          ? {
-            trace,
-            callIndex: 0,
-            callPhase: "compaction" as const,
-          }
-          : {}),
-      });
+      );
+      narrativeSummary = compactResponse.response.content.trim() || undefined;
     } catch (error) {
       throw annotateFailureError(error, "history compaction").error;
     }
 
-    const { response } = compactResponse;
-
-    const summary = response.content;
+    const compacted = compactHistoryIntoArtifactContext({
+      sessionId,
+      history,
+      keepTailCount: 5,
+      source: "executor_compaction",
+      existingState: existingArtifactContext,
+      ...(narrativeSummary ? { narrativeSummary } : {}),
+    });
 
     if (this.onCompaction) {
       try {
-        this.onCompaction(sessionId, summary);
+        this.onCompaction(
+          sessionId,
+          narrativeSummary && narrativeSummary.trim().length > 0
+            ? narrativeSummary
+            : compacted.summaryText,
+        );
       } catch {
         /* non-blocking */
       }
     }
 
-    return [
-      {
-        role: "system" as const,
-        content: `[Conversation summary]\n${summary}`,
-      },
-      ...toKeep,
-    ];
+    return {
+      history: compacted.compactedHistory,
+      artifactContext: compacted.state,
+    };
   }
 }

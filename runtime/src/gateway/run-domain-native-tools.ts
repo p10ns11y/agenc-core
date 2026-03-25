@@ -47,5 +47,6 @@ export function buildNativeActorResult(
     durationMs,
     compacted: false,
     stopReason: "completed",
+    completionState: "completed",
   };
 }

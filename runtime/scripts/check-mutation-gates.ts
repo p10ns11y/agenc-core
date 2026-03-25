@@ -5,12 +5,15 @@ import path from 'node:path';
 import {
   evaluateMutationRegressionGates,
   formatMutationGateEvaluation,
+  parseMutationGatingPolicyManifest,
+  type MutationGatingPolicyManifest,
   type MutationGateThresholds,
 } from '../src/eval/mutation-gates.js';
 import { parseMutationArtifact } from '../src/eval/mutation-runner.js';
 
 interface CliOptions {
   artifactPath: string;
+  policyPath?: string;
   dryRun: boolean;
   thresholds: Partial<MutationGateThresholds>;
 }
@@ -38,6 +41,10 @@ function parseCliArgs(argv: string[]): CliOptions {
     const arg = argv[i];
     if (arg === '--artifact' && argv[i + 1]) {
       options.artifactPath = path.resolve(process.cwd(), argv[++i]!);
+      continue;
+    }
+    if (arg === '--policy' && argv[i + 1]) {
+      options.policyPath = path.resolve(process.cwd(), argv[++i]!);
       continue;
     }
     if (arg === '--dry-run') {
@@ -72,6 +79,9 @@ function parseCliArgs(argv: string[]): CliOptions {
       console.log([
         'Usage: check-mutation-gates --artifact <path> [threshold overrides]',
         '',
+        'Policy flags:',
+        '  --policy <path>',
+        '',
         'Threshold flags:',
         '  --max-aggregate-pass-rate-drop <float>',
         '  --max-aggregate-conformance-drop <float>',
@@ -94,8 +104,19 @@ async function main(): Promise<void> {
   const options = parseCliArgs(process.argv.slice(2));
   const raw = await readFile(options.artifactPath, 'utf8');
   const artifact = parseMutationArtifact(JSON.parse(raw) as unknown);
+  let manifest: MutationGatingPolicyManifest | undefined;
+  if (options.policyPath) {
+    const manifestRaw = await readFile(options.policyPath, 'utf8');
+    manifest = parseMutationGatingPolicyManifest(
+      JSON.parse(manifestRaw) as unknown,
+    );
+  }
 
-  const evaluation = evaluateMutationRegressionGates(artifact, options.thresholds);
+  const evaluation = evaluateMutationRegressionGates(
+    artifact,
+    options.thresholds,
+    manifest,
+  );
   console.log(formatMutationGateEvaluation(evaluation));
 
   if (!evaluation.passed && !options.dryRun) {

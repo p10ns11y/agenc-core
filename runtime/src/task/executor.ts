@@ -38,6 +38,8 @@ import type {
   DeadLetterEntry,
   DeadLetterStage,
   CheckpointStore,
+  DeadLetterQueueStore,
+  TaskExecutionResultAttestation,
   TaskCheckpoint,
   MetricsProvider,
   TracingProvider,
@@ -86,6 +88,26 @@ interface PipelineRuntimeState {
   claimExpired: boolean;
 }
 
+function buildTrustedExecutionResultAttestation(
+  recordedAt: number,
+): TaskExecutionResultAttestation {
+  return {
+    schemaVersion: 1,
+    source: "live_runtime",
+    trust: "trusted",
+    recordedAt,
+  };
+}
+
+function checkpointExecutionResultRequiresRevalidation(
+  checkpoint: TaskCheckpoint,
+): boolean {
+  if (checkpoint.executionResult === undefined) {
+    return false;
+  }
+  return checkpoint.executionResultAttestation?.trust !== "trusted";
+}
+
 // ============================================================================
 // TaskExecutor Class
 // ============================================================================
@@ -131,7 +153,7 @@ export class TaskExecutor {
   private readonly claimExpiryBufferMs: number;
   private readonly retryPolicy: RetryPolicy;
   private readonly backpressureConfig: BackpressureConfig;
-  private readonly dlq: DeadLetterQueue;
+  private readonly dlq: DeadLetterQueueStore;
   private readonly checkpointStore: CheckpointStore | null;
   private readonly metricsProvider: MetricsProvider;
   private readonly tracingProvider: TracingProvider;
@@ -178,7 +200,7 @@ export class TaskExecutor {
       ...DEFAULT_BACKPRESSURE_CONFIG,
       ...config.backpressure,
     };
-    this.dlq = new DeadLetterQueue(config.deadLetterQueue);
+    this.dlq = config.deadLetterStore ?? new DeadLetterQueue(config.deadLetterQueue);
     this.checkpointStore = config.checkpointStore ?? null;
     this.metricsProvider = config.metrics ?? new NoopMetrics();
     this.tracingProvider = config.tracing ?? new NoopTracing();
@@ -347,7 +369,7 @@ export class TaskExecutor {
   /**
    * Get the dead letter queue instance for inspection, retry, and management.
    */
-  getDeadLetterQueue(): DeadLetterQueue {
+  getDeadLetterQueue(): DeadLetterQueueStore {
     return this.dlq;
   }
 
@@ -478,10 +500,12 @@ export class TaskExecutor {
     controller: AbortController,
     checkpoint: TaskCheckpoint,
   ): Promise<void> {
-    let timeoutId: ReturnType<typeof setTimeout> | null = null;
-    let deadlineTimerId: ReturnType<typeof setTimeout> | null = null;
-    let timedOut = false;
-    let claimExpired = false;
+    const state: PipelineRuntimeState = {
+      timeoutId: null,
+      deadlineTimerId: null,
+      timedOut: false,
+      claimExpired: false,
+    };
 
     try {
       let claimResult: ClaimResult;
@@ -491,57 +515,40 @@ export class TaskExecutor {
         // Already claimed — skip claim, run execute + submit
         claimResult = checkpoint.claimResult;
         this.logger.info(`Task ${pda}: skipping claim (recovered)`);
-
-        // Set up deadline timer
-        ({ deadlineTimerId, claimExpired } = await this.setupDeadlineTimer(
+        executionResult = await this.revalidateRecoveredExecution(
           task,
+          pda,
+          claimResult,
           controller,
-          deadlineTimerId,
-          claimExpired,
-          pda,
-        ));
-        if (claimExpired) return;
-
-        // Set up execution timeout
-        if (this.taskTimeoutMs > 0) {
-          timeoutId = setTimeout(() => {
-            timedOut = true;
-            controller.abort();
-          }, this.taskTimeoutMs);
-        }
-
-        executionResult = await this.executeTaskStep(
-          task,
-          claimResult,
-          controller.signal,
-        );
-
-        if (timeoutId !== null) {
-          clearTimeout(timeoutId);
-          timeoutId = null;
-        }
-        if (deadlineTimerId !== null) {
-          clearTimeout(deadlineTimerId);
-          deadlineTimerId = null;
-        }
-
-        // Checkpoint after execution
-        await this.saveCheckpoint(
-          pda,
-          "executed",
-          claimResult,
-          executionResult,
+          state,
           checkpoint.createdAt,
         );
+        if (state.claimExpired) return;
       } else if (
         checkpoint.stage === "executed" &&
         checkpoint.claimResult &&
         checkpoint.executionResult
       ) {
-        // Already claimed + executed — skip to submit
         claimResult = checkpoint.claimResult;
-        executionResult = checkpoint.executionResult;
-        this.logger.info(`Task ${pda}: skipping claim+execute (recovered)`);
+        if (checkpointExecutionResultRequiresRevalidation(checkpoint)) {
+          this.logger.warn(
+            `Task ${pda}: revalidating persisted execution result before submit`,
+          );
+          executionResult = await this.revalidateRecoveredExecution(
+            task,
+            pda,
+            claimResult,
+            controller,
+            state,
+            checkpoint.createdAt,
+          );
+          if (state.claimExpired) return;
+        } else {
+          executionResult = checkpoint.executionResult;
+          this.logger.info(
+            `Task ${pda}: skipping claim+execute (recovered trusted checkpoint)`,
+          );
+        }
       } else {
         // Unexpected state — clean up
         this.logger.warn(
@@ -561,10 +568,9 @@ export class TaskExecutor {
       // Success — remove checkpoint
       await this.checkpointStore!.remove(pda);
     } catch (err) {
-      if (timeoutId !== null) clearTimeout(timeoutId);
-      if (deadlineTimerId !== null) clearTimeout(deadlineTimerId);
+      this.clearPipelineTimers(state);
 
-      if (claimExpired) {
+      if (state.claimExpired) {
         const claim = await this.operations
           .fetchClaim(task.pda)
           .catch(() => null);
@@ -578,7 +584,7 @@ export class TaskExecutor {
         this.events.onClaimExpiring?.(expiredError, task.pda);
         this.events.onTaskFailed?.(expiredError, task.pda);
         this.sendToDeadLetterQueue(task, expiredError, "execute", 1);
-      } else if (timedOut) {
+      } else if (state.timedOut) {
         const timeoutError = new TaskTimeoutError(this.taskTimeoutMs);
         this.metrics.tasksFailed++;
         this.events.onTaskTimeout?.(timeoutError, task.pda);
@@ -599,9 +605,48 @@ export class TaskExecutor {
         this.logger.warn("Failed to remove checkpoint", err);
       });
     } finally {
+      this.clearPipelineTimers(state);
       this.activeTasks.delete(pda);
       this.drainQueue();
     }
+  }
+
+  private async revalidateRecoveredExecution(
+    task: TaskDiscoveryResult,
+    pda: string,
+    claimResult: ClaimResult,
+    controller: AbortController,
+    state: PipelineRuntimeState,
+    checkpointCreatedAt: number,
+  ): Promise<TaskExecutionResult | PrivateTaskExecutionResult> {
+    const deadlineState = await this.setupDeadlineTimer(
+      task,
+      controller,
+      state.deadlineTimerId,
+      state.claimExpired,
+      pda,
+    );
+    state.deadlineTimerId = deadlineState.deadlineTimerId;
+    state.claimExpired = deadlineState.claimExpired;
+    if (state.claimExpired) {
+      throw new ClaimExpiredError(0, this.claimExpiryBufferMs);
+    }
+
+    this.startExecutionTimeout(controller, state);
+    const executionResult = await this.executeTaskStep(
+      task,
+      claimResult,
+      controller.signal,
+    );
+    this.clearPipelineTimers(state);
+    await this.saveCheckpoint(
+      pda,
+      "executed",
+      claimResult,
+      executionResult,
+      checkpointCreatedAt,
+    );
+    return executionResult;
   }
 
   /**
@@ -1306,6 +1351,10 @@ export class TaskExecutor {
       stage,
       claimResult,
       executionResult,
+      executionResultAttestation:
+        stage === "executed" && executionResult
+          ? buildTrustedExecutionResultAttestation(now)
+          : undefined,
       createdAt: createdAt ?? now,
       updatedAt: now,
     });

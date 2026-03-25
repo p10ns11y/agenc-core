@@ -114,8 +114,8 @@ function createSubagentHarness() {
     backgroundToolSurfaceLabel(toolName) {
       return `tool ${toolName}`;
     },
-    retirePlannerDagOpenNodes() {
-      calls.push({ type: "retireDagNodes" });
+    retirePlannerDagOpenNodes(status, note) {
+      calls.push({ type: "retireDagNodes", status, note });
     },
     firstMeaningfulLine(value) {
       return typeof value === "string" ? value.split("\n").find(Boolean) ?? null : null;
@@ -179,5 +179,52 @@ test("subagent controller records tool activity and inspect requests", () => {
   assert.ok(calls.some((entry) => entry.type === "inspect" && entry.reason === "subagents.tool.executing"));
   assert.ok(
     calls.some((entry) => entry.type === "event" && entry.kind === "subagent tool"),
+  );
+});
+
+test("subagent controller preserves rich completion truth on synthesized results", () => {
+  const { controller, calls } = createSubagentHarness();
+
+  controller.handleSubagentLifecycleMessage("subagents.synthesized", {
+    subagentSessionId: "child-2",
+    data: {
+      stepName: "verify",
+      objective: "finish verification",
+      completionState: "needs_verification",
+      stopReason: "completed",
+      stopReasonDetail: "workflow verifier still required",
+      toolCalls: 2,
+    },
+  });
+
+  assert.ok(
+    calls.some(
+      (entry) =>
+        entry.type === "updateStep" &&
+        entry.input.status === "needs_verification",
+    ),
+  );
+  assert.ok(
+    calls.some(
+      (entry) =>
+        entry.type === "retireDagNodes" &&
+        entry.status === "needs_verification" &&
+        entry.note === "workflow verifier still required",
+    ),
+  );
+  assert.ok(
+    calls.some(
+      (entry) =>
+        entry.type === "status" &&
+        entry.status === "child synthesis: needs verification",
+    ),
+  );
+  assert.ok(
+    calls.some(
+      (entry) =>
+        entry.type === "event" &&
+        entry.kind === "subagent" &&
+        entry.body.includes("completion state: needs verification"),
+    ),
   );
 });

@@ -862,6 +862,7 @@ describe("validateGatewayConfig approvals", () => {
       ...makeConfig(),
       approvals: {
         enabled: true,
+        mode: "safe_local_dev",
         gateDesktopAutomation: true,
         timeoutMs: 60_000,
         defaultSlaMs: 10_000,
@@ -878,6 +879,7 @@ describe("validateGatewayConfig approvals", () => {
       ...makeConfig(),
       approvals: {
         enabled: "yes" as unknown as boolean,
+        mode: "reckless" as unknown as string,
         gateDesktopAutomation: "strict" as unknown as boolean,
         timeoutMs: "slow" as unknown as number,
         defaultSlaMs: "fast" as unknown as number,
@@ -888,6 +890,9 @@ describe("validateGatewayConfig approvals", () => {
 
     expect(result.valid).toBe(false);
     expect(result.errors).toContain("approvals.enabled must be a boolean");
+    expect(result.errors).toContain(
+      "approvals.mode must be one of safe_local_dev, trusted_operator, unattended_background, benchmark",
+    );
     expect(result.errors).toContain(
       "approvals.gateDesktopAutomation must be a boolean",
     );

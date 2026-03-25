@@ -8,6 +8,8 @@
  */
 
 import { ChatExecutor } from "../llm/chat-executor.js";
+import { buildModelRoutingPolicy } from "../llm/model-routing-policy.js";
+import { buildRuntimeEconomicsPolicy } from "../llm/run-budget.js";
 import type {
   ChatExecutorConfig,
   DeterministicPipelineExecutor,
@@ -64,6 +66,8 @@ export interface CreateChatExecutorParams {
   };
   /** Callback to resolve host tooling profile. */
   resolveHostToolingProfile: () => HostToolingProfile | null;
+  /** Callback to resolve canonical host workspace root. */
+  resolveHostWorkspaceRoot: () => string | null;
   /** Optional deterministic pipeline executor. */
   pipelineExecutor?: DeterministicPipelineExecutor;
 }
@@ -86,6 +90,19 @@ export function createChatExecutor(
   }
 
   const { subagentConfig, llmConfig } = params;
+  const economicsPolicy = buildRuntimeEconomicsPolicy({
+    sessionTokenBudget: params.sessionTokenBudget,
+    plannerMaxTokens: llmConfig?.plannerMaxTokens,
+    requestTimeoutMs: llmConfig?.requestTimeoutMs,
+    childTimeoutMs: subagentConfig.defaultTimeoutMs,
+    maxFanoutPerTurn: subagentConfig.maxFanoutPerTurn,
+    mode: "enforce",
+  });
+  const modelRoutingPolicy = buildModelRoutingPolicy({
+    providers: params.providers,
+    economicsPolicy,
+    llmConfig,
+  });
 
   return new ChatExecutor({
     providers: params.providers,
@@ -131,8 +148,11 @@ export function createChatExecutor(
     retryPolicyMatrix: llmConfig?.retryPolicy,
     toolFailureCircuitBreaker: llmConfig?.toolFailureCircuitBreaker,
     resolveHostToolingProfile: params.resolveHostToolingProfile,
+    resolveHostWorkspaceRoot: params.resolveHostWorkspaceRoot,
     pipelineExecutor: params.pipelineExecutor,
     sessionTokenBudget: params.sessionTokenBudget,
     onCompaction: params.onCompaction,
+    economicsPolicy,
+    modelRoutingPolicy,
   });
 }

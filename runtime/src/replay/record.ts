@@ -52,6 +52,7 @@ export function toReplayStoreRecord(
   };
 
   return {
+    schemaVersion: 1,
     ...recordEvent,
     projectionHash: computeProjectionHash({
       ...recordEvent,

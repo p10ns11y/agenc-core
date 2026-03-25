@@ -1,4 +1,5 @@
 import type { ChatCallUsageRecord } from "../llm/chat-executor.js";
+import type { RuntimeEconomicsSummary } from "../llm/run-budget.js";
 
 export type ChatUsageSectionId =
   | "system"
@@ -29,6 +30,17 @@ export interface ChatUsagePayload {
   readonly maxOutputTokens?: number;
   readonly safetyMarginTokens?: number;
   readonly sections?: readonly ChatUsageSection[];
+  readonly economics?: {
+    readonly mode: RuntimeEconomicsSummary["mode"];
+    readonly totalSpendUnits: number;
+    readonly totalLatencyMs: number;
+    readonly rerouteCount: number;
+    readonly downgradeCount: number;
+    readonly denialCount: number;
+    readonly budgetViolationCount: number;
+    readonly childRemainingTokens: number;
+    readonly childRemainingSpendUnits: number;
+  };
 }
 
 interface BuildChatUsagePayloadInput {
@@ -40,6 +52,7 @@ interface BuildChatUsagePayloadInput {
   readonly usedFallback?: boolean;
   readonly contextWindowTokens?: number;
   readonly callUsage?: readonly ChatCallUsageRecord[];
+  readonly economicsSummary?: RuntimeEconomicsSummary;
 }
 
 const DEFAULT_CHAR_PER_TOKEN = 4;
@@ -96,6 +109,42 @@ export function buildChatUsagePayload(
     ...(input.provider ? { provider: input.provider } : {}),
     ...(input.model ? { model: input.model } : {}),
     ...(input.usedFallback === true ? { usedFallback: true } : {}),
+    ...(input.economicsSummary
+      ? {
+          economics: {
+            mode: input.economicsSummary.mode,
+            totalSpendUnits: Number(
+              input.economicsSummary.totalSpendUnits.toFixed(4),
+            ),
+            totalLatencyMs: normalizeNonNegativeInt(
+              input.economicsSummary.totalLatencyMs,
+            ),
+            rerouteCount: normalizeNonNegativeInt(
+              input.economicsSummary.rerouteCount,
+            ),
+            downgradeCount: normalizeNonNegativeInt(
+              input.economicsSummary.downgradeCount,
+            ),
+            denialCount: normalizeNonNegativeInt(
+              input.economicsSummary.denialCount,
+            ),
+            budgetViolationCount: normalizeNonNegativeInt(
+              input.economicsSummary.budgetViolationCount,
+            ),
+            childRemainingTokens: normalizeNonNegativeInt(
+              input.economicsSummary.runClasses.child.budget.tokenCeiling -
+                input.economicsSummary.runClasses.child.usage.tokens,
+            ),
+            childRemainingSpendUnits: Number(
+              Math.max(
+                0,
+                input.economicsSummary.runClasses.child.budget.spendCeilingUnits -
+                  input.economicsSummary.runClasses.child.usage.spendUnits,
+              ).toFixed(4),
+            ),
+          },
+        }
+      : {}),
   };
 
   const usageRecord = selectUsageRecord(input.callUsage);

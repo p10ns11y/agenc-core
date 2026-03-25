@@ -918,11 +918,26 @@ export interface DeadLetterQueueConfig {
  */
 export type CheckpointStage = "claimed" | "executed" | "submitted";
 
+export interface TaskExecutionResultAttestation {
+  /** Persisted schema version for trust evaluation. */
+  schemaVersion?: 1;
+  /** Where the execution result originated. */
+  source: "live_runtime" | "migrated_checkpoint" | "unknown";
+  /** Whether submit may trust the persisted execution result directly. */
+  trust: "trusted" | "needs_revalidation";
+  /** Unix timestamp (ms) when this attestation was recorded. */
+  recordedAt: number;
+  /** Why the checkpoint requires revalidation, when applicable. */
+  reason?: "schema_migrated" | "missing_attestation" | "legacy_execution_result";
+}
+
 /**
  * Snapshot of a task's pipeline progress, persisted after each stage transition.
  * Used by the executor to resume from the last successful stage after a crash.
  */
 export interface TaskCheckpoint {
+  /** Persisted schema version for migration-safe checkpoint reads. */
+  schemaVersion?: 1;
   /** Task account PDA (base58 string) */
   taskPda: string;
   /** Last completed pipeline stage */
@@ -931,6 +946,8 @@ export interface TaskCheckpoint {
   claimResult?: ClaimResult;
   /** Result of execution (present once stage >= 'executed') */
   executionResult?: TaskExecutionResult | PrivateTaskExecutionResult;
+  /** Provenance for deciding whether a persisted execution result may be submitted directly. */
+  executionResultAttestation?: TaskExecutionResultAttestation;
   /** Unix timestamp (ms) when the checkpoint was first created */
   createdAt: number;
   /** Unix timestamp (ms) when the checkpoint was last updated */
@@ -1015,6 +1032,33 @@ export interface BatchTaskItem {
 }
 
 /**
+ * Dead-letter queue interface used by TaskExecutor.
+ *
+ * Implementations may be in-memory or durable, but the operational contract is
+ * synchronous so failure capture never depends on async best-effort writes.
+ */
+export interface DeadLetterQueueStore {
+  add(entry: DeadLetterEntry): void;
+  getAll(): DeadLetterEntry[];
+  getByTaskId(taskPda: string): DeadLetterEntry | undefined;
+  retry(taskPda: string): DeadLetterEntry | undefined;
+  remove(taskPda: string): boolean;
+  size(): number;
+  clear(): void;
+}
+
+export interface TaskExecutorPersistenceConfig {
+  /** Default durable mode for runtime-managed executors. Use 'memory' only for explicit dev/test flows. */
+  mode?: "memory" | "sqlite";
+  /** Override the base persistence directory. */
+  rootDir?: string;
+  /** Override the checkpoint SQLite path when mode='sqlite'. */
+  checkpointDbPath?: string;
+  /** Override the dead-letter SQLite path when mode='sqlite'. */
+  deadLetterDbPath?: string;
+}
+
+/**
  * Full configuration for the task executor.
  */
 export interface TaskExecutorConfig {
@@ -1046,8 +1090,12 @@ export interface TaskExecutorConfig {
   backpressure?: Partial<BackpressureConfig>;
   /** Dead letter queue configuration. When provided, failed tasks are captured for inspection and retry. */
   deadLetterQueue?: Partial<DeadLetterQueueConfig>;
+  /** Override the dead-letter queue implementation. */
+  deadLetterStore?: DeadLetterQueueStore;
   /** Checkpoint store for durable execution. When provided, pipeline progress is persisted and recovered on restart. */
   checkpointStore?: CheckpointStore;
+  /** Runtime-managed persistence defaults. Bare TaskExecutor callers remain in-memory unless they pass explicit stores. */
+  persistence?: TaskExecutorPersistenceConfig;
   /** Optional metrics provider for OpenTelemetry-compatible instrumentation. */
   metrics?: MetricsProvider;
   /** Optional tracing provider for distributed trace spans. */

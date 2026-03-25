@@ -64,6 +64,12 @@ export interface StructuredMemoryEntry {
   readonly createdAt: number;
 }
 
+export interface StructuredMemoryDigestEntry {
+  readonly heading: string;
+  readonly body: string;
+  readonly updatedAt: number;
+}
+
 export interface EntityExtractor {
   extract(text: string, sessionId: string): Promise<StructuredMemoryEntry[]>;
 }
@@ -183,4 +189,16 @@ export class CuratedMemoryManager {
     await rename(tmpPath, this.memoryFilePath);
     return true;
   }
+}
+
+export function renderStructuredMemoryDigest(
+  entries: readonly StructuredMemoryDigestEntry[],
+  maxItems = 8,
+): string {
+  return entries
+    .slice()
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, maxItems)
+    .map((entry) => `- ${entry.heading}: ${entry.body}`)
+    .join("\n");
 }

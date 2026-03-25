@@ -4,6 +4,7 @@ import {
   canRetryDelegatedOutputWithoutAdditionalToolCalls,
   resolveCorrectionAllowedToolNames,
   resolveExecutionToolContractGuidance,
+  validateRequiredToolEvidence,
 } from "./chat-executor-contract-flow.js";
 
 describe("chat-executor-contract-flow", () => {
@@ -76,6 +77,25 @@ describe("chat-executor-contract-flow", () => {
         allowedToolNames: ["system.bash", "system.writeFile"],
       }),
     ).toContain("Do not claim the phase is complete");
+  });
+
+  it("adds behavior-first retry guidance when no runnable harness was executed", () => {
+    const instruction = buildRequiredToolEvidenceRetryInstruction({
+      missingEvidenceMessage:
+        "Behavior verification was required, but no runnable behavior harness was executed.",
+      validationCode: "missing_behavior_harness",
+      allowedToolNames: ["system.bash", "system.writeFile"],
+    });
+
+    expect(instruction).toContain(
+      "First prefer existing repo-local test, smoke, scenario, or validation commands",
+    );
+    expect(instruction).toContain(
+      "If you add a new test or scenario harness, run it before the implementation",
+    );
+    expect(instruction).toContain(
+      "do not claim completion; report that behavior verification still needs to run",
+    );
   });
 
   it("tells contradictory-completion retries to re-emit a completion-only answer after a fix", () => {
@@ -194,5 +214,140 @@ describe("chat-executor-contract-flow", () => {
         },
       }),
     ).toBe(false);
+  });
+
+  it("validates workflow-owned completion contracts without delegated specs", () => {
+    const result = validateRequiredToolEvidence({
+      ctx: {
+        messageText: "Implement the runtime entry point",
+        allToolCalls: [
+          {
+            name: "system.writeFile",
+            args: { path: "/tmp/project/src/main.c" },
+            result: JSON.stringify({
+              path: "/tmp/project/src/main.c",
+              bytesWritten: 64,
+            }),
+            isError: false,
+            durationMs: 2,
+          },
+        ],
+        activeRoutedToolNames: ["system.writeFile"],
+        initialRoutedToolNames: ["system.writeFile"],
+        expandedRoutedToolNames: [],
+        requiredToolEvidence: {
+          maxCorrectionAttempts: 1,
+          verificationContract: {
+            workspaceRoot: "/tmp/project",
+            requiredSourceArtifacts: ["/tmp/project/PLAN.md"],
+            targetArtifacts: ["/tmp/project/src/main.c"],
+            verificationMode: "mutation_required",
+          },
+          completionContract: {
+            taskClass: "build_required",
+            placeholdersAllowed: false,
+            partialCompletionAllowed: false,
+          },
+        },
+        providerEvidence: undefined,
+        response: {
+          role: "assistant",
+          content: "Implemented /tmp/project/src/main.c.",
+          finishReason: "stop",
+        },
+      } as any,
+    });
+
+    expect(result.contractValidation?.code).toBe("missing_required_source_evidence");
+    expect(result.missingEvidenceMessage).toContain("source artifacts");
+  });
+
+  it("returns an explicit no-harness validation result when behavior is required but no behavior command ran", () => {
+    const result = validateRequiredToolEvidence({
+      ctx: {
+        messageText: "Implement shell job control and verify the behavior",
+        allToolCalls: [
+          {
+            name: "system.writeFile",
+            args: { path: "/tmp/project/src/shell.c" },
+            result: JSON.stringify({
+              path: "/tmp/project/src/shell.c",
+              bytesWritten: 128,
+            }),
+            isError: false,
+            durationMs: 2,
+          },
+        ],
+        activeRoutedToolNames: ["system.writeFile"],
+        initialRoutedToolNames: ["system.writeFile"],
+        expandedRoutedToolNames: [],
+        requiredToolEvidence: {
+          maxCorrectionAttempts: 1,
+          verificationContract: {
+            workspaceRoot: "/tmp/project",
+            targetArtifacts: ["/tmp/project/src/shell.c"],
+            acceptanceCriteria: [
+              "Shell job-control behavior is verified with scenario coverage",
+            ],
+            verificationMode: "mutation_required",
+          },
+          completionContract: {
+            taskClass: "artifact_only",
+            placeholdersAllowed: false,
+            partialCompletionAllowed: false,
+          },
+        },
+        providerEvidence: undefined,
+        response: {
+          role: "assistant",
+          content: "Implemented /tmp/project/src/shell.c.",
+          finishReason: "stop",
+        },
+      } as any,
+    });
+
+    expect(result.contractValidation?.code).toBe("missing_behavior_harness");
+    expect(result.missingEvidenceMessage).toContain("Behavior verification was required");
+  });
+
+  it("treats unsafe benchmark mode as evidence-only for delegated validation", () => {
+    const result = validateRequiredToolEvidence({
+      ctx: {
+        messageText: "Scaffold manifests only for the workspace",
+        allToolCalls: [
+          {
+            name: "system.bash",
+            args: { command: "npm", args: ["install"] },
+            result: JSON.stringify({ stdout: "ok", stderr: "", exitCode: 0 }),
+            isError: false,
+            durationMs: 3,
+          },
+        ],
+        activeRoutedToolNames: ["system.bash"],
+        initialRoutedToolNames: ["system.bash"],
+        expandedRoutedToolNames: [],
+        requiredToolEvidence: {
+          maxCorrectionAttempts: 1,
+          unsafeBenchmarkMode: true,
+          delegationSpec: {
+            task: "scaffold_manifests",
+            objective: "Author only manifests/configs and do not execute install/build/test commands in this phase",
+            inputContract: "Scaffold only; later deterministic verification runs npm install",
+            acceptanceCriteria: ["No install/build/test commands executed or claimed"],
+            requiredToolCapabilities: ["system.writeFile", "system.bash"],
+          },
+        },
+        providerEvidence: undefined,
+        response: {
+          role: "assistant",
+          content:
+            "**Phase scaffold_manifests completed.** Authored manifests and ran npm install to confirm the links work.",
+          finishReason: "stop",
+        },
+      } as any,
+    });
+
+    expect(result.contractValidation).toMatchObject({ ok: true });
+    expect(result.missingEvidenceMessage).toBeUndefined();
   });
 });

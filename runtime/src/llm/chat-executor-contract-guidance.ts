@@ -14,6 +14,10 @@ import type {
   DelegationContractSpec,
   DelegationOutputValidationCode,
 } from "../utils/delegation-validation.js";
+import type { ImplementationCompletionContract } from "../workflow/completion-contract.js";
+import type {
+  WorkflowVerificationContract,
+} from "../workflow/verification-obligations.js";
 import {
   getMissingDoomEvidenceGap,
   inferDoomTurnContract,
@@ -23,7 +27,9 @@ import {
   resolveDelegatedCorrectionToolChoiceToolNames,
   resolveDelegatedInitialToolChoiceToolNames,
   resolveDelegatedInitialToolChoiceToolName,
+  specRequiresFileMutationEvidence,
 } from "../utils/delegation-validation.js";
+import { sanitizeDelegationContextRequirements } from "../utils/delegation-execution-context.js";
 import {
   TYPED_ARTIFACT_DOMAINS,
   inferTypedArtifactInspectionIntent,
@@ -44,6 +50,8 @@ export interface ToolContractGuidanceContext {
   readonly allowedToolNames: readonly string[];
   readonly requiredToolEvidence?: {
     readonly delegationSpec?: DelegationContractSpec;
+    readonly verificationContract?: WorkflowVerificationContract;
+    readonly completionContract?: ImplementationCompletionContract;
   };
   readonly validationCode?: DelegationOutputValidationCode;
 }
@@ -424,11 +432,16 @@ function resolveDelegationInitialContractGuidance(
       ? shellFilteredToolNames
       : routedToolNames;
   const usesFlexibleInitialSubset = effectiveRoutedToolNames.length > 1;
+  const sourceGroundingRetry =
+    (spec.lastValidationCode ?? "") === "missing_required_source_evidence";
   const runtimeInstruction = usesFlexibleInitialSubset
     ? workspaceBootstrap
       ? "Bootstrap the delegated workspace before inspecting it. " +
         "If the delegated cwd does not exist yet, create the workspace root first or keep targeting that workspace via absolute paths until it exists. " +
         "After the workspace root exists, create or update the required files directly and use shell verification only after meaningful mutations."
+      : sourceGroundingRetry
+        ? "Inspect the named source artifacts and current workspace state before mutating files again. " +
+          "If those sources describe intended or planned structure, keep that distinction explicit instead of presenting planned files as already present."
       : fileAuthoringOnlyPhase
         ? "Start with the smallest grounded step that reduces uncertainty in the delegated contract. " +
           "Inspect the existing workspace state before mutating files when that will prevent avoidable rework, " +
@@ -460,6 +473,9 @@ function isDelegatedFileAuthoringPhaseWithoutVerification(
   if ((spec.lastValidationCode ?? "") === "acceptance_evidence_missing") {
     return false;
   }
+  if (!specRequiresFileMutationEvidence(spec)) {
+    return false;
+  }
 
   const acceptanceCriteria = spec.acceptanceCriteria ?? [];
   const acceptanceRequiresVerification = acceptanceCriteria.some(
@@ -489,12 +505,15 @@ function isDelegatedFileAuthoringPhaseWithoutVerification(
 function isDelegatedWorkspaceBootstrapPhase(
   spec: DelegationContractSpec,
 ): boolean {
+  const sanitizedContextRequirements = sanitizeDelegationContextRequirements(
+    spec.contextRequirements,
+  );
   const stepText = [
     spec.task ?? "",
     spec.objective ?? "",
     spec.inputContract ?? "",
     ...(spec.acceptanceCriteria ?? []),
-    ...(spec.contextRequirements ?? []),
+    ...sanitizedContextRequirements,
   ]
     .join("\n")
     .toLowerCase();
@@ -522,7 +541,7 @@ function isDelegatedWorkspaceBootstrapPhase(
     /\bskeleton\s+package\.json\b/.test(stepText);
   const hasTargetRootCue =
     /^create\s+\/\S+/m.test(spec.objective ?? "") ||
-    (spec.contextRequirements ?? []).some((entry) => entry.startsWith("cwd=/"));
+    typeof spec.executionContext?.workspaceRoot === "string";
 
   return hasTargetRootCue && (hasEmptyWorkspaceCue || hasRootCreationCue);
 }

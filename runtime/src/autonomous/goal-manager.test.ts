@@ -93,9 +93,13 @@ describe("GoalManager", () => {
       expect(goal.updatedAt).toBe(goal.createdAt);
     });
 
-    it("generates unique IDs", async () => {
-      const g1 = await manager.addGoal(makeGoal());
-      const g2 = await manager.addGoal(makeGoal());
+    it("generates unique IDs for distinct goals", async () => {
+      const g1 = await manager.addGoal(
+        makeGoal({ title: "Goal one", description: "First unique goal" }),
+      );
+      const g2 = await manager.addGoal(
+        makeGoal({ title: "Goal two", description: "Second unique goal" }),
+      );
       expect(g1.id).not.toBe(g2.id);
     });
 
@@ -379,7 +383,12 @@ describe("GoalManager", () => {
       });
 
       for (let i = 0; i < 3; i++) {
-        const g = await m.addGoal(makeGoal({ title: `Goal ${i}` }));
+        const g = await m.addGoal(
+          makeGoal({
+            title: `Goal ${i}`,
+            description: `Goal ${i} description`,
+          }),
+        );
         await m.cancelGoal(g.id);
       }
 

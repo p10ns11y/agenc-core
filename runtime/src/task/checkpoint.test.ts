@@ -1,6 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import Database from "better-sqlite3";
 import { Keypair } from "@solana/web3.js";
 import { InMemoryCheckpointStore } from "./checkpoint.js";
+import { SqliteCheckpointStore } from "./sqlite-checkpoint-store.js";
 import { TaskExecutor } from "./executor.js";
 import type {
   TaskExecutionContext,
@@ -11,6 +16,7 @@ import type {
   ClaimResult,
 } from "./types.js";
 import { silentLogger } from "../utils/logger.js";
+import { RuntimeSchemaCompatibilityError } from "../workflow/schema-version.js";
 import {
   createTask,
   createDiscoveryResult,
@@ -39,6 +45,15 @@ function createExecutorConfig(
     agentPda,
     logger: silentLogger,
     ...overrides,
+  };
+}
+
+function makeTrustedExecutionResultAttestation(recordedAt = Date.now()) {
+  return {
+    schemaVersion: 1 as const,
+    source: "live_runtime" as const,
+    trust: "trusted" as const,
+    recordedAt,
   };
 }
 
@@ -144,6 +159,163 @@ describe("InMemoryCheckpointStore", () => {
 
     const pending = await store.listPending();
     expect(pending).toHaveLength(1);
+  });
+});
+
+describe("SqliteCheckpointStore", () => {
+  let tempDir = "";
+  let store: SqliteCheckpointStore;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "agenc-task-checkpoint-"));
+    store = new SqliteCheckpointStore(join(tempDir, "checkpoints.sqlite"));
+  });
+
+  afterEach(async () => {
+    await store.close();
+    if (tempDir) {
+      await rm(tempDir, { recursive: true, force: true });
+      tempDir = "";
+    }
+  });
+
+  it("persists checkpoints across store instances", async () => {
+    const checkpoint: TaskCheckpoint = {
+      taskPda: "task-sqlite-1",
+      stage: "executed",
+      executionResult: { proofHash: new Uint8Array(32).fill(7) },
+      executionResultAttestation: makeTrustedExecutionResultAttestation(2_000),
+      createdAt: 1_000,
+      updatedAt: 2_000,
+    };
+
+    await store.save(checkpoint);
+    await store.close();
+
+    const reopened = new SqliteCheckpointStore(join(tempDir, "checkpoints.sqlite"));
+    await expect(reopened.load("task-sqlite-1")).resolves.toEqual({
+      ...checkpoint,
+      claimResult: undefined,
+      schemaVersion: 1,
+    });
+    await reopened.close();
+  });
+
+  it("marks executed checkpoints without attestation for revalidation on load", async () => {
+    const checkpoint: TaskCheckpoint = {
+      taskPda: "task-sqlite-untrusted",
+      stage: "executed",
+      executionResult: { proofHash: new Uint8Array(32).fill(8) },
+      createdAt: 1_500,
+      updatedAt: 2_500,
+    };
+
+    await store.save(checkpoint);
+    await store.close();
+
+    const reopened = new SqliteCheckpointStore(join(tempDir, "checkpoints.sqlite"));
+    await expect(reopened.load("task-sqlite-untrusted")).resolves.toEqual({
+      ...checkpoint,
+      claimResult: undefined,
+      executionResultAttestation: {
+        schemaVersion: 1,
+        source: "unknown",
+        trust: "needs_revalidation",
+        recordedAt: 2_500,
+        reason: "missing_attestation",
+      },
+      schemaVersion: 1,
+    });
+    await reopened.close();
+  });
+
+  it("migrates legacy unversioned checkpoint payloads on load", async () => {
+    const dbPath = join(tempDir, "checkpoints.sqlite");
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE task_checkpoint_meta (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        schema_version INTEGER NOT NULL
+      );
+      INSERT INTO task_checkpoint_meta (id, schema_version) VALUES (1, 1);
+      CREATE TABLE task_checkpoints (
+        task_pda TEXT PRIMARY KEY,
+        stage TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    db.prepare(
+      `INSERT INTO task_checkpoints (task_pda, stage, payload, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(
+      "task-legacy-1",
+      "claimed",
+      JSON.stringify({
+        taskPda: "task-legacy-1",
+        stage: "claimed",
+        createdAt: 1000,
+        updatedAt: 2000,
+      }),
+      1000,
+      2000,
+    );
+    db.close();
+
+    const reopened = new SqliteCheckpointStore(dbPath);
+    await expect(reopened.load("task-legacy-1")).resolves.toEqual({
+      taskPda: "task-legacy-1",
+      stage: "claimed",
+      claimResult: undefined,
+      executionResult: undefined,
+      createdAt: 1000,
+      updatedAt: 2000,
+      schemaVersion: 1,
+    });
+    await reopened.close();
+  });
+
+  it("fails loudly when persisted sqlite checkpoint payloads use an unsupported schema", async () => {
+    const dbPath = join(tempDir, "checkpoints.sqlite");
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE task_checkpoint_meta (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        schema_version INTEGER NOT NULL
+      );
+      INSERT INTO task_checkpoint_meta (id, schema_version) VALUES (1, 1);
+      CREATE TABLE task_checkpoints (
+        task_pda TEXT PRIMARY KEY,
+        stage TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    db.prepare(
+      `INSERT INTO task_checkpoints (task_pda, stage, payload, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(
+      "task-bad-schema",
+      "claimed",
+      JSON.stringify({
+        schemaVersion: 999,
+        taskPda: "task-bad-schema",
+        stage: "claimed",
+        createdAt: 1000,
+        updatedAt: 2000,
+      }),
+      1000,
+      2000,
+    );
+    db.close();
+
+    const reopened = new SqliteCheckpointStore(dbPath);
+    await expect(reopened.load("task-bad-schema")).rejects.toBeInstanceOf(
+      RuntimeSchemaCompatibilityError,
+    );
+    await reopened.close();
   });
 });
 
@@ -332,6 +504,7 @@ describe("TaskExecutor checkpoint integration", () => {
         stage: "executed",
         claimResult,
         executionResult,
+        executionResultAttestation: makeTrustedExecutionResultAttestation(),
         createdAt: Date.now() - 1000,
         updatedAt: Date.now() - 500,
       });
@@ -380,6 +553,74 @@ describe("TaskExecutor checkpoint integration", () => {
       // Checkpoint was removed
       const pending = await store.listPending();
       expect(pending).toHaveLength(0);
+    });
+
+    it("revalidates untrusted executed checkpoints before submit", async () => {
+      const taskPda = Keypair.generate().publicKey;
+      const claimPda = Keypair.generate().publicKey;
+      const taskPdaStr = taskPda.toBase58();
+      const task = createTask();
+
+      const claimResult: ClaimResult = {
+        success: true,
+        taskId: new Uint8Array(32),
+        claimPda,
+      };
+
+      const store = new InMemoryCheckpointStore();
+      await store.save({
+        taskPda: taskPdaStr,
+        stage: "executed",
+        claimResult,
+        executionResult: {
+          proofHash: new Uint8Array(32).fill(1),
+        },
+        createdAt: Date.now() - 1000,
+        updatedAt: Date.now() - 500,
+      });
+
+      const ops = createMockOperations();
+      ops.fetchClaim.mockResolvedValue(
+        createMockClaim({
+          expiresAt: Math.floor(Date.now() / 1000) + 300,
+        }),
+      );
+      ops.fetchTask.mockResolvedValue(task);
+
+      const handlerCalled = vi.fn();
+      const handler = async (
+        _ctx: TaskExecutionContext,
+      ): Promise<TaskExecutionResult> => {
+        handlerCalled();
+        return { proofHash: new Uint8Array(32).fill(9) };
+      };
+
+      const discovery = createMockDiscovery();
+      executor = new TaskExecutor(
+        createExecutorConfig({
+          operations: ops,
+          discovery,
+          mode: "autonomous",
+          handler,
+          checkpointStore: store,
+        }),
+      );
+
+      const completed = vi.fn();
+      executor.on({ onTaskCompleted: completed });
+
+      const startPromise = executor.start();
+      await waitFor(() => completed.mock.calls.length > 0);
+      await executor.stop();
+      await startPromise.catch(() => {});
+
+      expect(handlerCalled).toHaveBeenCalledTimes(1);
+      expect(ops.claimTask).not.toHaveBeenCalled();
+      expect(ops.completeTask).toHaveBeenCalledTimes(1);
+      const submittedProofHash = ops.completeTask.mock.calls[0]?.[2] as Uint8Array;
+      expect(Array.from(submittedProofHash)).toEqual(
+        Array.from(new Uint8Array(32).fill(9)),
+      );
     });
 
     it("cleans up stale checkpoint when claim has expired", async () => {
@@ -501,6 +742,7 @@ describe("TaskExecutor checkpoint integration", () => {
         stage: "executed",
         claimResult,
         executionResult: { proofHash: new Uint8Array(32).fill(1) },
+        executionResultAttestation: makeTrustedExecutionResultAttestation(),
         createdAt: Date.now() - 2000,
         updatedAt: Date.now() - 1000,
       });
@@ -509,6 +751,7 @@ describe("TaskExecutor checkpoint integration", () => {
         stage: "executed",
         claimResult,
         executionResult: { proofHash: new Uint8Array(32).fill(2) },
+        executionResultAttestation: makeTrustedExecutionResultAttestation(),
         createdAt: Date.now() - 2000,
         updatedAt: Date.now() - 500,
       });
@@ -588,6 +831,66 @@ describe("TaskExecutor checkpoint integration", () => {
 
       expect(ops.claimTask).not.toHaveBeenCalled();
       expect(ops.completeTask).not.toHaveBeenCalled();
+    });
+
+    it("recovers persisted checkpoints after process restart with sqlite storage", async () => {
+      const tempDir = await mkdtemp(join(tmpdir(), "agenc-task-recover-"));
+      const dbPath = join(tempDir, "checkpoints.sqlite");
+      const store1 = new SqliteCheckpointStore(dbPath);
+      const taskPda = Keypair.generate().publicKey;
+      const claimPda = Keypair.generate().publicKey;
+      const task = createTask();
+
+      await store1.save({
+        taskPda: taskPda.toBase58(),
+        stage: "claimed",
+        claimResult: {
+          success: true,
+          taskId: new Uint8Array(32),
+          claimPda,
+        },
+        createdAt: Date.now() - 1_000,
+        updatedAt: Date.now() - 1_000,
+      });
+      await store1.close();
+
+      const ops = createMockOperations();
+      ops.fetchClaim.mockResolvedValue(
+        createMockClaim({
+          expiresAt: Math.floor(Date.now() / 1000) + 300,
+        }),
+      );
+      ops.fetchTask.mockResolvedValue(task);
+
+      const handlerCalled = vi.fn();
+      const store2 = new SqliteCheckpointStore(dbPath);
+      executor = new TaskExecutor(
+        createExecutorConfig({
+          operations: ops,
+          discovery: createMockDiscovery(),
+          mode: "autonomous",
+          handler: async (
+            _ctx: TaskExecutionContext,
+          ): Promise<TaskExecutionResult> => {
+            handlerCalled();
+            return { proofHash: new Uint8Array(32).fill(1) };
+          },
+          checkpointStore: store2,
+        }),
+      );
+
+      const completed = vi.fn();
+      executor.on({ onTaskCompleted: completed });
+
+      const startPromise = executor.start();
+      await waitFor(() => completed.mock.calls.length > 0);
+      await executor.stop();
+      await startPromise.catch(() => {});
+
+      expect(handlerCalled).toHaveBeenCalledTimes(1);
+      await expect(store2.listPending()).resolves.toEqual([]);
+      await store2.close();
+      await rm(tempDir, { recursive: true, force: true });
     });
   });
 });

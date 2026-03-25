@@ -222,6 +222,47 @@ test("dispatchOperatorSurfaceEvent routes tool execution events", () => {
   ]);
 });
 
+test("dispatchOperatorSurfaceEvent preserves honest completion states from chat.response", () => {
+  const { api, state, calls } = createHarness({
+    state: {
+      runState: "working",
+      runPhase: "planner",
+      activeRunStartedAtMs: 99,
+    },
+  });
+
+  dispatchOperatorSurfaceEvent(
+    {
+      family: "chat",
+      type: "chat.response",
+      payload: {
+        sessionId: "session-1",
+        completionState: "needs_verification",
+        stopReason: "completed",
+      },
+      payloadRecord: {
+        sessionId: "session-1",
+        completionState: "needs_verification",
+        stopReason: "completed",
+      },
+      payloadList: null,
+      isSessionScoped: true,
+      message: {},
+    },
+    null,
+    api,
+  );
+
+  assert.equal(state.runState, "needs_verification");
+  assert.equal(state.runPhase, null);
+  assert.equal(state.activeRunStartedAtMs, null);
+  assert.ok(
+    calls.some(
+      ([kind, value]) => kind === "status" && value === "run needs verification",
+    ),
+  );
+});
+
 test("dispatchOperatorSurfaceEvent routes final chat messages through stream reconciliation", () => {
   const { api, state, calls } = createHarness();
 
@@ -412,6 +453,98 @@ test("dispatchOperatorSurfaceEvent updates run state from run.inspect payloads",
   assert.deepEqual(calls, [
     ["hydratePlannerDagFromTraceArtifacts", "session-4"],
     ["status", "run inspect loaded: running"],
+  ]);
+});
+
+test("dispatchOperatorSurfaceEvent prefers completion truth from run.inspect payloads", () => {
+  const payload = {
+    sessionId: "session-4",
+    objective: "Ship it",
+    state: "working",
+    completionState: "needs_verification",
+    remainingRequirements: ["workflow_verifier_pass"],
+    currentPhase: "execute",
+    createdAt: "456",
+  };
+  const { api, state, calls } = createHarness({
+    state: { sessionId: "session-4", runInspectPending: true, activeRunStartedAtMs: null },
+  });
+
+  dispatchOperatorSurfaceEvent(
+    {
+      family: "run",
+      type: "run.inspect",
+      payload,
+      payloadRecord: payload,
+      payloadList: null,
+      isSessionScoped: true,
+      message: {},
+    },
+    null,
+    api,
+  );
+
+  assert.equal(state.runState, "needs_verification");
+  assert.equal(state.runPhase, "execute");
+  assert.equal(state.activeRunStartedAtMs, 456);
+  assert.deepEqual(calls, [
+    ["hydratePlannerDagFromTraceArtifacts", "session-4"],
+    ["status", "run inspect loaded: needs verification"],
+  ]);
+});
+
+test("dispatchOperatorSurfaceEvent preserves completion truth on run.updated payloads", () => {
+  const payload = {
+    sessionId: "session-5",
+    state: "working",
+    completionState: "needs_verification",
+    remainingRequirements: ["workflow_verifier_pass"],
+    currentPhase: "active",
+    explanation: "Verification is still required.",
+  };
+  const { api, state, calls } = createHarness({
+    state: {
+      sessionId: "session-5",
+      runState: "working",
+      runPhase: "planning",
+      activeRunStartedAtMs: null,
+    },
+  });
+
+  dispatchOperatorSurfaceEvent(
+    {
+      family: "run",
+      type: "run.updated",
+      payload,
+      payloadRecord: payload,
+      payloadList: null,
+      isSessionScoped: true,
+      message: {},
+    },
+    null,
+    api,
+  );
+
+  assert.equal(state.runState, "needs_verification");
+  assert.equal(state.runPhase, "active");
+  assert.equal(state.activeRunStartedAtMs, 123);
+  assert.deepEqual(calls, [
+    ["status", "run updated: needs verification"],
+    [
+      "pushEvent",
+      "run",
+      "Run Update",
+      [
+        "completion state: needs_verification",
+        "run state: working",
+        "phase: active",
+        "remaining requirements: workflow_verifier_pass",
+        "session: session-5",
+        "explanation: Verification is still required.",
+      ].join("\n"),
+      "magenta",
+    ],
+    ["requestRunInspect", "run update", null],
   ]);
 });
 

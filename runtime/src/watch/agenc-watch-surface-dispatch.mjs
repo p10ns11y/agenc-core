@@ -32,6 +32,37 @@ export function dispatchOperatorSurfaceEvent(surfaceEvent, rawMessage, api) {
   }
 }
 
+function normalizeCompletionState(value) {
+  const normalized = String(value ?? "").trim();
+  return normalized === "completed" ||
+      normalized === "partial" ||
+      normalized === "blocked" ||
+      normalized === "needs_verification"
+    ? normalized
+    : "";
+}
+
+function normalizeRemainingRequirements(value) {
+  return Array.isArray(value)
+    ? value
+      .map((entry) => String(entry ?? "").trim())
+      .filter(Boolean)
+    : [];
+}
+
+function preferredRunSurfaceState(payload, priorState) {
+  const completionState = normalizeCompletionState(payload?.completionState);
+  return {
+    completionState,
+    remainingRequirements: normalizeRemainingRequirements(payload?.remainingRequirements),
+    runState:
+      completionState ||
+      (typeof payload?.state === "string" && payload.state.trim()
+        ? payload.state.trim()
+        : priorState ?? null),
+  };
+}
+
 function handleSubscriptionSurfaceEvent(surfaceEvent, api) {
   const payload = surfaceEvent.payloadRecord;
   switch (surfaceEvent.type) {
@@ -157,6 +188,14 @@ function handleChatSurfaceEvent(surfaceEvent, state, api) {
     case "chat.typing":
       api.setTransientStatus("agent is typing…");
       return true;
+    case "chat.response":
+      if (typeof payload.completionState === "string" && payload.completionState.trim()) {
+        state.runState = payload.completionState.trim();
+        state.runPhase = null;
+        state.activeRunStartedAtMs = null;
+        api.setTransientStatus(`run ${state.runState.replace(/_/g, " ")}`);
+      }
+      return true;
     case "chat.cancelled":
       api.eventStore.cancelAgentStream("cancelled");
       api.setTransientStatus("chat cancelled");
@@ -252,37 +291,62 @@ function handleRunSurfaceEvent(surfaceEvent, state, api) {
       api.eventStore.pushEvent("runs", "Run List", api.tryPrettyJson(surfaceEvent.payloadList ?? []), "blue");
       return true;
     case "run.inspect":
-      state.runInspectPending = false;
-      state.runDetail = payload;
-      state.currentObjective = payload.objective ?? state.currentObjective;
-      state.runState = payload.state ?? state.runState;
-      state.runPhase = payload.currentPhase ?? state.runPhase;
-      state.activeRunStartedAtMs = Number.isFinite(Number(payload.createdAt))
-        ? Number(payload.createdAt)
-        : state.activeRunStartedAtMs ?? api.now();
-      api.hydratePlannerDagFromTraceArtifacts(payload.sessionId ?? state.sessionId);
-      api.setTransientStatus(`run inspect loaded: ${state.runState ?? "unknown"}`);
+      {
+        const runTruth = preferredRunSurfaceState(payload, state.runState);
+        state.runInspectPending = false;
+        state.runDetail = payload;
+        state.currentObjective = payload.objective ?? state.currentObjective;
+        state.runState = runTruth.runState ?? state.runState;
+        state.runPhase = payload.currentPhase ?? state.runPhase;
+        state.activeRunStartedAtMs = Number.isFinite(Number(payload.createdAt))
+          ? Number(payload.createdAt)
+          : state.activeRunStartedAtMs ?? api.now();
+        api.hydratePlannerDagFromTraceArtifacts(payload.sessionId ?? state.sessionId);
+        api.setTransientStatus(
+          `run inspect loaded: ${String(state.runState ?? "unknown").replace(/_/g, " ")}`,
+        );
+      }
       return true;
     case "run.updated":
-      state.runState = payload.state ?? state.runState;
-      state.runPhase = payload.currentPhase ?? state.runPhase;
-      if (!Number.isFinite(Number(state.activeRunStartedAtMs))) {
-        state.activeRunStartedAtMs = api.now();
+      {
+        const runTruth = preferredRunSurfaceState(payload, state.runState);
+        state.runDetail = state.runDetail && typeof state.runDetail === "object"
+          ? { ...state.runDetail, ...payload }
+          : payload;
+        state.runState = runTruth.runState ?? state.runState;
+        state.runPhase = payload.currentPhase ?? state.runPhase;
+        if (
+          typeof state.activeRunStartedAtMs !== "number" ||
+          !Number.isFinite(state.activeRunStartedAtMs)
+        ) {
+          state.activeRunStartedAtMs = api.now();
+        }
+        api.setTransientStatus(
+          `run updated: ${String(state.runState ?? "unknown").replace(/_/g, " ")}`,
+        );
+        api.eventStore.pushEvent(
+          "run",
+          "Run Update",
+          [
+            runTruth.completionState ? `completion state: ${runTruth.completionState}` : null,
+            runTruth.completionState &&
+            typeof payload.state === "string" &&
+            payload.state.trim() &&
+            payload.state.trim() !== runTruth.completionState
+              ? `run state: ${payload.state.trim()}`
+              : `state: ${state.runState ?? "unknown"}`,
+            `phase: ${state.runPhase ?? "unknown"}`,
+            runTruth.remainingRequirements.length > 0
+              ? `remaining requirements: ${runTruth.remainingRequirements.join(", ")}`
+              : null,
+            `session: ${payload.sessionId ?? state.sessionId ?? "unknown"}`,
+            payload.explanation ? `explanation: ${payload.explanation}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          "magenta",
+        );
       }
-      api.setTransientStatus(`run updated: ${state.runState ?? "unknown"}`);
-      api.eventStore.pushEvent(
-        "run",
-        "Run Update",
-        [
-          `state: ${state.runState ?? "unknown"}`,
-          `phase: ${state.runPhase ?? "unknown"}`,
-          `session: ${payload.sessionId ?? state.sessionId ?? "unknown"}`,
-          payload.explanation ? `explanation: ${payload.explanation}` : "",
-        ]
-          .filter(Boolean)
-          .join("\n"),
-        "magenta",
-      );
       api.requestRunInspect("run update");
       return true;
     default:

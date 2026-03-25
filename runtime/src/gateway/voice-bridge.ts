@@ -25,6 +25,7 @@ import type { SessionManager } from "./session.js";
 import type { HookDispatcher } from "./hooks.js";
 import type { ApprovalEngine } from "./approvals.js";
 import type { MemoryBackend } from "../memory/types.js";
+import { EffectLedger } from "../workflow/effect-ledger.js";
 import { createGatewayMessage } from "./message.js";
 import { createSessionToolHandler } from "./tool-handler-factory.js";
 import { buildChatUsagePayload } from "./chat-usage.js";
@@ -426,6 +427,9 @@ export class VoiceBridge {
   ): ToolHandler {
     const { hooks, approvalEngine, desktopRouterFactory, toolHandler } =
       this.config;
+    const effectLedger = this.config.memoryBackend
+      ? EffectLedger.fromMemoryBackend(this.config.memoryBackend)
+      : undefined;
 
     const baseHandler = createSessionToolHandler({
       sessionId,
@@ -438,6 +442,8 @@ export class VoiceBridge {
       send,
       hooks,
       approvalEngine,
+      effectLedger,
+      effectChannel: "voice",
       delegation: this.config.delegation,
     });
 
