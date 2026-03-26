@@ -12,6 +12,7 @@ import type { MemoryBackend } from "../memory/types.js";
 import type { MemoryRetriever } from "../llm/chat-executor.js";
 import type { Logger } from "../utils/logger.js";
 import { safeStringify } from "../tools/types.js";
+import { assessExecuteWithAgentResult } from "../utils/delegated-scope-trust.js";
 import { SEVEN_DAYS_MS } from "../utils/async.js";
 
 // ============================================================================
@@ -86,7 +87,19 @@ export function summarizeToolResult(
   durationMs: number,
 ): string {
   const argStr = truncate(safeStringify(args), MAX_ARGS_PREVIEW_CHARS);
-  const resultStr = truncate(result, MAX_RESULT_PREVIEW_CHARS);
+  const delegatedScopeAssessment =
+    toolName === "execute_with_agent"
+      ? assessExecuteWithAgentResult({ args, result })
+      : undefined;
+  const resultStr = truncate(
+    delegatedScopeAssessment?.delegatedScopeTrust === "rejected_invalid_scope"
+      ? "[delegated scope rejected by runtime]"
+      : delegatedScopeAssessment?.delegatedScopeTrust ===
+          "informational_untrusted"
+        ? "[delegated cwd/workspace fact treated as informational only]"
+        : result,
+    MAX_RESULT_PREVIEW_CHARS,
+  );
   return `${toolName}(${argStr}) -> ${resultStr} [${durationMs}ms]`;
 }
 

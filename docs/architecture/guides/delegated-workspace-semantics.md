@@ -6,13 +6,18 @@ This guide defines the final delegated local-file execution rules for AgenC runt
 
 Delegated local-file execution has one executable filesystem contract:
 
-- `executionContext.workspaceRoot`
-- `executionContext.allowedReadRoots`
-- `executionContext.allowedWriteRoots`
-- `executionContext.requiredSourceArtifacts`
-- `executionContext.targetArtifacts`
+- runtime-owned `executionContext.workspaceRoot`
+- runtime-owned `executionContext.allowedReadRoots`
+- runtime-owned `executionContext.allowedWriteRoots`
+- validated `executionContext.requiredSourceArtifacts`
+- validated `executionContext.targetArtifacts`
 
 Those values are canonical concrete host paths by the time a child session is spawned.
+
+On the live public `execute_with_agent` path, the model must not supply the
+first trusted root. The public contract may carry bounded artifact and
+verification hints, but the runtime derives the child workspace root and
+allowed roots from trusted parent session state.
 
 ## Why `/workspace` is presentation-only
 
@@ -65,9 +70,9 @@ Why:
 When delegated local-file spawn fails before child execution, check these in order:
 
 1. Does the step carry a canonical `executionContext`?
-2. Does `executionContext.workspaceRoot` match the child `workingDirectory`?
-3. Are all required source artifacts inside `allowedReadRoots` and present on disk?
-4. Are all target artifacts inside `allowedWriteRoots`?
+2. Does the runtime-owned `executionContext.workspaceRoot` match the child `workingDirectory`?
+3. Are all required source artifacts inside the runtime-owned `allowedReadRoots` and present on disk?
+4. Are all target artifacts inside the runtime-owned `allowedWriteRoots`?
 5. Are any paths still using `/workspace/...` instead of concrete host paths?
 
 Common failure modes:

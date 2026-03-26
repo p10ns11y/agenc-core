@@ -376,6 +376,107 @@ You have broad access to this machine via the system.bash tool.`,
     });
   });
 
+  it("persists delegated scope trust metadata for poisoned child cwd summaries", async () => {
+    const logger = createLoggerStub();
+    const memoryBackend = createMemoryBackendStub();
+    const session = createSession();
+    const sessionMgr = {
+      getOrCreate: vi.fn(() => session),
+      appendMessage: vi.fn(),
+      compact: vi.fn(async () => undefined),
+    } as any;
+    const webChat = {
+      createAbortController: vi.fn(() => new AbortController()),
+      clearAbortController: vi.fn(),
+      send: vi.fn(async () => undefined),
+      pushToSession: vi.fn(),
+      broadcastEvent: vi.fn(),
+    } as any;
+    const hooks = {
+      dispatch: vi.fn(async () => ({ completed: true, payload: {} })),
+    } as any;
+    const signals = {
+      signalThinking: vi.fn(),
+      signalIdle: vi.fn(),
+    };
+    const result = createResult({
+      content: "Subagent cwd: /",
+      toolCalls: [
+        {
+          name: "execute_with_agent",
+          args: { task: "Run pwd in the child and report it." },
+          result: JSON.stringify({
+            success: true,
+            output: "Subagent cwd: /",
+          }),
+          isError: false,
+          durationMs: 11,
+        },
+      ],
+    });
+    const execute = vi.fn(async () => result);
+
+    await executeWebChatConversationTurn({
+      logger,
+      msg: {
+        sessionId: "session:test",
+        senderId: "operator-1",
+        channel: "webchat",
+        content: "what did the child cwd say?",
+      },
+      webChat,
+      chatExecutor: { execute } as any,
+      sessionMgr,
+      getSystemPrompt: () => "sys",
+      sessionToolHandler: vi.fn() as any,
+      sessionStreamCallback: vi.fn(),
+      signals,
+      hooks,
+      memoryBackend,
+      sessionTokenBudget: 16_000,
+      defaultMaxToolRounds: 3,
+      contextWindowTokens: 64_000,
+      traceConfig: {
+        enabled: false,
+        includeHistory: true,
+        includeSystemPrompt: true,
+        includeToolArgs: true,
+        includeToolResults: true,
+        includeProviderPayloads: false,
+        maxChars: 20_000,
+      },
+      turnTraceId: "trace-2",
+      buildToolRoutingDecision: () => undefined,
+      recordToolRoutingOutcome: vi.fn(),
+      getSessionTokenUsage: () => 42,
+    });
+
+    expect(hooks.dispatch).toHaveBeenCalledWith("message:outbound", {
+      sessionId: "session:test",
+      content: "Subagent cwd: /",
+      provider: "grok",
+      userMessage: "what did the child cwd say?",
+      agentResponse: "Subagent cwd: /",
+      agentResponseMetadata: {
+        delegatedScopeTrust: "informational_untrusted",
+        delegatedScopeTrustReason: "assistant_delegated_environment_summary",
+        delegatedScopeContainsEnvironmentFact: true,
+        memoryRole: "working",
+      },
+    });
+    expect(memoryBackend.addEntry).toHaveBeenNthCalledWith(2, {
+      sessionId: "session:test",
+      role: "assistant",
+      content: "Subagent cwd: /",
+      metadata: {
+        delegatedScopeTrust: "informational_untrusted",
+        delegatedScopeTrustReason: "assistant_delegated_environment_summary",
+        delegatedScopeContainsEnvironmentFact: true,
+        memoryRole: "working",
+      },
+    });
+  });
+
   it("broadcasts planner trace events to webchat even when trace logging is disabled", async () => {
     const logger = createLoggerStub();
     const memoryBackend = createMemoryBackendStub();
@@ -597,5 +698,85 @@ You have broad access to this machine via the system.bash tool.`,
     expect(sessionMgr.appendMessage).not.toHaveBeenCalled();
     expect(hooks.dispatch).not.toHaveBeenCalled();
     expect(memoryBackend.addEntry).not.toHaveBeenCalled();
+  });
+
+  it("passes the session workspace root into planner/runtime execution instead of a conflicting message root", async () => {
+    const logger = createLoggerStub();
+    const memoryBackend = createMemoryBackendStub();
+    const session = createSession();
+    const sessionMgr = {
+      getOrCreate: vi.fn(() => session),
+      appendMessage: vi.fn(),
+      compact: vi.fn(async () => undefined),
+    } as any;
+    const webChat = {
+      createAbortController: vi.fn(() => new AbortController()),
+      clearAbortController: vi.fn(),
+      send: vi.fn(async () => undefined),
+      pushToSession: vi.fn(),
+      broadcastEvent: vi.fn(),
+      loadSessionWorkspaceRoot: vi
+        .fn(async () => "/home/tetsuo/git/stream-test/agenc-shell"),
+    } as any;
+    const hooks = {
+      dispatch: vi.fn(async () => ({ completed: true, payload: {} })),
+    } as any;
+    const signals = {
+      signalThinking: vi.fn(),
+      signalIdle: vi.fn(),
+    };
+    const execute = vi.fn(async () => createResult());
+
+    await executeWebChatConversationTurn({
+      logger,
+      msg: {
+        sessionId: "session:test",
+        senderId: "operator-1",
+        channel: "webchat",
+        content: "Read PLAN.md and execute the implementation plan.",
+        metadata: { workspaceRoot: "/home/tetsuo/git/AgenC" },
+      },
+      webChat,
+      chatExecutor: {
+        execute,
+      } as any,
+      sessionMgr,
+      getSystemPrompt: () => "system",
+      sessionToolHandler: vi.fn() as any,
+      sessionStreamCallback: vi.fn(),
+      signals,
+      hooks,
+      memoryBackend,
+      sessionTokenBudget: 16_000,
+      defaultMaxToolRounds: 3,
+      contextWindowTokens: 64_000,
+      traceConfig: {
+        enabled: false,
+        includeHistory: true,
+        includeSystemPrompt: true,
+        includeToolArgs: true,
+        includeToolResults: true,
+        includeProviderPayloads: false,
+        maxChars: 20_000,
+      },
+      turnTraceId: "trace-2",
+      buildToolRoutingDecision: () => undefined,
+      recordToolRoutingOutcome: vi.fn(),
+      getSessionTokenUsage: () => 0,
+    });
+
+    expect(webChat.loadSessionWorkspaceRoot).toHaveBeenCalledWith("session:test");
+    expect(execute).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runtimeContext: {
+          workspaceRoot: "/home/tetsuo/git/stream-test/agenc-shell",
+        },
+        message: expect.objectContaining({
+          metadata: expect.objectContaining({
+            workspaceRoot: "/home/tetsuo/git/stream-test/agenc-shell",
+          }),
+        }),
+      }),
+    );
   });
 });

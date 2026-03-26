@@ -3,6 +3,10 @@ import type { ChatToolRoutingSummary } from "../llm/chat-executor.js";
 import type { Logger } from "../utils/logger.js";
 import { silentLogger } from "../utils/logger.js";
 import {
+  inferParentSafeReadOnlyIntrospection,
+  resolveParentSafeReadOnlyIntrospectionToolNames,
+} from "../utils/parent-safe-introspection.js";
+import {
   HIGH_SIGNAL_BROWSER_TOOL_NAMES,
   LOW_SIGNAL_BROWSER_TOOL_NAMES,
   PRIMARY_BROWSER_READ_TOOL_NAMES,
@@ -940,19 +944,37 @@ export class ToolRouter {
       };
     }
 
-    const currentIntentTerms = toTerms(params.messageText);
-    const intentTerms = this.extractIntentTerms(currentIntentTerms, params.history);
     const explicitToolMentions = this.extractExplicitToolMentions(params.messageText);
+    const parentSafeIntrospection = inferParentSafeReadOnlyIntrospection(
+      params.messageText,
+    );
+    const currentIntentTerms = toTerms(params.messageText);
+    const intentTerms = parentSafeIntrospection
+      ? [...currentIntentTerms]
+      : this.extractIntentTerms(currentIntentTerms, params.history);
     const blockedToolNames = inferBlockedToolNamesForMessage(
       params.messageText,
       this.allToolNames,
     );
-    const constrainedAllowedToolNames = inferConstrainedAllowedToolNamesForMessage(
-      params.messageText,
-      explicitToolMentions,
-      this.allToolNames,
-    );
-    const clusterKey = intentTerms.slice(0, 6).join("|") || "general";
+    const parentSafeAllowedToolNames = parentSafeIntrospection
+      ? new Set(
+          resolveParentSafeReadOnlyIntrospectionToolNames(
+            parentSafeIntrospection,
+            this.allToolNames,
+          ),
+        )
+      : null;
+    const constrainedAllowedToolNames =
+      parentSafeAllowedToolNames && parentSafeAllowedToolNames.size > 0
+        ? parentSafeAllowedToolNames
+        : inferConstrainedAllowedToolNamesForMessage(
+            params.messageText,
+            explicitToolMentions,
+            this.allToolNames,
+          );
+    const clusterKey = parentSafeIntrospection
+      ? `parent_safe_introspection:${parentSafeIntrospection.command}`
+      : intentTerms.slice(0, 6).join("|") || "general";
     const now = Date.now();
     const cached = this.cache.get(params.sessionId);
     const requiredFamilies = requiredFamiliesForTerms(currentIntentTerms);
@@ -960,7 +982,7 @@ export class ToolRouter {
     const terminalIntent = resolveTerminalIntent(currentIntentTerms);
 
     let invalidatedReason: string | undefined;
-    if (cached) {
+    if (cached && !parentSafeIntrospection) {
       const cachedTerminalIntent = resolveTerminalIntent(cached.terms);
       if (cached.missCount >= this.config.pivotMissThreshold) {
         invalidatedReason = "tool_miss_threshold";
@@ -1021,6 +1043,9 @@ export class ToolRouter {
           },
         );
       }
+    }
+    if (cached && parentSafeIntrospection) {
+      invalidatedReason = "parent_safe_introspection";
     }
 
     const hasHostCodegenIntent = inferHostCodegenIntent(params.messageText);

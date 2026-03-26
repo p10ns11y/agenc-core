@@ -1,6 +1,6 @@
 import type { ToolRoutingDecision } from "./tool-routing.js";
 
-export const COMPLEX_TURN_MAX_TOOL_ROUNDS = 20;
+export const COMPLEX_TURN_MAX_TOOL_ROUNDS = 2_048;
 
 const HIGH_ITERATION_TOOL_NAMES = new Set<string>([
   "desktop.text_editor",

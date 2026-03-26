@@ -21,17 +21,6 @@ export interface CompletionStateToolCall {
   readonly isError: boolean;
 }
 
-const DIRECT_MUTATION_TOOL_NAMES = new Set([
-  "desktop.text_editor",
-  "system.appendFile",
-  "system.delete",
-  "system.mkdir",
-  "system.move",
-  "system.writeFile",
-]);
-
-const SHELL_MUTATION_RE = /(?:^|[;&|]\s*|\n)\s*(?:cp|mv|rm|mkdir|touch|tee|sed|perl|python|node|ruby|go|cargo|npm|pnpm|yarn|make|cmake)\b|>>?|(?:^|[;&|]\s*|\n)\s*cat\s+.+>>?/i;
-
 export function resolvePipelineCompletionState(input: {
   readonly status: "running" | "completed" | "failed" | "halted";
   readonly completedSteps: number;
@@ -48,8 +37,6 @@ export function resolvePipelineCompletionState(input: {
 export function resolveWorkflowCompletionState(input: {
   readonly stopReason: string;
   readonly toolCalls: readonly CompletionStateToolCall[];
-  readonly plannerUsed?: boolean;
-  readonly deterministicStepsExecuted?: number;
   readonly verificationContract?: WorkflowVerificationContract;
   readonly completionContract?: ImplementationCompletionContract;
   readonly validationCode?: DelegationOutputValidationCode;
@@ -64,9 +51,6 @@ export function resolveWorkflowCompletionState(input: {
     (toolCall) => !didToolCallFail(toolCall.isError, toolCall.result),
   );
   const hasProgress = successfulToolCalls.length > 0;
-  const hasMutationProgress = successfulToolCalls.some((toolCall) =>
-    isMutationToolCall(toolCall),
-  );
   const requiresExplicitVerification = Boolean(
     obligations &&
       (
@@ -75,13 +59,8 @@ export function resolveWorkflowCompletionState(input: {
         obligations.requiresReviewVerification
       ),
   );
-  const requiresDeterministicImplementationVerification =
-    !obligations?.completionContract &&
-    input.plannerUsed === true &&
-    Number(input.deterministicStepsExecuted ?? 0) > 0 &&
-    hasMutationProgress;
   const requiresVerificationBeforeCompletion =
-    requiresExplicitVerification || requiresDeterministicImplementationVerification;
+    requiresExplicitVerification;
 
   if (input.stopReason === "completed") {
     if (
@@ -128,21 +107,4 @@ function mergeVerificationContract(input: {
       ? { completionContract: input.completionContract }
       : {}),
   };
-}
-
-function isMutationToolCall(toolCall: CompletionStateToolCall): boolean {
-  if (DIRECT_MUTATION_TOOL_NAMES.has(toolCall.name.trim())) {
-    return true;
-  }
-  if (toolCall.name !== "system.bash" && toolCall.name !== "desktop.bash") {
-    return false;
-  }
-  const command =
-    toolCall.args &&
-    typeof toolCall.args === "object" &&
-    !Array.isArray(toolCall.args) &&
-    typeof (toolCall.args as { command?: unknown }).command === "string"
-      ? String((toolCall.args as { command: string }).command)
-      : "";
-  return SHELL_MUTATION_RE.test(command);
 }

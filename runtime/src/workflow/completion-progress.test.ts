@@ -26,8 +26,17 @@ describe("completion-progress", () => {
           isError: false,
         },
       ],
-      plannerUsed: true,
-      deterministicStepsExecuted: 2,
+      verificationContract: {
+        workspaceRoot: "/workspace",
+        targetArtifacts: ["/workspace/src/main.c"],
+        verificationMode: "mutation_required",
+        completionContract: {
+          taskClass: "build_required",
+          placeholdersAllowed: false,
+          partialCompletionAllowed: false,
+          placeholderTaxonomy: "implementation",
+        },
+      },
       updatedAt: 10,
     });
 
@@ -65,8 +74,17 @@ describe("completion-progress", () => {
           isError: false,
         },
       ],
-      plannerUsed: true,
-      deterministicStepsExecuted: 1,
+      verificationContract: {
+        workspaceRoot: "/workspace",
+        targetArtifacts: ["/workspace/src/main.c"],
+        verificationMode: "mutation_required",
+        completionContract: {
+          taskClass: "build_required",
+          placeholdersAllowed: false,
+          partialCompletionAllowed: false,
+          placeholderTaxonomy: "implementation",
+        },
+      },
       updatedAt: 5,
     });
     const next = {
@@ -97,6 +115,133 @@ describe("completion-progress", () => {
         expect.objectContaining({
           requirement: "build_verification",
           summary: "ctest",
+        }),
+      ]),
+    );
+  });
+
+  it("produces the same progress requirements for equivalent direct and planner implementation contracts", () => {
+    const direct = deriveWorkflowProgressSnapshot({
+      stopReason: "completed",
+      completionState: "needs_verification",
+      toolCalls: [
+        {
+          name: "system.writeFile",
+          args: { path: "/workspace/src/main.c" },
+          result: JSON.stringify({ ok: true }),
+          isError: false,
+        },
+      ],
+      verificationContract: {
+        workspaceRoot: "/workspace",
+        targetArtifacts: ["/workspace/src/main.c"],
+        verificationMode: "mutation_required",
+        completionContract: {
+          taskClass: "artifact_only",
+          placeholdersAllowed: false,
+          partialCompletionAllowed: false,
+          placeholderTaxonomy: "implementation",
+        },
+      },
+      updatedAt: 20,
+    });
+    const planner = deriveWorkflowProgressSnapshot({
+      stopReason: "completed",
+      completionState: "needs_verification",
+      toolCalls: [
+        {
+          name: "system.writeFile",
+          args: { path: "/workspace/src/main.c" },
+          result: JSON.stringify({ ok: true }),
+          isError: false,
+        },
+      ],
+      verificationContract: {
+        workspaceRoot: "/workspace",
+        targetArtifacts: ["/workspace/src/main.c"],
+        verificationMode: "mutation_required",
+        stepKind: "delegated_write",
+        completionContract: {
+          taskClass: "artifact_only",
+          placeholdersAllowed: false,
+          partialCompletionAllowed: false,
+          placeholderTaxonomy: "implementation",
+        },
+      },
+      updatedAt: 20,
+    });
+
+    expect(direct).toMatchObject({
+      requiredRequirements: ["workflow_verifier_pass"],
+      remainingRequirements: ["workflow_verifier_pass"],
+    });
+    expect(planner).toMatchObject({
+      requiredRequirements: ["workflow_verifier_pass"],
+      remainingRequirements: ["workflow_verifier_pass"],
+    });
+  });
+
+  it("preserves needs-verification carryover when a later snapshot blocks before verifier closure", () => {
+    const previous = deriveWorkflowProgressSnapshot({
+      stopReason: "completed",
+      completionState: "needs_verification",
+      toolCalls: [
+        {
+          name: "system.bash",
+          args: { command: "npm test" },
+          result: JSON.stringify({
+            stdout: "ok",
+            stderr: "",
+            exitCode: 0,
+            __agencVerification: {
+              category: "build",
+              repoLocal: true,
+              command: "npm test",
+            },
+          }),
+          isError: false,
+        },
+      ],
+      verificationContract: {
+        workspaceRoot: "/workspace",
+        targetArtifacts: ["/workspace/src/main.c"],
+        verificationMode: "mutation_required",
+        completionContract: {
+          taskClass: "build_required",
+          placeholdersAllowed: false,
+          partialCompletionAllowed: false,
+          placeholderTaxonomy: "implementation",
+        },
+      },
+      updatedAt: 5,
+    });
+    const next = {
+      completionState: "blocked" as const,
+      stopReason: "validation_error" as const,
+      stopReasonDetail: "Verification artifacts are still missing",
+      requiredRequirements: [] as const,
+      satisfiedRequirements: [] as const,
+      remainingRequirements: [] as const,
+      reusableEvidence: [] as const,
+      updatedAt: 15,
+    };
+
+    const merged = mergeWorkflowProgressSnapshots({
+      previous,
+      next,
+    });
+
+    expect(merged).toMatchObject({
+      completionState: "needs_verification",
+      remainingRequirements: ["workflow_verifier_pass"],
+      stopReason: "validation_error",
+      stopReasonDetail: "Verification artifacts are still missing",
+    });
+    expect(merged?.reusableEvidence).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          requirement: "build_verification",
+          summary: "npm test",
         }),
       ]),
     );

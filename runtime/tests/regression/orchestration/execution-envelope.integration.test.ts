@@ -7,6 +7,7 @@ import { createMockMemoryBackend } from "../../../src/memory/test-utils.js";
 import { PipelineExecutor } from "../../../src/workflow/pipeline.js";
 import type { SubAgentConfig, SubAgentResult } from "../../../src/gateway/sub-agent.js";
 import { SubAgentOrchestrator } from "../../../src/gateway/subagent-orchestrator.js";
+import { deriveDelegatedExecutionEnvelopeFromParent } from "../../../src/utils/delegation-execution-context.js";
 
 class RecordingManager {
   private readonly entries = new Map<string, SubAgentResult>();
@@ -120,25 +121,44 @@ describe("execution envelope integration", () => {
       ],
     });
 
+    const directDerivation = deriveDelegatedExecutionEnvelopeFromParent({
+      parentWorkspaceRoot: workspaceRoot,
+      parentAllowedReadRoots: [workspaceRoot],
+      parentAllowedWriteRoots: [workspaceRoot],
+      requestedExecutionContext: {
+        version: "v1",
+        workspaceRoot,
+        allowedReadRoots: [workspaceRoot],
+        allowedWriteRoots: [workspaceRoot],
+        requiredSourceArtifacts: [`${workspaceRoot}/PLAN.md`],
+        targetArtifacts: [`${workspaceRoot}/AGENC.md`],
+        allowedTools: ["system.readFile", "system.writeFile"],
+        effectClass: "filesystem_write",
+        verificationMode: "mutation_required",
+        stepKind: "delegated_write",
+      },
+      requiresStructuredExecutionContext: true,
+      source: "direct_live_path",
+    });
+
     expect(result.status).toMatch(/^(?:completed|failed)$/);
+    expect(directDerivation.ok).toBe(true);
     expect(manager.spawnCalls).toHaveLength(1);
     expect(manager.spawnCalls[0]).toMatchObject({
-      workingDirectory: workspaceRoot,
+      workingDirectory: directDerivation.ok
+        ? directDerivation.workingDirectory
+        : workspaceRoot,
       workingDirectorySource: "execution_envelope",
     });
     expect(manager.spawnCalls[0]?.tools).toEqual(
       expect.arrayContaining(["system.readFile", "system.writeFile"]),
     );
     expect(manager.spawnCalls[0]?.delegationSpec?.executionContext).toEqual(
-      expect.objectContaining({
-        workspaceRoot,
-        requiredSourceArtifacts: [`${workspaceRoot}/PLAN.md`],
-        targetArtifacts: [`${workspaceRoot}/AGENC.md`],
-      }),
+      directDerivation.ok ? directDerivation.executionContext : undefined,
     );
   });
 
-  it("rejects delegated workspace aliases instead of canonicalizing them into live execution scope", async () => {
+  it("derives planner child scope from trusted parent authority instead of treating workspace aliases as live root truth", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "agenc-envelope-"));
     TEMP_DIRS.push(workspaceRoot);
     writeFileSync(join(workspaceRoot, "PLAN.md"), "# plan\n", "utf8");
@@ -150,6 +170,7 @@ describe("execution envelope integration", () => {
       output: '{"status":"completed","summary":"updated PLAN.md"}',
       success: true,
       durationMs: 12,
+      completionState: "completed",
       toolCalls: [
         {
           name: "system.readFile",
@@ -209,11 +230,36 @@ describe("execution envelope integration", () => {
       ],
     });
 
-    expect(result.status).toBe("failed");
-    expect(result.error).toContain(
-      "Delegated local-file work must have a canonical workspace root before child execution.",
+    const directDerivation = deriveDelegatedExecutionEnvelopeFromParent({
+      parentWorkspaceRoot: workspaceRoot,
+      parentAllowedReadRoots: [workspaceRoot],
+      parentAllowedWriteRoots: [workspaceRoot],
+      requestedExecutionContext: {
+        version: "v1",
+        allowedReadRoots: [workspaceRoot],
+        allowedWriteRoots: [],
+        requiredSourceArtifacts: [`${workspaceRoot}/PLAN.md`],
+        allowedTools: ["system.readFile"],
+        effectClass: "read_only",
+        verificationMode: "grounded_read",
+        stepKind: "delegated_review",
+      },
+      requiresStructuredExecutionContext: true,
+      source: "direct_live_path",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(directDerivation.ok).toBe(true);
+    expect(manager.spawnCalls).toHaveLength(1);
+    expect(manager.spawnCalls[0]).toMatchObject({
+      workingDirectory: directDerivation.ok
+        ? directDerivation.workingDirectory
+        : workspaceRoot,
+      workingDirectorySource: "execution_envelope",
+    });
+    expect(manager.spawnCalls[0]?.delegationSpec?.executionContext).toEqual(
+      directDerivation.ok ? directDerivation.executionContext : undefined,
     );
-    expect(manager.spawnCalls).toHaveLength(0);
   });
 
   it("rejects broken delegated contracts before any child execution begins", async () => {
@@ -281,7 +327,170 @@ describe("execution envelope integration", () => {
     expect(result.status).toBe("failed");
     expect(manager.spawnCalls).toHaveLength(0);
     expect(result.error).toContain(
-      "Delegated local-file work must have a canonical workspace root before child execution.",
+      "outside the trusted parent workspace authority",
     );
+  });
+
+  it("derives the same narrowed child envelope for planner and direct descendant-scoped work", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "agenc-envelope-"));
+    const packageRoot = join(workspaceRoot, "packages", "shell");
+    TEMP_DIRS.push(workspaceRoot);
+    mkdirSync(packageRoot, { recursive: true });
+    writeFileSync(join(packageRoot, "PLAN.md"), "# plan\n", "utf8");
+    const baseExecutor = new PipelineExecutor({
+      toolHandler: async () => '{"stdout":"ok","exitCode":0}',
+      memoryBackend: createMockMemoryBackend(),
+    });
+    const manager = new RecordingManager({
+      output: '{"status":"completed","summary":"inspected package plan"}',
+      success: true,
+      durationMs: 12,
+      completionState: "completed",
+      toolCalls: [
+        {
+          name: "system.readFile",
+          args: { path: `${packageRoot}/PLAN.md` },
+          result: `{"path":"${packageRoot}/PLAN.md","content":"# plan"}`,
+          isError: false,
+          durationMs: 2,
+        },
+      ],
+      stopReason: "completed",
+    });
+    const orchestrator = new SubAgentOrchestrator({
+      fallbackExecutor: baseExecutor,
+      resolveSubAgentManager: () => manager,
+      pollIntervalMs: 5,
+      unsafeBenchmarkMode: true,
+    });
+
+    const requestedExecutionContext = {
+      version: "v1" as const,
+      workspaceRoot: packageRoot,
+      allowedReadRoots: [packageRoot],
+      allowedWriteRoots: [],
+      requiredSourceArtifacts: [`${packageRoot}/PLAN.md`],
+      allowedTools: ["system.readFile"],
+      effectClass: "read_only" as const,
+      verificationMode: "grounded_read" as const,
+      stepKind: "delegated_review" as const,
+    };
+
+    const result = await orchestrator.execute({
+      id: "planner:envelope:descendant-parity",
+      createdAt: Date.now(),
+      context: { results: {} },
+      steps: [],
+      plannerContext: {
+        parentRequest: "Inspect the shell package plan",
+        history: [],
+        memory: [],
+        toolOutputs: [],
+        workspaceRoot,
+      },
+      plannerSteps: [
+        {
+          name: "review_shell_plan",
+          stepType: "subagent_task",
+          objective: "Review the shell package plan",
+          inputContract: "Inspect the delegated PLAN.md under packages/shell.",
+          acceptanceCriteria: ["packages/shell/PLAN.md inspected"],
+          requiredToolCapabilities: ["system.readFile"],
+          contextRequirements: ["cwd=/workspace/packages/shell"],
+          executionContext: requestedExecutionContext,
+          maxBudgetHint: "2m",
+          canRunParallel: false,
+        },
+      ],
+    });
+
+    const directDerivation = deriveDelegatedExecutionEnvelopeFromParent({
+      parentWorkspaceRoot: workspaceRoot,
+      parentAllowedReadRoots: [workspaceRoot],
+      parentAllowedWriteRoots: [workspaceRoot],
+      requestedExecutionContext,
+      requiresStructuredExecutionContext: true,
+      source: "direct_live_path",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(directDerivation.ok).toBe(true);
+    expect(manager.spawnCalls).toHaveLength(1);
+    expect(manager.spawnCalls[0]).toMatchObject({
+      workingDirectory: directDerivation.ok
+        ? directDerivation.workingDirectory
+        : packageRoot,
+      workingDirectorySource: "execution_envelope",
+    });
+    expect(manager.spawnCalls[0]?.delegationSpec?.executionContext).toEqual(
+      directDerivation.ok ? directDerivation.executionContext : undefined,
+    );
+  });
+
+  it("rejects planner child workspace roots that widen outside the trusted parent authority", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "agenc-envelope-"));
+    const outsideRoot = mkdtempSync(join(tmpdir(), "agenc-envelope-outside-"));
+    TEMP_DIRS.push(workspaceRoot);
+    TEMP_DIRS.push(outsideRoot);
+    const baseExecutor = new PipelineExecutor({
+      toolHandler: async () => '{"stdout":"ok","exitCode":0}',
+      memoryBackend: createMockMemoryBackend(),
+    });
+    const manager = new RecordingManager({
+      output: '{"status":"completed","summary":"should not run"}',
+      success: true,
+      durationMs: 12,
+      toolCalls: [],
+      stopReason: "completed",
+    });
+    const orchestrator = new SubAgentOrchestrator({
+      fallbackExecutor: baseExecutor,
+      resolveSubAgentManager: () => manager,
+      pollIntervalMs: 5,
+    });
+
+    const result = await orchestrator.execute({
+      id: "planner:envelope:4",
+      createdAt: Date.now(),
+      context: { results: {} },
+      steps: [],
+      plannerContext: {
+        parentRequest: "Inspect PLAN.md",
+        history: [],
+        memory: [],
+        toolOutputs: [],
+        workspaceRoot,
+      },
+      plannerSteps: [
+        {
+          name: "review_plan",
+          stepType: "subagent_task",
+          objective: "Review the implementation plan",
+          inputContract: "Inspect PLAN.md in the delegated workspace.",
+          acceptanceCriteria: ["PLAN.md inspected"],
+          requiredToolCapabilities: ["system.readFile"],
+          contextRequirements: [],
+          executionContext: {
+            version: "v1",
+            workspaceRoot: outsideRoot,
+            allowedReadRoots: [outsideRoot],
+            allowedWriteRoots: [],
+            requiredSourceArtifacts: [join(outsideRoot, "PLAN.md")],
+            allowedTools: ["system.readFile"],
+            effectClass: "filesystem_read",
+            verificationMode: "evidence_only",
+            stepKind: "delegated_analysis",
+          },
+          maxBudgetHint: "2m",
+          canRunParallel: false,
+        },
+      ],
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain(
+      "outside the trusted parent workspace root",
+    );
+    expect(manager.spawnCalls).toHaveLength(0);
   });
 });

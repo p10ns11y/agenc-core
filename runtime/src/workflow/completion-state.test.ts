@@ -53,12 +53,10 @@ describe("completion-state", () => {
     ).toBe("needs_verification");
   });
 
-  it("marks the shell-stub incident shape as needs_verification before verifier rollout", () => {
+  it("marks deterministic implementation as needs_verification when the runtime-owned contract lacks verifier closure", () => {
     expect(
       resolveWorkflowCompletionState({
         stopReason: "completed",
-        plannerUsed: true,
-        deterministicStepsExecuted: 4,
         toolCalls: [
           {
             name: "system.bash",
@@ -76,6 +74,17 @@ describe("completion-state", () => {
             isError: false,
           },
         ],
+        verificationContract: {
+          workspaceRoot: "/workspace",
+          targetArtifacts: ["/workspace/src/jobs.c"],
+          verificationMode: "mutation_required",
+          completionContract: {
+            taskClass: "build_required",
+            placeholdersAllowed: false,
+            partialCompletionAllowed: false,
+            placeholderTaxonomy: "implementation",
+          },
+        },
         verifier: {
           performed: false,
           overall: "skipped",
@@ -132,5 +141,45 @@ describe("completion-state", () => {
         },
       }),
     ).toBe("needs_verification");
+  });
+
+  it("uses the same completion semantics for planner and direct implementation when the workflow contract matches", () => {
+    const sharedInput = {
+      stopReason: "completed",
+      toolCalls: [
+        {
+          name: "system.writeFile",
+          args: { path: "/workspace/src/main.c" },
+          result: JSON.stringify({ ok: true }),
+          isError: false,
+        },
+      ],
+      verificationContract: {
+        workspaceRoot: "/workspace",
+        targetArtifacts: ["/workspace/src/main.c"],
+        verificationMode: "mutation_required" as const,
+        completionContract: {
+          taskClass: "artifact_only" as const,
+          placeholdersAllowed: false,
+          partialCompletionAllowed: false,
+          placeholderTaxonomy: "implementation" as const,
+        },
+      },
+      verifier: {
+        performed: false,
+        overall: "skipped" as const,
+      },
+    };
+
+    expect(resolveWorkflowCompletionState(sharedInput)).toBe("completed");
+    expect(
+      resolveWorkflowCompletionState({
+        ...sharedInput,
+        verificationContract: {
+          ...sharedInput.verificationContract,
+          stepKind: "delegated_write",
+        },
+      }),
+    ).toBe("completed");
   });
 });

@@ -34,13 +34,12 @@ import {
   SUBAGENT_ORCHESTRATION_SECTION_RE,
 } from "./subagent-orchestrator-types.js";
 import {
-  redactSensitiveData,
+  sanitizeExecutionPromptText,
   truncateText,
   extractTerms,
 } from "./subagent-context-curation.js";
 import {
   buildDelegationExecutionContext,
-  canonicalizeDelegationExecutionContext,
   sanitizeDelegationContextRequirements,
 } from "../utils/delegation-execution-context.js";
 import type { DelegationStepAdmission } from "./delegation-admission.js";
@@ -48,6 +47,7 @@ import {
   isNodeWorkspaceRelevant,
   collectReachableVerificationCategories,
 } from "./subagent-workspace-probes.js";
+import { classifyDelegatedScopeTrustSignal } from "./subagent-failure-classification.js";
 
 /* ------------------------------------------------------------------ */
 /*  Parent request summarization                                       */
@@ -170,7 +170,7 @@ export function summarizeDownstreamRequirementStep(
       return [];
     }
     return [
-      `\`${step.name}\` expects: ${redactSensitiveData(inputContract)}`,
+      `\`${step.name}\` expects: ${sanitizeExecutionPromptText(inputContract)}`,
     ];
   }
 
@@ -214,7 +214,7 @@ export function summarizeDeterministicVerificationStep(
     return "Later deterministic verification reruns the workspace test command in non-interactive single-run mode.";
   }
 
-  return `Later deterministic verification runs \`${redactSensitiveData(rendered)}\`.`;
+  return `Later deterministic verification runs \`${sanitizeExecutionPromptText(rendered)}\`.`;
 }
 
 export function buildDownstreamRequirementLines(
@@ -337,8 +337,7 @@ export function buildEffectiveDelegationSpec(
     (reachableVerificationCategories.size > 0
       ? "deterministic_followup"
       : undefined);
-  const effectiveExecutionContext =
-    canonicalizeDelegationExecutionContext(step.executionContext);
+  const effectiveExecutionContext = step.executionContext;
   const sanitizedContextRequirements = sanitizeDelegationContextRequirements(
     step.contextRequirements,
   );
@@ -861,7 +860,7 @@ export function buildRetryTaskPrompt(
         "Do not guess or restate success. Ground the retry in the concrete probe failure details.",
       );
       corrections.push(
-        `Probe failure details: ${redactSensitiveData(failure.message)}`,
+        `Probe failure details: ${sanitizeExecutionPromptText(failure.message)}`,
       );
       if (
         step.acceptanceCriteria.some((criterion) =>
@@ -888,6 +887,30 @@ export function buildRetryTaskPrompt(
       );
       corrections.push(
         "Fix and verify the issue with the allowed tools first. If the issue remains unresolved, report the phase as blocked instead of successful.",
+      );
+    }
+    const delegatedScopeTrustSignal = classifyDelegatedScopeTrustSignal({
+      message: failure.message,
+      contextRequirements: step.contextRequirements,
+    });
+    if (delegatedScopeTrustSignal === "model_authored_invalid_root_attempt") {
+      corrections.push(
+        "Do not invent, widen, or restate workspace-root / cwd authority in free-form text. The runtime-owned execution envelope already defines the child filesystem boundary.",
+      );
+      corrections.push(
+        "If the runtime rejects a requested root or artifact path, keep all work inside the approved workspace scope instead of proposing another root.",
+      );
+    } else if (
+      delegatedScopeTrustSignal === "trusted_runtime_envelope_mismatch"
+    ) {
+      corrections.push(
+        "Treat the runtime-approved execution envelope as authoritative. Keep shell cwd, reads, writes, and artifact references aligned to that exact approved scope.",
+      );
+    } else if (
+      delegatedScopeTrustSignal === "informational_untrusted_cwd_mention"
+    ) {
+      corrections.push(
+        "Treat free-form cwd or working-directory mentions as informational only. Do not convert them into execution authority or alternative workspace roots.",
       );
     }
     if (
@@ -992,7 +1015,7 @@ export function buildHostToolingPromptSection(
   );
   if (profile.npm?.workspaceProtocolSupport === "unsupported") {
     const evidence = profile.npm.workspaceProtocolEvidence
-      ? ` (${redactSensitiveData(profile.npm.workspaceProtocolEvidence)})`
+      ? ` (${sanitizeExecutionPromptText(profile.npm.workspaceProtocolEvidence)})`
       : "";
     lines.push(
       "Empirical npm probe: local `workspace:*` dependency specifiers are unsupported on this host" +
@@ -1003,7 +1026,7 @@ export function buildHostToolingPromptSection(
     );
   } else if (profile.npm?.workspaceProtocolSupport === "unknown") {
     const evidence = profile.npm.workspaceProtocolEvidence
-      ? ` (${redactSensitiveData(profile.npm.workspaceProtocolEvidence)})`
+      ? ` (${sanitizeExecutionPromptText(profile.npm.workspaceProtocolEvidence)})`
       : "";
     lines.push(
       "Empirical npm probe could not confirm whether local `workspace:*` dependency specifiers work on this host" +

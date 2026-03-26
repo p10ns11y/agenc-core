@@ -63,6 +63,10 @@ export interface SessionEndResult {
   readonly proposedFacts: readonly string[];
 }
 
+export interface TurnIngestionMetadata {
+  readonly agentResponseMetadata?: Record<string, unknown>;
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -211,6 +215,7 @@ export class MemoryIngestionEngine {
     sessionId: string,
     userMessage: string,
     agentResponse: string,
+    metadata?: TurnIngestionMetadata,
   ): Promise<void> {
     const safeUserMessage = truncateForIngestion(userMessage);
     const safeAgentResponse = truncateForIngestion(agentResponse);
@@ -259,6 +264,7 @@ export class MemoryIngestionEngine {
                 confidence,
                 salienceScore: roundToTwoDecimals(salience),
                 contentHash,
+                ...(metadata?.agentResponseMetadata ?? {}),
               },
             },
             embedding,
@@ -284,6 +290,7 @@ export class MemoryIngestionEngine {
                 confidence,
                 salienceScore: roundToTwoDecimals(salience),
                 contentHash,
+                ...(metadata?.agentResponseMetadata ?? {}),
               },
             },
             embedding,
@@ -550,7 +557,12 @@ export function createIngestionHooks(
     priority: 200,
     handler: async (ctx: HookContext): Promise<HookResult> => {
       try {
-        const { sessionId, userMessage, agentResponse } = ctx.payload;
+        const {
+          sessionId,
+          userMessage,
+          agentResponse,
+          agentResponseMetadata,
+        } = ctx.payload;
         if (
           typeof sessionId !== "string" ||
           typeof userMessage !== "string" ||
@@ -564,7 +576,14 @@ export function createIngestionHooks(
 
         // Fire-and-forget — do not block the response pipeline
         void engine
-          .ingestTurn(sessionId, userMessage, agentResponse)
+          .ingestTurn(sessionId, userMessage, agentResponse, {
+            agentResponseMetadata:
+              typeof agentResponseMetadata === "object" &&
+                agentResponseMetadata !== null &&
+                !Array.isArray(agentResponseMetadata)
+                ? agentResponseMetadata as Record<string, unknown>
+                : undefined,
+          })
           .catch((err) => {
             log.error("memory-ingestion-turn: ingestTurn failed", err);
           });

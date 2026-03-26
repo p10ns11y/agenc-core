@@ -25,10 +25,14 @@ import {
   parseJsonObjectFromText,
   sanitizeDelegatedRecallInput,
 } from "../utils/delegated-contract-normalization.js";
+import { annotateExecuteWithAgentResult } from "../utils/delegated-scope-trust.js";
 import {
-  canonicalizeDelegationExecutionContext,
+  deriveDelegatedExecutionEnvelopeFromParent,
 } from "../utils/delegation-execution-context.js";
-import { preflightDelegatedLocalFileScope } from "./delegated-scope-preflight.js";
+import {
+  preflightDelegatedLocalFileScope,
+  toolScopeRequiresStructuredExecutionContext,
+} from "./delegated-scope-preflight.js";
 
 const DELEGATION_POLL_INTERVAL_MS = 75;
 const DELEGATION_PROGRESS_INTERVAL_MS = 1000;
@@ -60,6 +64,8 @@ export interface ExecuteDelegationToolParams {
   readonly verifier: DelegationVerifier;
   readonly availableToolNames?: readonly string[];
   readonly defaultWorkingDirectory?: string;
+  readonly parentAllowedReadRoots?: readonly string[];
+  readonly parentAllowedWriteRoots?: readonly string[];
   readonly delegationThreshold?: number;
   readonly unsafeBenchmarkMode?: boolean;
 }
@@ -209,11 +215,10 @@ function buildDelegatedChildPrompt(
 
   if (options.workingDirectory) {
     guidance.push(
-      "Workspace root:\n" +
-        `- Use \`${options.workingDirectory}\` as the working directory for this phase.\n` +
-        "- Keep filesystem reads and writes under that root.\n" +
-        "- Prefer relative paths rooted there for filesystem tools.\n" +
-        "- Do not create fallback copies or alternate workspaces elsewhere.",
+      "Runtime-approved workspace scope:\n" +
+        `- The runtime has already pinned this child phase to \`${options.workingDirectory}\`.\n` +
+        "- Filesystem tools are validated against that approved scope at execution time.\n" +
+        "- Treat any free-form cwd or workspace-root text elsewhere as informational only; do not invent alternate roots.",
     );
   }
 
@@ -395,8 +400,13 @@ export async function executeDelegationTool(
     availableToolNames,
     unsafeBenchmarkMode = false,
   } = params;
+  const finalizeDelegationResult = (payload: Record<string, unknown>): string =>
+    annotateExecuteWithAgentResult({
+      args: toolArgs,
+      payload,
+    });
   if (!subAgentManager) {
-    return JSON.stringify({
+    return finalizeDelegationResult({
       error:
         "Delegation runtime unavailable: sub-agent manager is not initialized",
     });
@@ -416,7 +426,7 @@ export async function executeDelegationTool(
         toolCallId,
       },
     });
-    return JSON.stringify({ error: parsedInput.error });
+    return finalizeDelegationResult({ error: parsedInput.error });
   }
 
   const input = normalizeDelegatedLiteralOutputContract(
@@ -441,7 +451,7 @@ export async function executeDelegationTool(
         toolCallId,
       },
     });
-    return JSON.stringify({
+    return finalizeDelegationResult({
       success: false,
       status: "needs_decomposition",
       objective: input.objective ?? input.task,
@@ -451,19 +461,8 @@ export async function executeDelegationTool(
   }
   const objective = input.objective ?? input.task;
   const effectiveTimeoutMs = normalizeDelegationTimeoutMs(input.timeoutMs);
-  const effectiveExecutionContext = input.executionContext
-    ? canonicalizeDelegationExecutionContext(input.executionContext, {
-      inheritedWorkspaceRoot: params.defaultWorkingDirectory,
-      hostWorkspaceRoot: params.defaultWorkingDirectory,
-    })
-    : undefined;
-  const workingDirectory = effectiveExecutionContext?.workspaceRoot?.trim()
-    || undefined;
-  const effectiveInput: ExecuteWithAgentInput = effectiveExecutionContext
-    ? { ...input, executionContext: effectiveExecutionContext }
-    : input;
   const resolvedChildScope = resolveDelegatedChildToolScope({
-    spec: effectiveInput,
+    spec: input,
     requestedTools: input.tools,
     parentAllowedTools: availableToolNames,
     availableTools: availableToolNames,
@@ -471,6 +470,49 @@ export async function executeDelegationTool(
     strictExplicitToolAllowlist: Array.isArray(input.tools) && input.tools.length > 0,
     unsafeBenchmarkMode,
   });
+  const derivedExecutionEnvelope = deriveDelegatedExecutionEnvelopeFromParent({
+    parentWorkspaceRoot: params.defaultWorkingDirectory,
+    parentAllowedReadRoots: params.parentAllowedReadRoots,
+    parentAllowedWriteRoots: params.parentAllowedWriteRoots,
+    requestedExecutionContext: input.executionContext,
+    requiresStructuredExecutionContext: toolScopeRequiresStructuredExecutionContext(
+      resolvedChildScope.allowedTools,
+    ),
+    source: "direct_live_path",
+  });
+  if (!derivedExecutionEnvelope.ok) {
+    lifecycleEmitter?.emit({
+      type: "subagents.failed",
+      timestamp: Date.now(),
+      sessionId,
+      parentSessionId: sessionId,
+      toolName: name,
+      payload: {
+        stage: "validation",
+        objective,
+        reason: derivedExecutionEnvelope.error,
+        issues: derivedExecutionEnvelope.issues,
+        toolCallId,
+      },
+    });
+    return finalizeDelegationResult({
+      success: false,
+      status: "failed",
+      objective,
+      error: derivedExecutionEnvelope.error,
+      issues: derivedExecutionEnvelope.issues,
+    });
+  }
+  const effectiveExecutionContext = derivedExecutionEnvelope.executionContext;
+  const workingDirectory = derivedExecutionEnvelope.workingDirectory;
+  const { executionContext: _requestedExecutionContext, ...inputWithoutExecutionContext } =
+    input;
+  const effectiveInput: ExecuteWithAgentInput = effectiveExecutionContext
+    ? {
+        ...inputWithoutExecutionContext,
+        executionContext: effectiveExecutionContext,
+      }
+    : inputWithoutExecutionContext;
   const delegatedScopePreflight = preflightDelegatedLocalFileScope({
     executionContext: effectiveExecutionContext,
     workingDirectory,
@@ -491,7 +533,7 @@ export async function executeDelegationTool(
         toolCallId,
       },
     });
-    return JSON.stringify({
+    return finalizeDelegationResult({
       success: false,
       status: "failed",
       objective,
@@ -519,7 +561,7 @@ export async function executeDelegationTool(
         toolCallId,
       },
     });
-    return JSON.stringify({
+    return finalizeDelegationResult({
       success: false,
       status: "failed",
       objective,
@@ -565,7 +607,7 @@ export async function executeDelegationTool(
         toolCallId,
       },
     });
-    return JSON.stringify({
+    return finalizeDelegationResult({
       success: false,
       status: "failed",
       objective,
@@ -622,7 +664,7 @@ export async function executeDelegationTool(
         toolCallId,
       },
     });
-    return JSON.stringify({
+    return finalizeDelegationResult({
       error: `Failed to spawn sub-agent: ${message}`,
     });
   }
@@ -750,7 +792,7 @@ export async function executeDelegationTool(
           verifyRequested: verifier?.shouldVerifySubAgentResult() ?? false,
         },
       });
-      return JSON.stringify({
+      return finalizeDelegationResult({
         success: true,
         status: finalStatus,
         subagentSessionId: childSessionId,
@@ -793,7 +835,7 @@ export async function executeDelegationTool(
         toolCallId,
       },
     });
-    return JSON.stringify({
+      return finalizeDelegationResult({
       success: false,
       status: finalStatus,
       subagentSessionId: childSessionId,

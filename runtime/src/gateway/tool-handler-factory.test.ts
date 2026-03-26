@@ -1802,6 +1802,7 @@ describe("createSessionToolHandler", () => {
       availableToolNames: ["system.readFile"],
       routerId: "router-a",
       send,
+      defaultWorkingDirectory: "/tmp/project-root",
       delegation: () => ({
         subAgentManager: subAgentManager as any,
         policyEngine: null,
@@ -1814,10 +1815,6 @@ describe("createSessionToolHandler", () => {
       task: "Inspect file",
       tools: ["system.readFile"],
       timeoutMs: 120_000,
-      executionContext: {
-        workspaceRoot: "/tmp/project-root",
-        allowedReadRoots: ["/tmp/project-root"],
-      },
     });
     const parsed = JSON.parse(result) as {
       success?: boolean;
@@ -1866,6 +1863,7 @@ describe("createSessionToolHandler", () => {
       availableToolNames: ["system.writeFile", "system.bash"],
       routerId: "router-a",
       send: vi.fn(),
+      defaultWorkingDirectory: "/tmp/project",
       delegation: () => ({
         subAgentManager: {
           spawn: vi.fn(async () => "subagent:child-verify"),
@@ -1913,11 +1911,6 @@ describe("createSessionToolHandler", () => {
     const result = await handler("execute_with_agent", {
       task: "Implement the CLI",
       tools: ["system.writeFile", "system.bash"],
-      executionContext: {
-        workspaceRoot: "/tmp/project",
-        allowedReadRoots: ["/tmp/project"],
-        allowedWriteRoots: ["/tmp/project"],
-      },
     });
     const parsed = JSON.parse(result) as {
       success?: boolean;
@@ -2004,24 +1997,25 @@ describe("createSessionToolHandler", () => {
     );
   });
 
-  it("rejects contextRequirements-only local-file execute_with_agent calls before spawn", async () => {
+  it("rejects direct local-file execute_with_agent calls when trusted parent workspace authority is absent", async () => {
     const subAgentManager = {
       spawn: vi.fn(async () => "subagent:child-1"),
-      getResult: vi.fn(() => ({
-        sessionId: "subagent:child-1",
-        output: '{"summary":"child completed"}',
-        success: true,
-        durationMs: 42,
-        toolCalls: [
-          {
-            name: "system.writeFile",
-            args: { path: "/tmp/project-root/src/grid.ts" },
-            result: '{"ok":true}',
-            isError: false,
-            durationMs: 5,
-          },
-        ],
-      })),
+      getResult: vi.fn(() =>
+        makeCompletedChildResult({
+          sessionId: "subagent:child-1",
+          output: '{"summary":"child completed"}',
+          success: true,
+          durationMs: 42,
+          toolCalls: [
+            {
+              name: "system.writeFile",
+              args: { path: "/tmp/project-root/src/grid.ts" },
+              result: '{"ok":true}',
+              isError: false,
+              durationMs: 5,
+            },
+          ],
+        })),
       getInfo: vi.fn(() => ({
         sessionId: "subagent:child-1",
         parentSessionId: "session-parent",
@@ -2059,45 +2053,49 @@ describe("createSessionToolHandler", () => {
       status?: string;
       error?: string;
       issues?: Array<{ code?: string }>;
+      delegatedScopeTrust?: string;
     };
 
     expect(subAgentManager.spawn).not.toHaveBeenCalled();
     expect(parsed.success).toBe(false);
     expect(parsed.status).toBe("failed");
-    expect(parsed.error).toContain("structured executionContext");
+    expect(parsed.error).toContain("trusted parent workspace root");
     expect(parsed.issues?.map((issue) => issue.code)).toContain(
-      "missing_execution_context",
+      "missing_parent_workspace_authority",
     );
   });
 
-  it("rejects local-file execute_with_agent calls that rely on /workspace cwd hints without a structured envelope", async () => {
+  it("derives direct child pwd shell scope from the trusted parent workspace root", async () => {
     const hostWorkspaceRoot = "/home/tetsuo/agent-test";
     const subAgentManager = {
       spawn: vi.fn(async () => "subagent:child-1"),
-      getResult: vi.fn(() => ({
-        sessionId: "subagent:child-1",
-        output: '{"summary":"child completed"}',
-        success: true,
-        durationMs: 42,
-        toolCalls: [
-          {
-            name: "system.writeFile",
-            args: {
-              path: `${hostWorkspaceRoot}/signal-cartography-ts-57/package.json`,
+      getResult: vi.fn(() =>
+        makeCompletedChildResult({
+          sessionId: "subagent:child-1",
+          output: JSON.stringify({ stdout: hostWorkspaceRoot, stderr: "", exitCode: 0 }),
+          success: true,
+          durationMs: 42,
+          toolCalls: [
+            {
+              name: "system.bash",
+              args: { command: "pwd" },
+              result: JSON.stringify({
+                stdout: `${hostWorkspaceRoot}\n`,
+                stderr: "",
+                exitCode: 0,
+              }),
+              isError: false,
+              durationMs: 5,
             },
-            result: '{"ok":true}',
-            isError: false,
-            durationMs: 5,
-          },
-        ],
-      })),
+          ],
+        })),
       getInfo: vi.fn(() => ({
         sessionId: "subagent:child-1",
         parentSessionId: "session-parent",
         depth: 1,
         status: "completed",
         startedAt: Date.now() - 100,
-        task: "Scaffold the signal cartography workspace",
+        task: "Print the delegated cwd",
       })),
     };
 
@@ -2117,23 +2115,110 @@ describe("createSessionToolHandler", () => {
     });
 
     const result = await handler("execute_with_agent", {
-      task: "Scaffold the signal cartography workspace",
-      tools: ["system.writeFile", "system.bash"],
-      contextRequirements: ["cwd=/workspace/signal-cartography-ts-57"],
+      task: "Print the delegated cwd",
+      objective: "Run pwd in the delegated child shell and report it.",
+      tools: ["system.bash"],
     });
     const parsed = JSON.parse(result) as {
       success?: boolean;
       status?: string;
-      error?: string;
-      issues?: Array<{ code?: string }>;
     };
 
-    expect(subAgentManager.spawn).not.toHaveBeenCalled();
-    expect(parsed.success).toBe(false);
-    expect(parsed.status).toBe("failed");
-    expect(parsed.error).toContain("structured executionContext");
-    expect(parsed.issues?.map((issue) => issue.code)).toContain(
-      "missing_execution_context",
+    expect(parsed.success).toBe(true);
+    expect(parsed.status).toBe("completed");
+    expect(subAgentManager.spawn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parentSessionId: "session-parent",
+        workingDirectory: hostWorkspaceRoot,
+        workingDirectorySource: "execution_envelope",
+        tools: ["system.bash"],
+        delegationSpec: expect.objectContaining({
+          executionContext: expect.objectContaining({
+            workspaceRoot: hostWorkspaceRoot,
+            allowedReadRoots: [hostWorkspaceRoot],
+            allowedWriteRoots: [hostWorkspaceRoot],
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("derives direct child ls shell scope from the trusted parent workspace root even when legacy cwd hints are present", async () => {
+    const hostWorkspaceRoot = "/home/tetsuo/agent-test";
+    const subAgentManager = {
+      spawn: vi.fn(async () => "subagent:child-1"),
+      getResult: vi.fn(() =>
+        makeCompletedChildResult({
+          sessionId: "subagent:child-1",
+          output: JSON.stringify({ stdout: "PLAN.md\nsrc\n", stderr: "", exitCode: 0 }),
+          success: true,
+          durationMs: 42,
+          toolCalls: [
+            {
+              name: "system.bash",
+              args: { command: "ls" },
+              result: JSON.stringify({
+                stdout: "PLAN.md\nsrc\n",
+                stderr: "",
+                exitCode: 0,
+              }),
+              isError: false,
+              durationMs: 5,
+            },
+          ],
+        })),
+      getInfo: vi.fn(() => ({
+        sessionId: "subagent:child-1",
+        parentSessionId: "session-parent",
+        depth: 1,
+        status: "completed",
+        startedAt: Date.now() - 100,
+        task: "List the delegated cwd",
+      })),
+    };
+
+    const handler = createSessionToolHandler({
+      sessionId: "session-parent",
+      baseHandler: vi.fn(async () => "should-not-run"),
+      availableToolNames: ["system.bash"],
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: hostWorkspaceRoot,
+      delegation: () => ({
+        subAgentManager: subAgentManager as any,
+        policyEngine: null,
+        verifier: null,
+        lifecycleEmitter: null,
+      }),
+    });
+
+    const result = await handler("execute_with_agent", {
+      task: "List the delegated cwd",
+      objective: "Run ls in the delegated child shell and report it.",
+      tools: ["system.bash"],
+      contextRequirements: ["cwd=/workspace/ignored-child-root"],
+    });
+    const parsed = JSON.parse(result) as {
+      success?: boolean;
+      status?: string;
+    };
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.status).toBe("completed");
+    expect(subAgentManager.spawn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parentSessionId: "session-parent",
+        workingDirectory: hostWorkspaceRoot,
+        workingDirectorySource: "execution_envelope",
+        tools: ["system.bash"],
+        delegationSpec: expect.objectContaining({
+          executionContext: expect.objectContaining({
+            workspaceRoot: hostWorkspaceRoot,
+            allowedReadRoots: [hostWorkspaceRoot],
+            allowedWriteRoots: [hostWorkspaceRoot],
+          }),
+        }),
+      }),
     );
   });
 
@@ -2164,8 +2249,6 @@ describe("createSessionToolHandler", () => {
       task: "Inspect PLAN.md",
       tools: ["system.readFile"],
       executionContext: {
-        workspaceRoot: "/workspace",
-        allowedReadRoots: ["/workspace"],
         requiredSourceArtifacts: ["/home/tetsuo/git/AgenC/AGENTS.md"],
       },
     });
@@ -2179,32 +2262,35 @@ describe("createSessionToolHandler", () => {
     expect(subAgentManager.spawn).not.toHaveBeenCalled();
     expect(parsed.success).toBe(false);
     expect(parsed.status).toBe("failed");
-    expect(parsed.error).toContain("outside the delegated read roots");
+    expect(parsed.error).toContain("outside the trusted parent workspace authority");
     expect(parsed.issues?.map((issue) => issue.code)).toContain(
-      "required_source_outside_read_roots",
+      "required_source_outside_parent_workspace",
     );
   });
 
-  it("requires a structured execution envelope instead of inferring delegated cwd from objective text", async () => {
+  it("preserves validated descendant target-artifact scope under the trusted parent workspace root", async () => {
+    const parentWorkspaceRoot = "/home/tetsuo/agent-test";
+    const childWorkspaceRoot = "/home/tetsuo/agent-test/terrain-router-ts-2";
     const subAgentManager = {
       spawn: vi.fn(async () => "subagent:child-1"),
-      getResult: vi.fn(() => ({
-        sessionId: "subagent:child-1",
-        output: '{"summary":"child completed"}',
-        success: true,
-        durationMs: 42,
-        toolCalls: [
-          {
-            name: "system.writeFile",
-            args: {
-              path: "/home/tetsuo/agent-test/terrain-router-ts-2/packages/core/src/index.ts",
+      getResult: vi.fn(() =>
+        makeCompletedChildResult({
+          sessionId: "subagent:child-1",
+          output: '{"summary":"child completed"}',
+          success: true,
+          durationMs: 42,
+          toolCalls: [
+            {
+              name: "system.writeFile",
+              args: {
+                path: `${childWorkspaceRoot}/packages/core/src/index.ts`,
+              },
+              result: '{"ok":true}',
+              isError: false,
+              durationMs: 5,
             },
-            result: '{"ok":true}',
-            isError: false,
-            durationMs: 5,
-          },
-        ],
-      })),
+          ],
+        })),
       getInfo: vi.fn(() => ({
         sessionId: "subagent:child-1",
         parentSessionId: "session-parent",
@@ -2221,6 +2307,7 @@ describe("createSessionToolHandler", () => {
       availableToolNames: ["system.writeFile", "system.bash"],
       routerId: "router-a",
       send: vi.fn(),
+      defaultWorkingDirectory: parentWorkspaceRoot,
       delegation: () => ({
         subAgentManager: subAgentManager as any,
         policyEngine: null,
@@ -2232,14 +2319,11 @@ describe("createSessionToolHandler", () => {
     await handler("execute_with_agent", {
       task: "Implement the terrain router core",
       objective:
-        "Write the core terrain router files under /home/tetsuo/agent-test/terrain-router-ts-2 and keep all code changes there.",
+        `Write the core terrain router files under ${childWorkspaceRoot} and keep all code changes there.`,
       tools: ["system.writeFile", "system.bash"],
       executionContext: {
-        workspaceRoot: "/home/tetsuo/agent-test/terrain-router-ts-2",
-        allowedReadRoots: ["/home/tetsuo/agent-test/terrain-router-ts-2"],
-        allowedWriteRoots: ["/home/tetsuo/agent-test/terrain-router-ts-2"],
         targetArtifacts: [
-          "/home/tetsuo/agent-test/terrain-router-ts-2/packages/core/src/index.ts",
+          `${childWorkspaceRoot}/packages/core/src/index.ts`,
         ],
       },
     });
@@ -2247,20 +2331,105 @@ describe("createSessionToolHandler", () => {
     expect(subAgentManager.spawn).toHaveBeenCalledWith(
       expect.objectContaining({
         parentSessionId: "session-parent",
-        workingDirectory: "/home/tetsuo/agent-test/terrain-router-ts-2",
+        workingDirectory: parentWorkspaceRoot,
         prompt: expect.stringContaining(
-          "Use `/home/tetsuo/agent-test/terrain-router-ts-2` as the working directory for this phase.",
+          `The runtime has already pinned this child phase to \`${parentWorkspaceRoot}\`.`,
         ),
         delegationSpec: expect.objectContaining({
           executionContext: expect.objectContaining({
-            workspaceRoot: "/home/tetsuo/agent-test/terrain-router-ts-2",
+            workspaceRoot: parentWorkspaceRoot,
             targetArtifacts: [
-              "/home/tetsuo/agent-test/terrain-router-ts-2/packages/core/src/index.ts",
+              `${childWorkspaceRoot}/packages/core/src/index.ts`,
             ],
           }),
         }),
       }),
     );
+  });
+
+  it("rejects public model-authored delegated workspace roots on the direct child path", async () => {
+    const hostWorkspaceRoot = "/home/tetsuo/agent-test";
+    const subAgentManager = {
+      spawn: vi.fn(async () => "subagent:child-1"),
+      getResult: vi.fn(),
+      getInfo: vi.fn(),
+    };
+
+    const handler = createSessionToolHandler({
+      sessionId: "session-parent",
+      baseHandler: vi.fn(async () => "should-not-run"),
+      availableToolNames: ["system.bash"],
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: hostWorkspaceRoot,
+      delegation: () => ({
+        subAgentManager: subAgentManager as any,
+        policyEngine: null,
+        verifier: null,
+        lifecycleEmitter: null,
+      }),
+    });
+
+    const result = await handler("execute_with_agent", {
+      task: "Print the delegated cwd",
+      tools: ["system.bash"],
+      executionContext: {
+        workspaceRoot: "/",
+        allowedReadRoots: ["/"],
+        allowedWriteRoots: ["/"],
+      },
+    });
+    const parsed = JSON.parse(result) as {
+      error?: string;
+      delegatedScopeTrust?: string;
+    };
+
+    expect(subAgentManager.spawn).not.toHaveBeenCalled();
+    expect(parsed.error).toContain("executionContext.workspaceRoot");
+    expect(parsed.delegatedScopeTrust).toBe("rejected_invalid_scope");
+  });
+
+  it("rejects public model-authored sibling-repo roots on the direct child path", async () => {
+    const hostWorkspaceRoot = "/home/tetsuo/git/AgenC";
+    const siblingWorkspaceRoot = "/home/tetsuo/git/agenc-shell";
+    const subAgentManager = {
+      spawn: vi.fn(async () => "subagent:child-1"),
+      getResult: vi.fn(),
+      getInfo: vi.fn(),
+    };
+
+    const handler = createSessionToolHandler({
+      sessionId: "session-parent",
+      baseHandler: vi.fn(async () => "should-not-run"),
+      availableToolNames: ["system.bash"],
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: hostWorkspaceRoot,
+      delegation: () => ({
+        subAgentManager: subAgentManager as any,
+        policyEngine: null,
+        verifier: null,
+        lifecycleEmitter: null,
+      }),
+    });
+
+    const result = await handler("execute_with_agent", {
+      task: "Run pwd in the child shell and report it.",
+      tools: ["system.bash"],
+      executionContext: {
+        workspaceRoot: siblingWorkspaceRoot,
+        allowedReadRoots: [siblingWorkspaceRoot],
+        allowedWriteRoots: [siblingWorkspaceRoot],
+      },
+    });
+    const parsed = JSON.parse(result) as {
+      error?: string;
+      delegatedScopeTrust?: string;
+    };
+
+    expect(subAgentManager.spawn).not.toHaveBeenCalled();
+    expect(parsed.error).toContain("executionContext.workspaceRoot");
+    expect(parsed.delegatedScopeTrust).toBe("rejected_invalid_scope");
   });
 
   it("blocks delegated child writes outside the execution envelope target artifacts", async () => {
@@ -2419,21 +2588,22 @@ describe("createSessionToolHandler", () => {
 
     const subAgentManager = {
       spawn: vi.fn(async () => "subagent:child-1"),
-      getResult: vi.fn(() => ({
-        sessionId: "subagent:child-1",
-        output: '{"summary":"child completed"}',
-        success: true,
-        durationMs: 42,
-        toolCalls: [
-          {
-            name: "system.readFile",
-            args: { path: planPath },
-            result: JSON.stringify({ path: planPath, content: originalPlan }),
-            isError: false,
-            durationMs: 5,
-          },
-        ],
-      })),
+      getResult: vi.fn(() =>
+        makeCompletedChildResult({
+          sessionId: "subagent:child-1",
+          output: '{"summary":"child completed"}',
+          success: true,
+          durationMs: 42,
+          toolCalls: [
+            {
+              name: "system.readFile",
+              args: { path: planPath },
+              result: JSON.stringify({ path: planPath, content: originalPlan }),
+              isError: false,
+              durationMs: 5,
+            },
+          ],
+        })),
       getInfo: vi.fn(() => ({
         sessionId: "subagent:child-1",
         parentSessionId: "session-parent",
@@ -2448,7 +2618,7 @@ describe("createSessionToolHandler", () => {
       if (toolName === "system.readFile") {
         expect(args).toEqual({
           path: planPath,
-          [SESSION_ALLOWED_ROOTS_ARG]: ["/tmp/fallback-root"],
+          [SESSION_ALLOWED_ROOTS_ARG]: [workspaceRoot],
         });
         return JSON.stringify({ path: planPath, content: originalPlan });
       }
@@ -2461,7 +2631,7 @@ describe("createSessionToolHandler", () => {
       availableToolNames: ["system.readFile"],
       routerId: "router-a",
       send: vi.fn(),
-      defaultWorkingDirectory: "/tmp/fallback-root",
+      defaultWorkingDirectory: workspaceRoot,
       delegation: () => ({
         subAgentManager: subAgentManager as any,
         policyEngine: null,
@@ -2479,11 +2649,22 @@ describe("createSessionToolHandler", () => {
     });
 
     expect(JSON.parse(result)).toMatchObject({
-      success: false,
-      error:
-        "Direct execute_with_agent local-file work must provide a structured executionContext before child execution.",
+      success: true,
+      status: "completed",
     });
-    expect(subAgentManager.spawn).not.toHaveBeenCalled();
+    expect(subAgentManager.spawn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workingDirectory: workspaceRoot,
+        workingDirectorySource: "execution_envelope",
+        delegationSpec: expect.objectContaining({
+          executionContext: expect.objectContaining({
+            workspaceRoot,
+            allowedReadRoots: [workspaceRoot],
+            allowedWriteRoots: [workspaceRoot],
+          }),
+        }),
+      }),
+    );
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -2944,6 +3125,7 @@ describe("createSessionToolHandler", () => {
       availableToolNames: ["system.bash"],
       routerId: "router-a",
       send: vi.fn(),
+      defaultWorkingDirectory: "/tmp/delegated-shell-contract",
       delegation: () => ({
         subAgentManager: subAgentManager as any,
         policyEngine: null,
@@ -2954,11 +3136,6 @@ describe("createSessionToolHandler", () => {
 
     const result = await handler("execute_with_agent", {
       task: "collect node version",
-      executionContext: {
-        workspaceRoot: "/tmp/delegated-shell-contract",
-        allowedReadRoots: ["/tmp/delegated-shell-contract"],
-        allowedWriteRoots: ["/tmp/delegated-shell-contract"],
-      },
     });
     const parsed = JSON.parse(result) as {
       success?: boolean;
@@ -3021,6 +3198,7 @@ describe("createSessionToolHandler", () => {
       availableToolNames: ["desktop.bash"],
       routerId: "router-a",
       send: vi.fn(),
+      defaultWorkingDirectory: "/tmp/child-json-contract",
       delegation: () => ({
         subAgentManager: subAgentManager as any,
         policyEngine: null,
@@ -3032,11 +3210,6 @@ describe("createSessionToolHandler", () => {
     const result = await handler("execute_with_agent", {
       task: "Build core game",
       inputContract: "JSON output with files and verification",
-      executionContext: {
-        workspaceRoot: "/tmp/child-json-contract",
-        allowedReadRoots: ["/tmp/child-json-contract"],
-        allowedWriteRoots: ["/tmp/child-json-contract"],
-      },
     });
     const parsed = JSON.parse(result) as {
       success?: boolean;
@@ -3158,6 +3331,7 @@ describe("createSessionToolHandler", () => {
       availableToolNames: ["desktop.bash"],
       routerId: "router-a",
       send: vi.fn(),
+      defaultWorkingDirectory: "/home/agenc/neon-heist",
       delegation: () => ({
         subAgentManager: subAgentManager as any,
         policyEngine: null,
@@ -3171,9 +3345,6 @@ describe("createSessionToolHandler", () => {
       inputContract: "JSON output with files and verification",
       acceptanceCriteria: ["Create all files"],
       executionContext: {
-        workspaceRoot: "/home/agenc/neon-heist",
-        allowedReadRoots: ["/home/agenc/neon-heist"],
-        allowedWriteRoots: ["/home/agenc/neon-heist"],
         targetArtifacts: [
           "/home/agenc/neon-heist/index.html",
           "/home/agenc/neon-heist/src/game.js",
@@ -3232,6 +3403,7 @@ describe("createSessionToolHandler", () => {
       availableToolNames: ["system.readFile", "system.writeFile"],
       routerId: "router-a",
       send: vi.fn(),
+      defaultWorkingDirectory: "/home/tetsuo/git/stream-test/agenc-shell",
       delegation: () => ({
         subAgentManager: subAgentManager as any,
         policyEngine: null,
@@ -3247,9 +3419,6 @@ describe("createSessionToolHandler", () => {
       acceptanceCriteria: ["AGENC.md written with all required sections"],
       requiredToolCapabilities: ["read_file", "write_file"],
       executionContext: {
-        workspaceRoot: "/home/tetsuo/git/stream-test/agenc-shell",
-        allowedReadRoots: ["/home/tetsuo/git/stream-test/agenc-shell"],
-        allowedWriteRoots: ["/home/tetsuo/git/stream-test/agenc-shell"],
         targetArtifacts: ["/home/tetsuo/git/stream-test/agenc-shell/AGENC.md"],
       },
     });
@@ -3390,7 +3559,7 @@ describe("createSessionToolHandler", () => {
   it("clamps execute_with_agent timeoutMs to a safe minimum", async () => {
     const subAgentManager = {
       spawn: vi.fn(async () => "subagent:child-min-timeout"),
-      getResult: vi.fn(() => ({
+      getResult: vi.fn(() => makeCompletedChildResult({
         sessionId: "subagent:child-min-timeout",
         output: "ok",
         success: true,
@@ -3413,6 +3582,7 @@ describe("createSessionToolHandler", () => {
       availableToolNames: ["desktop.bash"],
       routerId: "router-a",
       send: vi.fn(),
+      defaultWorkingDirectory: "/tmp/runtime-timeout-scope",
       delegation: () => ({
         subAgentManager: subAgentManager as any,
         policyEngine: null,
@@ -3424,9 +3594,6 @@ describe("createSessionToolHandler", () => {
     await handler("execute_with_agent", {
       task: "Inspect file quickly",
       timeoutMs: 10_000,
-      executionContext: {
-        workspaceRoot: "/tmp/runtime-timeout-scope",
-      },
     });
 
     expect(subAgentManager.spawn).toHaveBeenCalledWith(
@@ -3475,11 +3642,6 @@ describe("createSessionToolHandler", () => {
         "Create src/Game.ts",
         "Validate localhost runs cleanly",
       ],
-      executionContext: {
-        workspaceRoot: "/tmp/unsafe-benchmark-scope",
-        allowedReadRoots: ["/tmp/unsafe-benchmark-scope"],
-        allowedWriteRoots: ["/tmp/unsafe-benchmark-scope"],
-      },
     });
     const parsed = JSON.parse(result) as {
       success?: boolean;
@@ -3553,6 +3715,7 @@ describe("createSessionToolHandler", () => {
       ],
       routerId: "router-a",
       send: vi.fn(),
+      defaultWorkingDirectory: "/tmp/unsafe-benchmark-scope",
       delegation: () => ({
         subAgentManager: subAgentManager as any,
         policyEngine: null,
@@ -3575,9 +3738,6 @@ describe("createSessionToolHandler", () => {
         "Validate localhost runs cleanly",
       ],
       executionContext: {
-        workspaceRoot: "/tmp/unsafe-benchmark-scope",
-        allowedReadRoots: ["/tmp/unsafe-benchmark-scope"],
-        allowedWriteRoots: ["/tmp/unsafe-benchmark-scope"],
         targetArtifacts: ["/tmp/unsafe-benchmark-scope/src/main.ts"],
       },
     });
@@ -3643,6 +3803,7 @@ describe("createSessionToolHandler", () => {
       ],
       routerId: "router-a",
       send: vi.fn(),
+      defaultWorkingDirectory: "/tmp/unsafe-benchmark-policy-bypass",
       delegation: () => ({
         subAgentManager: subAgentManager as any,
         policyEngine,
@@ -3657,9 +3818,6 @@ describe("createSessionToolHandler", () => {
       inputContract: "Return JSON summary",
       acceptanceCriteria: ["Create files", "Run npm install"],
       executionContext: {
-        workspaceRoot: "/tmp/unsafe-benchmark-policy-bypass",
-        allowedReadRoots: ["/tmp/unsafe-benchmark-policy-bypass"],
-        allowedWriteRoots: ["/tmp/unsafe-benchmark-policy-bypass"],
         targetArtifacts: ["/tmp/unsafe-benchmark-policy-bypass/src/main.ts"],
       },
     });
@@ -3857,6 +4015,7 @@ describe("createSessionToolHandler", () => {
       availableToolNames: ["desktop.text_editor", "web_search"],
       routerId: "router-a",
       send: vi.fn(),
+      defaultWorkingDirectory: "/tmp/runtime-docs-scope",
       delegation: () => ({
         subAgentManager: subAgentManager as any,
         policyEngine: null,
@@ -3870,10 +4029,6 @@ describe("createSessionToolHandler", () => {
       objective:
         'Read docs/RUNTIME_API.md (full path /workspace/docs/RUNTIME_API.md). Focus ONLY on "Delegation Runtime Surface" and "Stateful Response Compaction" sections. Identify exactly one autonomy-validation risk/mismatch with a direct reference.',
       acceptanceCriteria: ["one specific risk or mismatch identified"],
-      executionContext: {
-        workspaceRoot: "/tmp/runtime-docs-scope",
-        allowedReadRoots: ["/tmp/runtime-docs-scope"],
-      },
     });
     expect(typeof result).toBe("string");
     expect(subAgentManager.spawn).toHaveBeenCalledWith(
@@ -4044,6 +4199,7 @@ describe("createSessionToolHandler", () => {
       availableToolNames: ["execute_with_agent", "system.readFile"],
       routerId: "router-a",
       send: vi.fn(),
+      defaultWorkingDirectory: "/tmp/unsafe-benchmark-nested",
       delegation: () => ({
         subAgentManager: subAgentManager as any,
         policyEngine,
@@ -4056,10 +4212,6 @@ describe("createSessionToolHandler", () => {
     const result = await handler("execute_with_agent", {
       task: "expand scope",
       tools: ["system.readFile"],
-      executionContext: {
-        workspaceRoot: "/tmp/unsafe-benchmark-nested",
-        allowedReadRoots: ["/tmp/unsafe-benchmark-nested"],
-      },
     });
     const parsed = JSON.parse(result) as { success?: boolean };
 

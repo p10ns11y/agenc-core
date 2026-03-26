@@ -20,6 +20,7 @@ import type {
   DelegationTrajectoryRecord,
 } from "./delegation-learning.js";
 import type { WorkflowCompletionState } from "../workflow/completion-state.js";
+import type { WorkflowProgressSnapshot } from "../workflow/completion-progress.js";
 import { createLLMStatefulFallbackReasonCounts } from "./types.js";
 import { SHELL_BUILTIN_COMMANDS } from "./chat-executor-constants.js";
 import {
@@ -28,6 +29,7 @@ import {
   normalizeDoomScreenResolution,
   parseToolResultObject,
 } from "./chat-executor-tool-utils.js";
+import { assessExecuteWithAgentResult } from "../utils/delegated-scope-trust.js";
 
 const DESKTOP_BIASED_SYSTEM_COMMANDS = new Set([
   "chromium",
@@ -700,6 +702,22 @@ export function inferRecoveryHint(
     };
   }
   if (call.name === "execute_with_agent" && parsedResult) {
+    const delegatedScopeAssessment = assessExecuteWithAgentResult({
+      args:
+        call.args && typeof call.args === "object" && !Array.isArray(call.args)
+          ? call.args
+          : undefined,
+      result: call.result,
+    });
+    if (delegatedScopeAssessment?.delegatedScopeTrust === "rejected_invalid_scope") {
+      return {
+        key: "execute-with-agent-invalid-scope",
+        message:
+          "The previous `execute_with_agent` attempt was rejected because delegated scope/root authority was invalid. " +
+          "Do not invent or widen child cwd/workspace roots in the next attempt. " +
+          "Use the parent tool path for trivial cwd/ls introspection, or rely only on runtime-provided delegated scope.",
+      };
+    }
     const status =
       typeof parsedResult.status === "string"
         ? parsedResult.status.trim().toLowerCase()
@@ -1162,6 +1180,43 @@ export interface QualityProxyInput {
   readonly verifierOverall: "pass" | "retry" | "fail" | "skipped";
   readonly evaluation?: EvaluationResult;
   readonly failedToolCalls: number;
+}
+
+export function buildWorkflowRecoveryStateLines(
+  progress?: WorkflowProgressSnapshot,
+): readonly string[] {
+  if (!progress || progress.completionState === "completed") {
+    return [];
+  }
+
+  const lines = [`Workflow state: ${progress.completionState}`];
+  if (progress.remainingRequirements.length > 0) {
+    lines.push(
+      `Still required before completion: ${progress.remainingRequirements.join(", ")}`,
+    );
+  }
+  if (progress.reusableEvidence.length > 0) {
+    lines.push(
+      `Reusable grounded evidence: ${progress.reusableEvidence
+        .slice(-3)
+        .map((entry) => entry.summary)
+        .join(" | ")}`,
+    );
+  }
+  if (progress.completionState === "needs_verification") {
+    lines.push(
+      "Do not mark this implementation complete until the remaining verifier requirements pass.",
+    );
+  } else if (progress.completionState === "partial") {
+    lines.push(
+      "Do not present the work as finished; continue from the grounded evidence and close the remaining requirements.",
+    );
+  } else if (progress.completionState === "blocked") {
+    lines.push(
+      "Do not present the work as complete; address the blocking condition or report it explicitly.",
+    );
+  }
+  return lines;
 }
 
 /** Compute a 0–1 quality proxy score from execution outcome signals. */

@@ -16,7 +16,10 @@ import {
   type DelegatedWorkingDirectoryResolution,
   resolveDelegatedWorkingDirectory,
 } from "./delegation-tool.js";
-import { sanitizeDelegationContextRequirements } from "../utils/delegation-execution-context.js";
+import {
+  isLegacyDelegatedScopeRequirement,
+  sanitizeDelegationContextRequirements,
+} from "../utils/delegation-execution-context.js";
 import {
   resolveDelegationBudgetHintMs,
 } from "./delegation-timeout.js";
@@ -24,14 +27,28 @@ import type { SubagentFailureClass, SubagentRetryRule } from "./subagent-orchest
 import {
   DEFAULT_TOOL_BUDGET_PER_REQUEST,
 } from "../llm/chat-executor-constants.js";
-import { buildCanonicalDelegatedFilesystemScope } from "../workflow/delegated-filesystem-scope.js";
+import {
+  isConcreteExecutableEnvelopeRoot,
+  normalizeWorkspaceRoot,
+} from "../workflow/path-normalization.js";
+
+export type DelegatedScopeTrustSignal =
+  | "trusted_runtime_envelope_mismatch"
+  | "model_authored_invalid_root_attempt"
+  | "informational_untrusted_cwd_mention"
+  | "none";
+
+const TRUSTED_RUNTIME_ENVELOPE_MISMATCH_RE =
+  /\bdelegated workspace root\b.*\bdoes not match the child working directory\b|\bdelegated (?:read|write) root\b.*\boutside the canonical workspace root\b|\b(?:required source|target) artifact\b.*\boutside the canonical workspace root\b|\bdelegated workspace root\b.*\bdoes not exist\b/i;
+const MODEL_AUTHORED_INVALID_ROOT_ATTEMPT_RE =
+  /\brequested delegated (?:workspace root|read root|write root|required source artifact|input artifact|target artifact)\b.*\boutside the trusted parent workspace (?:root|authority)\b/i;
 
 /* ------------------------------------------------------------------ */
 /*  Budget & tool budget constants                                     */
 /* ------------------------------------------------------------------ */
 
 const DEFAULT_PLANNED_SUBAGENT_TOOL_BUDGET = DEFAULT_TOOL_BUDGET_PER_REQUEST;
-const MAX_PLANNED_SUBAGENT_TOOL_BUDGET = 96;
+const MAX_PLANNED_SUBAGENT_TOOL_BUDGET = DEFAULT_TOOL_BUDGET_PER_REQUEST;
 const PLANNED_SUBAGENT_TOOL_BUDGET_MS_PER_CALL = 7_500;
 const BUDGET_EXCEEDED_RETRY_TOOL_BUDGET_MULTIPLIER = 1.5;
 
@@ -234,19 +251,16 @@ export function resolvePlannerStepWorkingDirectory(
 } | undefined {
   void pipeline;
   void hostWorkspaceRoot;
-  const canonicalScope = buildCanonicalDelegatedFilesystemScope({
-    workspaceRoot: step.executionContext?.workspaceRoot,
-    allowedReadRoots: step.executionContext?.allowedReadRoots,
-    allowedWriteRoots: step.executionContext?.allowedWriteRoots,
-    inputArtifacts: step.executionContext?.inputArtifacts,
-    requiredSourceArtifacts: step.executionContext?.requiredSourceArtifacts,
-    targetArtifacts: step.executionContext?.targetArtifacts,
-  });
-  if (canonicalScope.workspaceRoot) {
+  const rawWorkspaceRoot = step.executionContext?.workspaceRoot;
+  if (isConcreteExecutableEnvelopeRoot(rawWorkspaceRoot)) {
+    const workspaceRoot = normalizeWorkspaceRoot(rawWorkspaceRoot);
+    if (!workspaceRoot) {
+      return undefined;
+    }
     return {
-      path: canonicalScope.workspaceRoot,
+      path: workspaceRoot,
       anchored: isAnchoredDelegatedWorkingDirectory(
-        canonicalScope.workspaceRoot,
+        workspaceRoot,
       ),
       source: "execution_envelope",
     };
@@ -259,6 +273,31 @@ export function buildEffectiveContextRequirements(
   step: PipelinePlannerSubagentStep,
 ): readonly string[] {
   return sanitizeDelegationContextRequirements(step.contextRequirements);
+}
+
+export function classifyDelegatedScopeTrustSignal(input: {
+  readonly message?: string | null;
+  readonly contextRequirements?: readonly (string | undefined | null)[];
+}): DelegatedScopeTrustSignal {
+  const message = typeof input.message === "string" ? input.message.trim() : "";
+  if (message.length > 0) {
+    if (MODEL_AUTHORED_INVALID_ROOT_ATTEMPT_RE.test(message)) {
+      return "model_authored_invalid_root_attempt";
+    }
+    if (TRUSTED_RUNTIME_ENVELOPE_MISMATCH_RE.test(message)) {
+      return "trusted_runtime_envelope_mismatch";
+    }
+  }
+
+  if (
+    (input.contextRequirements ?? []).some((value) =>
+      isLegacyDelegatedScopeRequirement(value)
+    )
+  ) {
+    return "informational_untrusted_cwd_mention";
+  }
+
+  return "none";
 }
 
 /* ------------------------------------------------------------------ */

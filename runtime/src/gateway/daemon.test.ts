@@ -1102,6 +1102,8 @@ describe("summarizeToolResultForTrace", () => {
         status: "failed",
         objective: "Build core implementation",
         validationCode: "missing_file_mutation_evidence",
+        delegatedScopeTrust: "rejected_invalid_scope",
+        delegatedScopeTrustReason: "workspace_root_outside_parent_workspace",
         error:
           "Delegated task required file creation/edit evidence but child used no file mutation tools",
         failedToolCalls: 1,
@@ -1124,6 +1126,8 @@ describe("summarizeToolResultForTrace", () => {
       status: "failed",
       objective: "Build core implementation",
       validationCode: "missing_file_mutation_evidence",
+      delegatedScopeTrust: "rejected_invalid_scope",
+      delegatedScopeTrustReason: "workspace_root_outside_parent_workspace",
       failedToolCalls: 1,
       error: expect.stringContaining("file creation/edit evidence"),
       output: "Completed execute_with_agent",
@@ -3058,6 +3062,115 @@ describe("DaemonManager", () => {
       content: "export const ok = true;\n",
       [SESSION_ALLOWED_ROOTS_ARG]: [sessionWorkspaceRoot],
     });
+  });
+
+  it("uses the session workspace root for direct delegated child shell calls in webchat when workspace.hostPath is not pinned", async () => {
+    const dm = new DaemonManager({ configPath: "/tmp/config.json" });
+    const sessionWorkspaceRoot = await mkdtemp(
+      join(tmpdir(), "agenc-daemon-child-root-"),
+    );
+    (dm as any)._hostWorkspacePath = "/tmp/daemon-root";
+    (dm as any)._hostWorkspacePathPinned = false;
+    (dm as any)._llmTools = [
+      {
+        type: "function",
+        function: {
+          name: "system.bash",
+          description: "run commands",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+    ];
+    (dm as any)._subAgentManager = {
+      spawn: vi.fn(async () => "subagent:child-webchat"),
+      getResult: vi.fn(() => ({
+        sessionId: "subagent:child-webchat",
+        output: JSON.stringify({
+          stdout: `${sessionWorkspaceRoot}\n`,
+          stderr: "",
+          exitCode: 0,
+        }),
+        success: true,
+        completionState: "completed",
+        stopReason: "completed",
+        durationMs: 42,
+        toolCalls: [
+          {
+            name: "system.bash",
+            args: { command: "pwd" },
+            result: JSON.stringify({
+              stdout: `${sessionWorkspaceRoot}\n`,
+              stderr: "",
+              exitCode: 0,
+            }),
+            isError: false,
+            durationMs: 5,
+          },
+        ],
+      })),
+      getInfo: vi.fn(() => ({
+        sessionId: "subagent:child-webchat",
+        parentSessionId: "session-project-root",
+        depth: 1,
+        status: "completed",
+        startedAt: Date.now() - 100,
+        task: "Print the delegated cwd",
+      })),
+    };
+    const baseToolHandler = vi.fn(async () => JSON.stringify({ ok: true }));
+    const hooks = {
+      dispatch: vi.fn(async () => ({ completed: true, payload: {} })),
+    } as any;
+    const webChat = {
+      pushToSession: vi.fn(),
+      broadcastEvent: vi.fn(),
+      loadSessionWorkspaceRoot: vi.fn(async () => sessionWorkspaceRoot),
+    } as any;
+
+    try {
+      const handler = (dm as any).createWebChatSessionToolHandler({
+        sessionId: "session-project-root",
+        webChat,
+        hooks,
+        baseToolHandler,
+        traceLabel: "webchat",
+        traceConfig: { enabled: false },
+        traceId: "trace-delegated-project-root",
+      });
+
+      const result = await handler("execute_with_agent", {
+        task: "Print the delegated cwd",
+        objective: "Run pwd in the child shell and report it.",
+        tools: ["system.bash"],
+      });
+
+      expect(JSON.parse(result)).toMatchObject({
+        success: true,
+        status: "completed",
+      });
+    } finally {
+      await rm(sessionWorkspaceRoot, { recursive: true, force: true });
+    }
+
+    expect(webChat.loadSessionWorkspaceRoot).toHaveBeenCalledWith(
+      "session-project-root",
+    );
+    expect((dm as any)._subAgentManager.spawn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parentSessionId: "session-project-root",
+        workingDirectory: sessionWorkspaceRoot,
+        workingDirectorySource: "execution_envelope",
+        tools: ["system.bash"],
+        delegationSpec: expect.objectContaining({
+          executionContext: expect.objectContaining({
+            workspaceRoot: sessionWorkspaceRoot,
+            allowedReadRoots: [sessionWorkspaceRoot],
+            allowedWriteRoots: [sessionWorkspaceRoot],
+          }),
+        }),
+      }),
+    );
+    expect(baseToolHandler).not.toHaveBeenCalled();
   });
 
   it("keeps the configured host workspace root authoritative when workspace.hostPath is pinned", async () => {

@@ -86,7 +86,7 @@ const LOCAL_FILESYSTEM_CAPABLE_TOOL_NAMES = new Set([
   "system.writeFile",
 ]);
 
-function toolScopeRequiresStructuredExecutionContext(
+export function toolScopeRequiresStructuredExecutionContext(
   allowedTools?: readonly string[],
 ): boolean {
   return (allowedTools ?? []).some((toolName) =>

@@ -2411,7 +2411,7 @@ function validateLlmSection(llm: unknown, errors: string[]): void {
     requireIntRange(llm.maxRuntimeHints, "llm.maxRuntimeHints", 0, 32, errors);
   }
   if (llm.maxToolRounds !== undefined) {
-    requireIntRange(llm.maxToolRounds, "llm.maxToolRounds", 1, 64, errors);
+    requireIntRange(llm.maxToolRounds, "llm.maxToolRounds", 1, 2_048, errors);
   }
   if (llm.plannerEnabled !== undefined && typeof llm.plannerEnabled !== "boolean") {
     errors.push("llm.plannerEnabled must be a boolean");
@@ -2421,7 +2421,7 @@ function validateLlmSection(llm: unknown, errors: string[]): void {
       llm.plannerMaxTokens,
       "llm.plannerMaxTokens",
       16,
-      8_192,
+      65_536,
       errors,
     );
   }
@@ -2430,7 +2430,7 @@ function validateLlmSection(llm: unknown, errors: string[]): void {
       llm.toolBudgetPerRequest,
       "llm.toolBudgetPerRequest",
       1,
-      256,
+      8_192,
       errors,
     );
   }

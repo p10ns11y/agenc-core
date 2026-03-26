@@ -860,16 +860,16 @@ export type { EvalScriptResult };
 /**
  * Default max tool rounds for ChatExecutor based on config.
  *
- * Desktop-enabled sessions get 50 rounds because multi-step desktop automation
- * (open app → type → screenshot → verify → retry) legitimately chains many calls.
- * Text-only chat gets 3 rounds to keep simple responses snappy. Foreground
- * coding and durable-execution turns can raise their per-turn cap above this
- * default via resolveTurnMaxToolRounds().
+ * Foreground chat is allowed to run for very long coding turns by default.
+ * Runtime-owned repair gates, request budgets, and failure breakers still bound
+ * bad loops, so the round ceiling should not be the reason a healthy coding
+ * turn stops mid-execution.
  * Voice delegation uses a separate cap (MAX_DELEGATION_TOOL_ROUNDS = 15) set
  * per-call in voice-bridge.ts.
  */
 function getDefaultMaxToolRounds(config: GatewayConfig): number {
-  return config.desktop?.enabled ? 50 : 3;
+  void config;
+  return 2_048;
 }
 
 /** Result of loadWallet() — either a keypair + wallet adapter or null. */

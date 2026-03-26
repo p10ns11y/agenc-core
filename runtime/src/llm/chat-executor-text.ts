@@ -16,6 +16,7 @@ import type {
 } from "./prompt-budget.js";
 import type { ToolCallRecord, ChatPromptShape } from "./chat-executor-types.js";
 import type { WorkflowCompletionState } from "../workflow/completion-state.js";
+import type { WorkflowProgressSnapshot } from "../workflow/completion-progress.js";
 import {
   MAX_FINAL_RESPONSE_CHARS,
   REPETITIVE_LINE_MIN_COUNT,
@@ -47,6 +48,11 @@ import {
   parseJsonObjectFromText,
   tryParseJsonObject as tryParseObject,
 } from "../utils/delegated-contract-normalization.js";
+import {
+  assessExecuteWithAgentResult,
+  sanitizeDelegatedAssistantEnvironmentSummary,
+} from "../utils/delegated-scope-trust.js";
+import { buildWorkflowRecoveryStateLines } from "./chat-executor-recovery.js";
 
 // ============================================================================
 // JSON parsing helpers (used by planner + verifier)
@@ -110,7 +116,6 @@ const SIMPLE_READ_ONLY_SHELL_COMMANDS = new Set([
 ]);
 const SHELL_ADVICE_RE =
   /\b(?:spawns fresh shells|non-persistent|future commands there start|to work in\s+[`~]|prefix like|demo:)\b/i;
-
 function normalizeInlineText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
@@ -174,7 +179,46 @@ function extractDelegatedToolOutput(
   if (!output || isLowInformationCompletion(output)) {
     return undefined;
   }
+  const assessment = assessExecuteWithAgentResult({
+    args:
+      toolCall.args &&
+        typeof toolCall.args === "object" &&
+        !Array.isArray(toolCall.args)
+        ? toolCall.args as Record<string, unknown>
+        : undefined,
+    result: toolCall.result,
+  });
+  if (
+    assessment &&
+    assessment.delegatedScopeTrust !== "trusted_authoritative"
+  ) {
+    return undefined;
+  }
   return output;
+}
+
+function delegatedResultPreview(
+  toolCall: ToolCallRecord,
+  preparedText: string,
+): string {
+  if (toolCall.name !== "execute_with_agent") {
+    return preparedText;
+  }
+  const assessment = assessExecuteWithAgentResult({
+    args:
+      toolCall.args &&
+        typeof toolCall.args === "object" &&
+        !Array.isArray(toolCall.args)
+        ? toolCall.args as Record<string, unknown>
+        : undefined,
+    result: toolCall.result,
+  });
+  if (!assessment || assessment.delegatedScopeTrust === "trusted_authoritative") {
+    return preparedText;
+  }
+  return assessment.delegatedScopeTrust === "rejected_invalid_scope"
+    ? "[delegated scope rejected by runtime: invalid child root/workspace authority]"
+    : "[delegated output suppressed: untrusted cwd/workspace-root claim]";
 }
 
 export function reconcileDirectShellObservationContent(
@@ -589,6 +633,12 @@ const EXECUTION_PLAN_LINE_RE =
 const PLAN_HEADING_RE = /^(?:\*\*)?plan(?:\*\*)?:?/im;
 const FUTURE_EXECUTION_SIGNAL_RE =
   /\b(?:starting execution|begin(?:ning)? execution|i(?:'ll| will)|going to|next(?: up)?|after that|then)\b/i;
+const EXECUTION_DEFERRAL_SIGNAL_RE =
+  /\b(?:let me know|ready for|next (?:feature|module|step)|deepen next|specific feature|specific module|continue next|follow up next)\b/i;
+const EXECUTION_PROGRESS_SUMMARY_SIGNAL_RE =
+  /\b(?:summary of process|current status|compiled|build succeeded|updated\s+`|updated\s+src\/|wrote\s+|fixed\s+|implemented\s+|ready)\b/i;
+const EXECUTION_BLOCKER_SIGNAL_RE =
+  /\b(?:blocked|blocker|cannot continue|can't continue|unable to continue|needs verification|requires verification|verification pending|waiting on)\b/i;
 
 export function reconcileTerminalFailureContent(params: {
   content: string;
@@ -630,6 +680,7 @@ export function reconcileTerminalCompletionStateContent(params: {
   stopReason: string;
   stopReasonDetail?: string;
   toolCalls: readonly ToolCallRecord[];
+  completionProgress?: WorkflowProgressSnapshot;
 }): string {
   const {
     content,
@@ -637,17 +688,22 @@ export function reconcileTerminalCompletionStateContent(params: {
     stopReason,
     stopReasonDetail,
     toolCalls,
+    completionProgress,
   } = params;
   if (completionState === "completed") {
     return content;
   }
+  const workflowStateSection = buildWorkflowStateSection(completionProgress);
   if (completionState === "blocked") {
-    return reconcileTerminalFailureContent({
+    const blockedContent = reconcileTerminalFailureContent({
       content,
       stopReason,
       stopReasonDetail,
       toolCalls,
     });
+    return workflowStateSection
+      ? `${blockedContent}\n\n${workflowStateSection}`
+      : blockedContent;
   }
 
   const fallback = buildTerminalCompletionStateFallback({
@@ -655,6 +711,7 @@ export function reconcileTerminalCompletionStateContent(params: {
     stopReason,
     stopReasonDetail,
     toolCalls,
+    completionProgress,
   });
   const trimmed = content.trim();
   if (trimmed.length === 0) {
@@ -675,6 +732,7 @@ function buildTerminalCompletionStateFallback(params: {
   stopReason: string;
   stopReasonDetail?: string;
   toolCalls: readonly ToolCallRecord[];
+  completionProgress?: WorkflowProgressSnapshot;
 }): string {
   const lines: string[] = [];
   if (params.completionState === "partial") {
@@ -687,15 +745,30 @@ function buildTerminalCompletionStateFallback(params: {
   } else if (params.stopReason !== "completed") {
     lines.push(`Stop reason: ${params.stopReason.replace(/_/g, " ")}.`);
   }
-  const successfulCalls = params.toolCalls.filter((toolCall) =>
-    !didToolCallFail(toolCall.isError, toolCall.result),
-  );
-  if (successfulCalls.length > 0) {
-    lines.push(
-      `Grounded work recorded: ${summarizeToolCalls(successfulCalls).trim()}`,
+  const workflowStateSection = buildWorkflowStateSection(params.completionProgress);
+  if (workflowStateSection) {
+    lines.push(workflowStateSection);
+  } else {
+    const successfulCalls = params.toolCalls.filter((toolCall) =>
+      !didToolCallFail(toolCall.isError, toolCall.result),
     );
+    if (successfulCalls.length > 0) {
+      lines.push(
+        `Grounded progress so far: ${summarizeToolCalls(successfulCalls).trim()}`,
+      );
+    }
   }
   return lines.join("\n\n");
+}
+
+function buildWorkflowStateSection(
+  progress?: WorkflowProgressSnapshot,
+): string | undefined {
+  const lines = buildWorkflowRecoveryStateLines(progress);
+  if (lines.length === 0) {
+    return undefined;
+  }
+  return lines.join("\n");
 }
 
 function isContradictoryCompletionStateCopy(
@@ -797,6 +870,16 @@ export function isPlanOnlyExecutionResponse(content: string): boolean {
   const trimmed = content.trim();
   if (!looksLikeExecutionPlan(trimmed)) return false;
   return PLAN_HEADING_RE.test(trimmed) || FUTURE_EXECUTION_SIGNAL_RE.test(trimmed);
+}
+
+export function isExecutionDeferralResponse(content: string): boolean {
+  const trimmed = content.trim();
+  if (trimmed.length === 0) return false;
+  if (EXECUTION_BLOCKER_SIGNAL_RE.test(trimmed)) return false;
+  return (
+    EXECUTION_DEFERRAL_SIGNAL_RE.test(trimmed) &&
+    EXECUTION_PROGRESS_SUMMARY_SIGNAL_RE.test(trimmed)
+  );
 }
 
 function normalizeFailurePreview(value: string): string {
@@ -1035,7 +1118,7 @@ export function normalizeHistory(history: readonly LLMMessage[]): LLMMessage[] {
       return {
         ...baseMessage,
         content: truncateText(
-          entry.content,
+          sanitizeDelegatedAssistantEnvironmentSummary(entry.content),
           MAX_HISTORY_MESSAGE_CHARS,
         ),
       };
@@ -1046,7 +1129,7 @@ export function normalizeHistory(history: readonly LLMMessage[]): LLMMessage[] {
         return {
           type: "text" as const,
           text: truncateText(
-            part.text,
+            sanitizeDelegatedAssistantEnvironmentSummary(part.text),
             MAX_HISTORY_MESSAGE_CHARS,
           ),
         };
@@ -1092,7 +1175,9 @@ export function toStatefulReconciliationMessage(
 
   return {
     ...baseMessage,
-    content: extractStatefulReconciliationText(message.content),
+    content: sanitizeDelegatedAssistantEnvironmentSummary(
+      extractStatefulReconciliationText(message.content),
+    ),
   };
 }
 
@@ -1214,7 +1299,31 @@ export function prepareToolResultForPrompt(result: string): {
 
   try {
     const parsed = JSON.parse(result) as unknown;
-    const sanitized = sanitizeJsonForPrompt(parsed, setDataUrl);
+    const parsedObject =
+      typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : undefined;
+    const delegatedScopeTrust =
+      typeof parsedObject?.delegatedScopeTrust === "string"
+        ? parsedObject.delegatedScopeTrust
+        : undefined;
+    const replaySafeParsed =
+      delegatedScopeTrust === "rejected_invalid_scope"
+        ? {
+          ...parsedObject,
+          error:
+            "Delegated scope was rejected by the runtime. Do not infer or invent child cwd/workspace roots from this failure.",
+          output: undefined,
+          issues: undefined,
+        }
+        : delegatedScopeTrust === "informational_untrusted"
+          ? {
+            ...parsedObject,
+            output:
+              "[delegated cwd/workspace-root claim treated as informational only]",
+          }
+          : parsed;
+    const sanitized = sanitizeJsonForPrompt(replaySafeParsed, setDataUrl);
     return {
       text: truncateText(
         safeStringify(sanitized),
@@ -1327,7 +1436,7 @@ function buildToolExecutionLedgerEntries(
         MAX_TOOL_LEDGER_ENTRY_ARGUMENT_CHARS,
       ),
       resultPreview: truncateText(
-        preparedResult.text,
+        delegatedResultPreview(toolCall, preparedResult.text),
         MAX_TOOL_LEDGER_ENTRY_RESULT_CHARS,
       ),
     };

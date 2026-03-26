@@ -558,6 +558,17 @@ describe("chat-executor-planner explicit orchestration requirements", () => {
     expect(decision.reason).toContain("plan_artifact_request");
   });
 
+  it("forces planner routing for plan-artifact execution requests", () => {
+    const decision = assessPlannerDecision(
+      true,
+      "You are to read all of @PLAN.md and complete every single phase in full.",
+      [],
+    );
+
+    expect(decision.shouldPlan).toBe(true);
+    expect(decision.reason).toContain("plan_artifact_execution_request");
+  });
+
   it("extracts required subagent steps from the compact 'plan required' prompt shape", () => {
     const requirements = extractExplicitSubagentOrchestrationRequirements(
       "Subagent context audit SG3. Sub-agent orchestration plan required: " +
@@ -1418,12 +1429,14 @@ describe("chat-executor-planner explicit orchestration requirements", () => {
       "Write a TODO.md with a complete plan for building a C shell with jobs, fork(), argv parsing, and pipes.",
     );
 
-    expect(diagnostics).toEqual([
-      expect.objectContaining({
-        category: "validation",
-        code: "planner_plan_artifact_single_write_collapse",
-      }),
-    ]);
+    expect(diagnostics).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          category: "validation",
+          code: "planner_plan_artifact_single_write_collapse",
+        }),
+      ]),
+    );
   });
 
   it("allows substantial software plan-doc requests when the plan grounds before the final artifact write", () => {
@@ -1459,6 +1472,88 @@ describe("chat-executor-planner explicit orchestration requirements", () => {
     );
 
     expect(diagnostics).toEqual([]);
+  });
+
+  it("rejects plan-artifact execution requests that emit multiple mutable delegated owners for one workspace root", () => {
+    const workspaceRoot = "/tmp/agenc-shell";
+    const diagnostics = validatePlannerStepContracts(
+      {
+        reason: "complete_plan_artifact_execution",
+        requiresSynthesis: false,
+        confidence: 0.82,
+        steps: [
+          {
+            name: "read_plan",
+            stepType: "deterministic_tool",
+            dependsOn: [],
+            tool: "system.readFile",
+            args: {
+              path: `${workspaceRoot}/PLAN.md`,
+            },
+          },
+          {
+            name: "implement_changes",
+            stepType: "subagent_task",
+            dependsOn: ["read_plan"],
+            objective: "Implement the requested code changes from PLAN.md.",
+            inputContract: "PLAN.md plus existing source tree.",
+            acceptanceCriteria: ["Required source files updated."],
+            requiredToolCapabilities: ["read", "write", "bash"],
+            contextRequirements: ["read_plan"],
+            maxBudgetHint: "20m",
+            canRunParallel: false,
+            executionContext: {
+              version: "v1",
+              workspaceRoot,
+              allowedReadRoots: [workspaceRoot],
+              allowedWriteRoots: [workspaceRoot],
+              requiredSourceArtifacts: [`${workspaceRoot}/PLAN.md`],
+              targetArtifacts: [`${workspaceRoot}/src`],
+              effectClass: "filesystem_write",
+              verificationMode: "mutation_required",
+              stepKind: "delegated_write",
+            },
+          },
+          {
+            name: "qa_doublecheck",
+            stepType: "subagent_task",
+            dependsOn: ["implement_changes"],
+            objective: "Retest, polish, and keep fixing until PLAN.md is complete.",
+            inputContract: "Updated repo and PLAN.md.",
+            acceptanceCriteria: ["All tests pass after any fixes."],
+            requiredToolCapabilities: ["read", "write", "bash"],
+            contextRequirements: ["implement_changes"],
+            maxBudgetHint: "15m",
+            canRunParallel: false,
+            executionContext: {
+              version: "v1",
+              workspaceRoot,
+              allowedReadRoots: [workspaceRoot],
+              allowedWriteRoots: [workspaceRoot],
+              requiredSourceArtifacts: [`${workspaceRoot}/PLAN.md`],
+              targetArtifacts: [workspaceRoot],
+              effectClass: "mixed",
+              verificationMode: "mutation_required",
+              stepKind: "delegated_review",
+            },
+          },
+        ],
+        edges: [
+          { from: "read_plan", to: "implement_changes" },
+          { from: "implement_changes", to: "qa_doublecheck" },
+        ],
+      },
+      "Read all of @PLAN.md and complete every single phase in full.",
+    );
+
+    expect(diagnostics).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          category: "validation",
+          code: "planner_plan_artifact_single_owner_required",
+        }),
+      ]),
+    );
   });
 
   it("rejects deterministic bash steps that embed shell separators in direct args", () => {

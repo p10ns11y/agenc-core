@@ -246,4 +246,38 @@ describe("summarizeToolResult()", () => {
     const result = summarizeToolResult("tool", longArgs, longResult, 10);
     expect(result.length).toBeLessThan(400);
   });
+
+  it("redacts rejected delegated scope failures from recent progress", () => {
+    const result = summarizeToolResult(
+      "execute_with_agent",
+      { task: "run pwd in child" },
+      JSON.stringify({
+        success: false,
+        error:
+          'Requested delegated workspace root "/" is outside the trusted parent workspace root "/tmp/project".',
+        issues: [{ code: "workspace_root_outside_parent_workspace" }],
+      }),
+      14,
+    );
+
+    expect(result).toContain("[delegated scope rejected by runtime]");
+    expect(result).not.toContain('workspace root "/"');
+  });
+
+  it("redacts untrusted delegated cwd echoes from recent progress", () => {
+    const result = summarizeToolResult(
+      "execute_with_agent",
+      { task: "run pwd in the child and report it" },
+      JSON.stringify({
+        success: true,
+        output: "Subagent cwd: /tmp/project",
+      }),
+      14,
+    );
+
+    expect(result).toContain(
+      "[delegated cwd/workspace fact treated as informational only]",
+    );
+    expect(result).not.toContain("Subagent cwd: /tmp/project");
+  });
 });

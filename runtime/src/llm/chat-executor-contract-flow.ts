@@ -16,6 +16,13 @@ import {
   validateDelegatedOutputContract,
 } from "../utils/delegation-validation.js";
 import { validateRuntimeVerificationContract } from "../workflow/index.js";
+import type { ImplementationCompletionContract } from "../workflow/completion-contract.js";
+import {
+  isPathWithinRoot,
+  normalizeEnvelopePath,
+  normalizeWorkspaceRoot,
+} from "../workflow/path-normalization.js";
+import type { WorkflowVerificationContract } from "../workflow/verification-obligations.js";
 import { buildBrowserEvidenceRetryGuidance } from "../utils/browser-tool-taxonomy.js";
 import type { ExecutionContext, ToolCallRecord } from "./chat-executor-types.js";
 import type { LLMProviderEvidence } from "./types.js";
@@ -33,29 +40,46 @@ import { requestRequiresToolGroundedExecution } from "./chat-executor-planner.js
 
 type ToolNameCollection = Iterable<string> | readonly string[];
 
-type ContractFlowContext = Pick<
-  ExecutionContext,
-  | "messageText"
-  | "allToolCalls"
-  | "activeRoutedToolNames"
-  | "initialRoutedToolNames"
-  | "expandedRoutedToolNames"
-  | "requiredToolEvidence"
-  | "providerEvidence"
-  | "response"
-  | "plannerSummaryState"
->;
+type ContractFlowContext =
+  Pick<
+    ExecutionContext,
+    | "messageText"
+    | "allToolCalls"
+    | "activeRoutedToolNames"
+    | "initialRoutedToolNames"
+    | "expandedRoutedToolNames"
+    | "requiredToolEvidence"
+    | "providerEvidence"
+    | "response"
+    | "plannerSummaryState"
+  > &
+  Partial<
+    Pick<
+      ExecutionContext,
+      | "runtimeWorkspaceRoot"
+      | "plannerVerificationContract"
+      | "plannerCompletionContract"
+    >
+  >;
 
 export type LegacyCompletionCompatibilityClass =
   | "docs"
   | "research"
-  | "plan_only"
-  | "implementation";
+  | "plan_only";
 
 export interface LegacyCompletionCompatibilityDecision {
   readonly allowed: boolean;
   readonly compatibilityClass: LegacyCompletionCompatibilityClass;
   readonly reason: string;
+}
+
+export interface RuntimeWorkflowContextResolution {
+  readonly verificationContract?: WorkflowVerificationContract;
+  readonly completionContract?: ImplementationCompletionContract;
+  readonly ownershipSource?:
+    | "planner_owned"
+    | "required_tool_evidence"
+    | "direct_deterministic_implementation";
 }
 
 const DIRECT_MUTATION_TOOL_NAMES = new Set([
@@ -77,6 +101,10 @@ const BUILD_OR_BEHAVIOR_COMMAND_RE =
   /\b(?:build|compile|typecheck|lint|test|tests|testing|vitest|jest|pytest|playwright|ctest|cargo test|go test|smoke|scenario|e2e|end-to-end)\b/i;
 const LIKELY_IMPLEMENTATION_REQUEST_RE =
   /\b(?:implement|implementation|fix|repair|refactor|build|compile|typecheck|lint|test|write|edit|update|create)\b/i;
+const BEHAVIOR_REQUIREMENT_RE =
+  /\b(?:behavior|behaviour|scenario|smoke|integration|e2e|end-to-end|playtest|job control)\b/i;
+const BUILD_REQUIREMENT_RE =
+  /\b(?:build|compile|typecheck|lint|test|tests|testing|vitest|jest|pytest|playwright|ctest|cargo test|go test)\b/i;
 
 interface EncodedEffectTarget {
   readonly path?: string;
@@ -114,12 +142,47 @@ export function resolveExecutionToolContractGuidance(input: {
   });
 }
 
+export function resolveRuntimeWorkflowContext(input: {
+  readonly ctx: ContractFlowContext;
+}): RuntimeWorkflowContextResolution {
+  const plannerContext = mergeWorkflowVerificationContext({
+    verificationContract: input.ctx.plannerVerificationContract,
+    completionContract: input.ctx.plannerCompletionContract,
+  });
+  if (plannerContext.verificationContract || plannerContext.completionContract) {
+    return {
+      ...plannerContext,
+      ownershipSource: "planner_owned",
+    };
+  }
+
+  const explicitContext = mergeWorkflowVerificationContext({
+    verificationContract: input.ctx.requiredToolEvidence?.verificationContract,
+    completionContract: input.ctx.requiredToolEvidence?.completionContract,
+  });
+  if (explicitContext.verificationContract || explicitContext.completionContract) {
+    return {
+      ...explicitContext,
+      ownershipSource: "required_tool_evidence",
+    };
+  }
+
+  const directImplementationContext =
+    synthesizeDirectImplementationWorkflowContext(input.ctx);
+  if (directImplementationContext) {
+    return {
+      ...directImplementationContext,
+      ownershipSource: "direct_deterministic_implementation",
+    };
+  }
+
+  return {};
+}
+
 export function resolveLegacyCompletionCompatibility(input: {
   readonly ctx: ContractFlowContext;
 }): LegacyCompletionCompatibilityDecision {
-  const successfulToolCalls = input.ctx.allToolCalls.filter(
-    (toolCall) => !didToolCallFail(toolCall.isError, toolCall.result),
-  );
+  const analysis = analyzeLegacyCompletionTurn(input.ctx);
   const plannerRouteReason = input.ctx.plannerSummaryState.routeReason;
   if (
     plannerRouteReason === "exact_response_turn" ||
@@ -133,41 +196,9 @@ export function resolveLegacyCompletionCompatibility(input: {
     };
   }
 
-  const mutatedArtifacts = collectLegacyMutatedArtifacts(successfulToolCalls);
-  const hasMutationProgress = mutatedArtifacts.length > 0;
-  const hasResearchEvidence =
-    (input.ctx.providerEvidence?.citations?.length ?? 0) > 0 ||
-    successfulToolCalls.some((toolCall) =>
-      toolCall.name.startsWith(BROWSER_TOOL_PREFIX) ||
-      RESEARCH_TOOL_NAMES.has(toolCall.name),
-    );
-  const hasBuildOrBehaviorEvidence = successfulToolCalls.some((toolCall) => {
-    const verification = parseEncodedVerificationMetadata(toolCall.result);
-    if (
-      verification?.category === "build" ||
-      verification?.category === "behavior"
-    ) {
-      return true;
-    }
-    const command =
-      verification?.command ??
-      resolveCommandText(toolCall);
-    return BUILD_OR_BEHAVIOR_COMMAND_RE.test(command);
-  });
-  const mutatesSourceLikeArtifacts = mutatedArtifacts.some((artifact) =>
-    SOURCE_LIKE_PATH_RE.test(artifact),
-  );
-  const likelyImplementationRequest =
-    LIKELY_IMPLEMENTATION_REQUEST_RE.test(input.ctx.messageText) &&
-    requestRequiresToolGroundedExecution(input.ctx.messageText);
-  const implementationLikeTurn =
-    mutatesSourceLikeArtifacts ||
-    hasBuildOrBehaviorEvidence ||
-    (successfulToolCalls.length === 0 && likelyImplementationRequest);
-
   if (
-    hasMutationProgress &&
-    mutatedArtifacts.every((artifact) => isDocOnlyArtifactPath(artifact))
+    analysis.hasMutationProgress &&
+    analysis.mutatedArtifacts.every((artifact) => isDocOnlyArtifactPath(artifact))
   ) {
     return {
       allowed: true,
@@ -177,7 +208,11 @@ export function resolveLegacyCompletionCompatibility(input: {
     };
   }
 
-  if (!hasMutationProgress && hasResearchEvidence && !hasBuildOrBehaviorEvidence) {
+  if (
+    !analysis.hasMutationProgress &&
+    analysis.hasResearchEvidence &&
+    !analysis.hasBuildOrBehaviorEvidence
+  ) {
     return {
       allowed: true,
       compatibilityClass: "research",
@@ -187,7 +222,7 @@ export function resolveLegacyCompletionCompatibility(input: {
   }
 
   if (
-    !hasMutationProgress &&
+    !analysis.hasMutationProgress &&
     !requestRequiresToolGroundedExecution(input.ctx.messageText)
   ) {
     return {
@@ -198,7 +233,7 @@ export function resolveLegacyCompletionCompatibility(input: {
     };
   }
 
-  if (!implementationLikeTurn) {
+  if (!analysis.implementationLikeTurn) {
     return {
       allowed: true,
       compatibilityClass: "plan_only",
@@ -206,14 +241,16 @@ export function resolveLegacyCompletionCompatibility(input: {
         "Legacy completion remains allowed for non-implementation turns outside the implementation verifier scope.",
     };
   }
+  throw new Error(
+    "resolveLegacyCompletionCompatibility received implementation-class work. " +
+      "Implementation completion must be handled by workflow-owned truth before compatibility.",
+  );
+}
 
-  return {
-    allowed: false,
-    compatibilityClass: "implementation",
-    reason:
-      "Implementation-class completion now requires the workflow verification contract. " +
-      "Only docs, research, and plan-only turns may use the legacy completion path.",
-  };
+export function requiresWorkflowOwnedImplementationCompletion(input: {
+  readonly ctx: ContractFlowContext;
+}): boolean {
+  return analyzeLegacyCompletionTurn(input.ctx).implementationLikeTurn;
 }
 
 export function validateRequiredToolEvidence(input: {
@@ -409,6 +446,170 @@ export function buildRequiredToolEvidenceRetryInstruction(input: {
     correctionLines.join(" ") +
     allowedToolSummary
   );
+}
+
+function mergeWorkflowVerificationContext(input: {
+  readonly verificationContract?: WorkflowVerificationContract;
+  readonly completionContract?: ImplementationCompletionContract;
+}): RuntimeWorkflowContextResolution {
+  if (!input.verificationContract && !input.completionContract) {
+    return {};
+  }
+  return {
+    verificationContract: {
+      ...(input.verificationContract ?? {}),
+      ...(input.completionContract
+        ? { completionContract: input.completionContract }
+        : {}),
+    },
+    completionContract:
+      input.completionContract ?? input.verificationContract?.completionContract,
+  };
+}
+
+function synthesizeDirectImplementationWorkflowContext(
+  ctx: ContractFlowContext,
+): RuntimeWorkflowContextResolution | undefined {
+  const workspaceRoot = normalizeWorkspaceRoot(ctx.runtimeWorkspaceRoot);
+  if (!workspaceRoot) {
+    return undefined;
+  }
+
+  const successfulToolCalls = ctx.allToolCalls.filter(
+    (toolCall) => !didToolCallFail(toolCall.isError, toolCall.result),
+  );
+  if (successfulToolCalls.length === 0) {
+    return undefined;
+  }
+
+  const mutatedArtifacts = collectLegacyMutatedArtifacts(successfulToolCalls)
+    .map((artifact) => normalizeEnvelopePath(artifact, workspaceRoot))
+    .filter((artifact) => isPathWithinRoot(artifact, workspaceRoot));
+  const uniqueMutatedArtifacts = [...new Set(mutatedArtifacts)];
+  const docOnlyMutations =
+    uniqueMutatedArtifacts.length > 0 &&
+    uniqueMutatedArtifacts.every((artifact) => isDocOnlyArtifactPath(artifact));
+  if (docOnlyMutations) {
+    return undefined;
+  }
+
+  const hasMutationProgress = uniqueMutatedArtifacts.length > 0;
+  const mutatesSourceLikeArtifacts = uniqueMutatedArtifacts.some((artifact) =>
+    SOURCE_LIKE_PATH_RE.test(artifact),
+  );
+  const buildOrBehaviorSignals = successfulToolCalls.map((toolCall) => {
+    const verification = parseEncodedVerificationMetadata(toolCall.result);
+    return {
+      verificationCategory: verification?.category,
+      command: verification?.command ?? resolveCommandText(toolCall),
+    };
+  });
+  const hasBehaviorRequirement =
+    BEHAVIOR_REQUIREMENT_RE.test(ctx.messageText) ||
+    buildOrBehaviorSignals.some(({ verificationCategory, command }) =>
+      verificationCategory === "behavior" || BEHAVIOR_REQUIREMENT_RE.test(command)
+    );
+  const hasBuildRequirement =
+    hasBehaviorRequirement ||
+    BUILD_REQUIREMENT_RE.test(ctx.messageText) ||
+    buildOrBehaviorSignals.some(({ verificationCategory, command }) =>
+      verificationCategory === "build" || BUILD_REQUIREMENT_RE.test(command)
+    );
+  const likelyImplementationRequest =
+    LIKELY_IMPLEMENTATION_REQUEST_RE.test(ctx.messageText) &&
+    requestRequiresToolGroundedExecution(ctx.messageText);
+  const implementationLikeTurn =
+    hasMutationProgress &&
+    (mutatesSourceLikeArtifacts || likelyImplementationRequest || hasBuildRequirement);
+  if (!implementationLikeTurn) {
+    return undefined;
+  }
+
+  const completionContract: ImplementationCompletionContract = hasBehaviorRequirement
+    ? {
+      taskClass: "behavior_required",
+      placeholdersAllowed: false,
+      partialCompletionAllowed: false,
+      placeholderTaxonomy: "implementation",
+    }
+    : hasBuildRequirement
+      ? {
+        taskClass: "build_required",
+        placeholdersAllowed: false,
+        partialCompletionAllowed: false,
+        placeholderTaxonomy: "implementation",
+      }
+      : {
+        taskClass: "artifact_only",
+        placeholdersAllowed: false,
+        partialCompletionAllowed: false,
+        placeholderTaxonomy: "implementation",
+      };
+
+  return {
+    verificationContract: {
+      workspaceRoot,
+      targetArtifacts: uniqueMutatedArtifacts,
+      verificationMode: "mutation_required",
+      completionContract,
+    },
+    completionContract,
+  };
+}
+
+interface LegacyCompletionTurnAnalysis {
+  readonly successfulToolCalls: readonly ToolCallRecord[];
+  readonly mutatedArtifacts: readonly string[];
+  readonly hasMutationProgress: boolean;
+  readonly hasResearchEvidence: boolean;
+  readonly hasBuildOrBehaviorEvidence: boolean;
+  readonly implementationLikeTurn: boolean;
+}
+
+function analyzeLegacyCompletionTurn(
+  ctx: ContractFlowContext,
+): LegacyCompletionTurnAnalysis {
+  const successfulToolCalls = ctx.allToolCalls.filter(
+    (toolCall) => !didToolCallFail(toolCall.isError, toolCall.result),
+  );
+  const mutatedArtifacts = collectLegacyMutatedArtifacts(successfulToolCalls);
+  const hasMutationProgress = mutatedArtifacts.length > 0;
+  const hasResearchEvidence =
+    (ctx.providerEvidence?.citations?.length ?? 0) > 0 ||
+    successfulToolCalls.some((toolCall) =>
+      toolCall.name.startsWith(BROWSER_TOOL_PREFIX) ||
+      RESEARCH_TOOL_NAMES.has(toolCall.name),
+    );
+  const hasBuildOrBehaviorEvidence = successfulToolCalls.some((toolCall) => {
+    const verification = parseEncodedVerificationMetadata(toolCall.result);
+    if (
+      verification?.category === "build" ||
+      verification?.category === "behavior"
+    ) {
+      return true;
+    }
+    const command =
+      verification?.command ??
+      resolveCommandText(toolCall);
+    return BUILD_OR_BEHAVIOR_COMMAND_RE.test(command);
+  });
+  const mutatesSourceLikeArtifacts = mutatedArtifacts.some((artifact) =>
+    SOURCE_LIKE_PATH_RE.test(artifact),
+  );
+  const likelyImplementationRequest =
+    LIKELY_IMPLEMENTATION_REQUEST_RE.test(ctx.messageText) &&
+    requestRequiresToolGroundedExecution(ctx.messageText);
+  return {
+    successfulToolCalls,
+    mutatedArtifacts,
+    hasMutationProgress,
+    hasResearchEvidence,
+    hasBuildOrBehaviorEvidence,
+    implementationLikeTurn:
+      mutatesSourceLikeArtifacts ||
+      hasBuildOrBehaviorEvidence ||
+      (successfulToolCalls.length === 0 && likelyImplementationRequest),
+  };
 }
 
 function collectLegacyMutatedArtifacts(

@@ -35,6 +35,10 @@ import {
   inferTypedArtifactInspectionIntent,
   type TypedArtifactDomain,
 } from "../tools/system/typed-artifact-domains.js";
+import {
+  inferParentSafeReadOnlyIntrospection,
+  resolveParentSafeReadOnlyIntrospectionToolNames,
+} from "../utils/parent-safe-introspection.js";
 import { extractExplicitImperativeToolNames } from "./chat-executor-explicit-tools.js";
 import { getAcceptanceVerificationCategories } from "../utils/delegation-validation.js";
 
@@ -80,6 +84,11 @@ const TOOL_CONTRACT_GUIDANCE_RESOLVERS: readonly ToolContractGuidanceResolver[] 
     name: "explicit-tool-invocation",
     priority: 260,
     resolve: resolveExplicitToolInvocationContractGuidance,
+  },
+  {
+    name: "parent-safe-introspection",
+    priority: 255,
+    resolve: resolveParentSafeReadOnlyIntrospectionContractGuidance,
   },
   {
     name: "server-handle",
@@ -285,6 +294,44 @@ function resolveExplicitToolInvocationContractGuidance(
       `Execute ${noun} before answering.`,
     routedToolNames,
     toolChoice: "required",
+  };
+}
+
+function resolveParentSafeReadOnlyIntrospectionContractGuidance(
+  input: ToolContractGuidanceContext,
+): ToolContractGuidance | undefined {
+  if (input.phase !== "initial") return undefined;
+  if (input.toolCalls.length > 0) return undefined;
+
+  const intent = inferParentSafeReadOnlyIntrospection(input.messageText);
+  if (!intent) return undefined;
+
+  const routedToolNames = resolveParentSafeReadOnlyIntrospectionToolNames(
+    intent,
+    input.allowedToolNames,
+  );
+  if (routedToolNames.length === 0) return undefined;
+
+  const commandSummary = intent.command === "pwd" ? "`pwd`" : "`ls`";
+  const preferredToolName = routedToolNames[0]!;
+  const toolAction =
+    preferredToolName === "system.listDir"
+      ? "a direct parent-session directory listing"
+      : `${commandSummary} directly on the parent session`;
+  return {
+    source: "parent-safe-introspection",
+    runtimeInstruction:
+      "This is a trivial read-only workspace introspection turn. " +
+      `Run ${toolAction} with \`${preferredToolName}\` and answer from that output. ` +
+      "Do not delegate a child agent unless the user explicitly asked for child isolation.",
+    routedToolNames: [preferredToolName],
+    toolChoice: "required",
+    enforcement: {
+      mode: "block_other_tools",
+      message:
+        "This trivial read-only workspace introspection request should stay on the parent session tool path. " +
+        `Run ${commandSummary} directly instead of using child delegation or unrelated tools.`,
+    },
   };
 }
 

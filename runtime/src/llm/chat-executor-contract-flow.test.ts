@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   buildRequiredToolEvidenceRetryInstruction,
   canRetryDelegatedOutputWithoutAdditionalToolCalls,
+  requiresWorkflowOwnedImplementationCompletion,
   resolveCorrectionAllowedToolNames,
   resolveExecutionToolContractGuidance,
+  resolveLegacyCompletionCompatibility,
+  resolveRuntimeWorkflowContext,
   validateRequiredToolEvidence,
 } from "./chat-executor-contract-flow.js";
 
@@ -44,6 +47,186 @@ describe("chat-executor-contract-flow", () => {
       "mcp.doom.start_game",
       "mcp.doom.set_objective",
     ]);
+  });
+
+  it("synthesizes a runtime-owned workflow contract for direct deterministic implementation", () => {
+    const workflowContext = resolveRuntimeWorkflowContext({
+      ctx: {
+        messageText:
+          "Implement src/main.c in the current workspace and finish only when the implementation is complete.",
+        allToolCalls: [
+          {
+            name: "system.writeFile",
+            args: {
+              path: "/tmp/project/src/main.c",
+              content: "int main(void) { return 0; }\n",
+            },
+            result: JSON.stringify({
+              path: "/tmp/project/src/main.c",
+              bytesWritten: 30,
+            }),
+            isError: false,
+            durationMs: 2,
+          },
+        ],
+        activeRoutedToolNames: ["system.writeFile"],
+        initialRoutedToolNames: ["system.writeFile"],
+        expandedRoutedToolNames: [],
+        requiredToolEvidence: undefined,
+        providerEvidence: undefined,
+        response: undefined,
+        plannerSummaryState: {
+          routeReason: "tool_loop",
+        },
+        runtimeWorkspaceRoot: "/tmp/project",
+        plannerVerificationContract: undefined,
+        plannerCompletionContract: undefined,
+      } as any,
+    });
+
+    expect(workflowContext).toMatchObject({
+      ownershipSource: "direct_deterministic_implementation",
+      verificationContract: {
+        workspaceRoot: "/tmp/project",
+        targetArtifacts: ["/tmp/project/src/main.c"],
+        verificationMode: "mutation_required",
+      },
+      completionContract: {
+        taskClass: "artifact_only",
+      },
+    });
+  });
+
+  it("does not synthesize implementation ownership for documentation-only direct writes", () => {
+    const workflowContext = resolveRuntimeWorkflowContext({
+      ctx: {
+        messageText: "Update README.md with usage notes for the workspace.",
+        allToolCalls: [
+          {
+            name: "system.writeFile",
+            args: {
+              path: "/tmp/project/README.md",
+              content: "# Usage\n",
+            },
+            result: JSON.stringify({
+              path: "/tmp/project/README.md",
+              bytesWritten: 8,
+            }),
+            isError: false,
+            durationMs: 2,
+          },
+        ],
+        activeRoutedToolNames: ["system.writeFile"],
+        initialRoutedToolNames: ["system.writeFile"],
+        expandedRoutedToolNames: [],
+        requiredToolEvidence: undefined,
+        providerEvidence: undefined,
+        response: undefined,
+        plannerSummaryState: {
+          routeReason: "tool_loop",
+        },
+        runtimeWorkspaceRoot: "/tmp/project",
+        plannerVerificationContract: undefined,
+        plannerCompletionContract: undefined,
+      } as any,
+    });
+
+    expect(workflowContext).toEqual({});
+  });
+
+  it("requires workflow-owned completion for implementation-class turns outside legacy compatibility", () => {
+    expect(
+      requiresWorkflowOwnedImplementationCompletion({
+        ctx: {
+          messageText:
+            "Implement src/main.c in the current workspace and finish only when the implementation is complete.",
+          allToolCalls: [
+            {
+              name: "system.writeFile",
+              args: {
+                path: "/tmp/project/src/main.c",
+                content: "int main(void) { return 0; }\n",
+              },
+              result: JSON.stringify({
+                path: "/tmp/project/src/main.c",
+                bytesWritten: 30,
+              }),
+              isError: false,
+              durationMs: 2,
+            },
+          ],
+          activeRoutedToolNames: ["system.writeFile"],
+          initialRoutedToolNames: ["system.writeFile"],
+          expandedRoutedToolNames: [],
+          requiredToolEvidence: undefined,
+          providerEvidence: undefined,
+          response: undefined,
+          plannerSummaryState: {
+            routeReason: "tool_loop",
+          },
+        } as any,
+      }),
+    ).toBe(true);
+  });
+
+  it("limits legacy completion compatibility to docs, research, and plan-only turns", () => {
+    const docsDecision = resolveLegacyCompletionCompatibility({
+      ctx: {
+        messageText: "Update README.md with usage notes for the workspace.",
+        allToolCalls: [
+          {
+            name: "system.writeFile",
+            args: {
+              path: "/tmp/project/README.md",
+              content: "# Usage\n",
+            },
+            result: JSON.stringify({
+              path: "/tmp/project/README.md",
+              bytesWritten: 8,
+            }),
+            isError: false,
+            durationMs: 2,
+          },
+        ],
+        activeRoutedToolNames: ["system.writeFile"],
+        initialRoutedToolNames: ["system.writeFile"],
+        expandedRoutedToolNames: [],
+        requiredToolEvidence: undefined,
+        providerEvidence: undefined,
+        response: undefined,
+        plannerSummaryState: {
+          routeReason: "tool_loop",
+        },
+      } as any,
+    });
+
+    expect(docsDecision).toMatchObject({
+      allowed: true,
+      compatibilityClass: "docs",
+    });
+
+    const researchDecision = resolveLegacyCompletionCompatibility({
+      ctx: {
+        messageText: "Compare PixiJS and Phaser from official docs and cite sources.",
+        allToolCalls: [],
+        activeRoutedToolNames: ["web_search"],
+        initialRoutedToolNames: ["web_search"],
+        expandedRoutedToolNames: [],
+        requiredToolEvidence: undefined,
+        providerEvidence: {
+          citations: ["https://pixijs.com", "https://docs.phaser.io"],
+        },
+        response: undefined,
+        plannerSummaryState: {
+          routeReason: "tool_loop",
+        },
+      } as any,
+    });
+
+    expect(researchDecision).toMatchObject({
+      allowed: true,
+      compatibilityClass: "research",
+    });
   });
 
   it("adds validation-specific retry guidance", () => {

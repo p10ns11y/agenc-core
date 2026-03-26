@@ -747,6 +747,15 @@ export function summarizeToolResultForTrace(
         record.stopReasonDetail.trim().length > 0
           ? truncateToolLogText(record.stopReasonDetail, maxChars)
           : undefined;
+      const delegatedScopeTrust =
+        typeof record.delegatedScopeTrust === "string"
+          ? record.delegatedScopeTrust
+          : undefined;
+      const delegatedScopeTrustReason =
+        typeof record.delegatedScopeTrustReason === "string" &&
+        record.delegatedScopeTrustReason.trim().length > 0
+          ? truncateToolLogText(record.delegatedScopeTrustReason, maxChars)
+          : undefined;
       const failedToolCalls =
         typeof record.failedToolCalls === "number" &&
         Number.isFinite(record.failedToolCalls)
@@ -766,6 +775,8 @@ export function summarizeToolResultForTrace(
         validationCode !== undefined ||
         stopReason !== undefined ||
         stopReasonDetail !== undefined ||
+        delegatedScopeTrust !== undefined ||
+        delegatedScopeTrustReason !== undefined ||
         failedToolCalls !== undefined ||
         toolCalls !== undefined
       ) {
@@ -778,6 +789,10 @@ export function summarizeToolResultForTrace(
           ...(validationCode !== undefined ? { validationCode } : {}),
           ...(stopReason !== undefined ? { stopReason } : {}),
           ...(stopReasonDetail !== undefined ? { stopReasonDetail } : {}),
+          ...(delegatedScopeTrust !== undefined ? { delegatedScopeTrust } : {}),
+          ...(delegatedScopeTrustReason !== undefined
+            ? { delegatedScopeTrustReason }
+            : {}),
           ...(failedToolCalls !== undefined ? { failedToolCalls } : {}),
           ...(decomposition !== undefined ? { decomposition } : {}),
           ...(error !== undefined ? { error } : {}),

@@ -38,6 +38,8 @@ export const REDACTED_FILE_URL = "[REDACTED_FILE_URL]";
 export const REDACTED_BEARER_TOKEN = "Bearer [REDACTED_TOKEN]";
 export const REDACTED_API_KEY = "[REDACTED_API_KEY]";
 export const REDACTED_ABSOLUTE_PATH = "[REDACTED_ABSOLUTE_PATH]";
+export const OMITTED_EXECUTION_ABSOLUTE_PATH =
+  "an absolute path omitted by runtime redaction";
 
 export const PRIVATE_KEY_BLOCK_RE =
   /-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----/g;

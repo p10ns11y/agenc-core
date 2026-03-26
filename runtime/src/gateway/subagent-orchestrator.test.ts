@@ -876,7 +876,7 @@ describe("SubAgentOrchestrator", () => {
 
     expect(result.status).toBe("completed");
     expect(manager.spawnCalls).toHaveLength(1);
-    expect(manager.spawnCalls[0]?.toolBudgetPerRequest).toBe(64);
+    expect(manager.spawnCalls[0]?.toolBudgetPerRequest).toBe(2048);
   });
 
   it("emits normalized child trajectory records when trajectory sink is configured", async () => {
@@ -2123,7 +2123,7 @@ describe("SubAgentOrchestrator", () => {
       resolveSubAgentManager: () => manager,
       pollIntervalMs: 10,
     });
-    const { executionContext } = createTestExecutionContext({
+    const { workspaceRoot, executionContext } = createTestExecutionContext({
       prefix: "subagent-redaction-",
     });
 
@@ -2189,13 +2189,15 @@ describe("SubAgentOrchestrator", () => {
     expect(prompt).toContain("[REDACTED_API_KEY]");
     expect(prompt).toContain("[REDACTED_INTERNAL_URL]");
     expect(prompt).toContain("[REDACTED_FILE_URL]");
-    expect(prompt).toContain("[REDACTED_ABSOLUTE_PATH]");
     expect(prompt).toContain("[REDACTED_IMAGE_DATA_URL]");
+    expect(prompt).toContain(workspaceRoot);
+    expect(prompt).toContain("an absolute path omitted by runtime redaction");
     expect(prompt).not.toContain("supersecrettoken");
     expect(prompt).not.toContain("sk-abcdefghijklmnopqrstuvwxyz");
     expect(prompt).not.toContain("127.0.0.1:8080");
     expect(prompt).not.toContain("192.168.1.20:8080");
     expect(prompt).not.toContain("/home/tetsuo/.ssh/id_rsa");
+    expect(prompt).not.toContain("[REDACTED_ABSOLUTE_PATH]");
     expect(prompt).not.toContain("episodic memory should not leak");
   });
 
@@ -6104,6 +6106,65 @@ describe("SubAgentOrchestrator", () => {
     expect(prompt).toContain("host-side browser verification command");
   });
 
+  it("adds trust-aware retry guidance for invalid delegated workspace-root attempts", () => {
+    const fallback = createFallbackExecutor(async (pipeline) => ({
+      status: "completed",
+      context: pipeline.context,
+      completedSteps: pipeline.steps.length,
+      totalSteps: pipeline.steps.length,
+    }));
+    const orchestrator = new SubAgentOrchestrator({
+      fallbackExecutor: fallback,
+      resolveSubAgentManager: () => null,
+      pollIntervalMs: 5,
+      fallbackBehavior: "fail_request",
+    });
+
+    const step: PipelinePlannerSubagentStep = {
+      name: "author_core",
+      stepType: "subagent_task",
+      objective:
+        "Author the delegated package files only inside the approved workspace.",
+      inputContract: "Stay inside the runtime-approved workspace root.",
+      acceptanceCriteria: ["Files authored inside the approved workspace"],
+      requiredToolCapabilities: ["system.writeFile"],
+      contextRequirements: ["cwd=/workspace/legacy-hint"],
+      canRunParallel: false,
+    };
+
+    const prompt = (orchestrator as unknown as {
+      buildRetryTaskPrompt: (
+        currentTaskPrompt: string,
+        step: PipelinePlannerSubagentStep,
+        allowedTools: readonly string[],
+        failure: {
+          failureClass: "malformed_result_contract";
+          message: string;
+          stopReasonHint: "validation_error";
+        },
+        retryAttempt: number,
+      ) => string;
+    }).buildRetryTaskPrompt(
+      "Base prompt",
+      step,
+      ["system.writeFile"],
+      {
+        failureClass: "malformed_result_contract",
+        message:
+          'Requested delegated workspace root "/" is outside the trusted parent workspace root "/home/tetsuo/git/AgenC".',
+        stopReasonHint: "validation_error",
+      },
+      1,
+    );
+
+    expect(prompt).toContain(
+      "The runtime-owned execution envelope already defines the child filesystem boundary.",
+    );
+    expect(prompt).toContain(
+      "keep all work inside the approved workspace scope",
+    );
+  });
+
   it("fails blocked successful child outputs without retrying them as completed phases", async () => {
     const fallback = createFallbackExecutor(async (pipeline) => ({
       status: "completed",
@@ -6862,8 +6923,8 @@ describe("SubAgentOrchestrator", () => {
 
     expect(result.status).toBe("completed");
     expect(manager.spawnCalls).toHaveLength(2);
-    expect(manager.spawnCalls[0]?.toolBudgetPerRequest).toBe(64);
-    expect(manager.spawnCalls[1]?.toolBudgetPerRequest).toBe(96);
+    expect(manager.spawnCalls[0]?.toolBudgetPerRequest).toBe(2048);
+    expect(manager.spawnCalls[1]?.toolBudgetPerRequest).toBe(2048);
   });
 
   it("retries child validation failures that return non-completed stop reasons without tool evidence", async () => {

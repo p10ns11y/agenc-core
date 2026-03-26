@@ -52,39 +52,19 @@ interface EncodedVerificationMetadata {
   readonly path?: string;
 }
 
-const DIRECT_MUTATION_TOOL_NAMES = new Set([
-  "desktop.text_editor",
-  "system.appendFile",
-  "system.delete",
-  "system.mkdir",
-  "system.move",
-  "system.writeFile",
-]);
-
-const SHELL_MUTATION_RE =
-  /(?:^|[;&|]\s*|\n)\s*(?:cp|mv|rm|mkdir|touch|tee|sed|perl|python|node|ruby|go|cargo|npm|pnpm|yarn|make|cmake)\b|>>?|(?:^|[;&|]\s*|\n)\s*cat\s+.+>>?/i;
-
 export function deriveWorkflowProgressSnapshot(params: {
   readonly stopReason: LLMPipelineStopReason;
   readonly completionState: WorkflowCompletionState;
   readonly stopReasonDetail?: string;
   readonly validationCode?: DelegationOutputValidationCode;
   readonly toolCalls: readonly CompletionProgressToolCall[];
-  readonly plannerUsed?: boolean;
-  readonly deterministicStepsExecuted?: number;
   readonly verificationContract?: WorkflowVerificationContract;
   readonly completionContract?: ImplementationCompletionContract;
   readonly updatedAt: number;
 }): WorkflowProgressSnapshot | undefined {
   const mergedContract = mergeVerificationContract({
     verificationContract: params.verificationContract,
-    completionContract:
-      params.completionContract ??
-      inferDeterministicCompletionContract({
-        plannerUsed: params.plannerUsed,
-        deterministicStepsExecuted: params.deterministicStepsExecuted,
-        toolCalls: params.toolCalls,
-      }),
+    completionContract: params.completionContract,
   });
   const obligations = mergedContract
     ? deriveVerificationObligations(mergedContract)
@@ -223,51 +203,6 @@ function mergeVerificationContract(params: {
       ? { completionContract: params.completionContract }
       : {}),
   };
-}
-
-function inferDeterministicCompletionContract(params: {
-  readonly plannerUsed?: boolean;
-  readonly deterministicStepsExecuted?: number;
-  readonly toolCalls: readonly CompletionProgressToolCall[];
-}): ImplementationCompletionContract | undefined {
-  if (params.plannerUsed !== true) {
-    return undefined;
-  }
-  if (Number(params.deterministicStepsExecuted ?? 0) <= 0) {
-    return undefined;
-  }
-  const hasMutationProgress = params.toolCalls.some((toolCall) =>
-    isMutationToolCall(toolCall),
-  );
-  if (!hasMutationProgress) {
-    return undefined;
-  }
-  return {
-    taskClass: "artifact_only",
-    placeholdersAllowed: false,
-    partialCompletionAllowed: false,
-    placeholderTaxonomy: "implementation",
-  };
-}
-
-function isMutationToolCall(toolCall: CompletionProgressToolCall): boolean {
-  if (toolCall.isError) {
-    return false;
-  }
-  if (DIRECT_MUTATION_TOOL_NAMES.has(toolCall.name.trim())) {
-    return true;
-  }
-  if (toolCall.name !== "system.bash" && toolCall.name !== "desktop.bash") {
-    return false;
-  }
-  const command =
-    toolCall.args &&
-    typeof toolCall.args === "object" &&
-    !Array.isArray(toolCall.args) &&
-    typeof (toolCall.args as { command?: unknown }).command === "string"
-      ? String((toolCall.args as { command: string }).command)
-      : "";
-  return SHELL_MUTATION_RE.test(command);
 }
 
 function decodeVerificationMetadata(

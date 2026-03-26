@@ -55,7 +55,7 @@ describe("resolveTurnMaxToolRounds", () => {
 
   it("never lowers an explicit higher default cap", () => {
     expect(
-      resolveTurnMaxToolRounds(50, {
+      resolveTurnMaxToolRounds(COMPLEX_TURN_MAX_TOOL_ROUNDS + 10, {
         routedToolNames: ["system.writeFile"],
         expandedToolNames: [],
         diagnostics: {
@@ -71,7 +71,7 @@ describe("resolveTurnMaxToolRounds", () => {
           schemaCharsSaved: 0,
         },
       }),
-    ).toBe(50);
+    ).toBe(COMPLEX_TURN_MAX_TOOL_ROUNDS + 10);
   });
 });
 

@@ -36,6 +36,8 @@ import type {
   PipelineExecutionEvent,
   PipelineResult,
 } from "../workflow/pipeline.js";
+import type { ImplementationCompletionContract } from "../workflow/completion-contract.js";
+import type { WorkflowVerificationContract } from "../workflow/verification-obligations.js";
 import type { HostToolingProfile } from "../gateway/host-tooling.js";
 import { resolveWorkflowCompletionState } from "../workflow/completion-state.js";
 import { deriveWorkflowProgressSnapshot } from "../workflow/completion-progress.js";
@@ -106,6 +108,7 @@ import {
   DEFAULT_FAILURE_BUDGET_PER_REQUEST,
   DEFAULT_TOOL_CALL_TIMEOUT_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,
+  MAX_ADAPTIVE_TOOL_ROUNDS,
   DEFAULT_SUBAGENT_VERIFIER_MIN_CONFIDENCE,
   DEFAULT_SUBAGENT_VERIFIER_MAX_ROUNDS,
   DEFAULT_TOOL_FAILURE_BREAKER_THRESHOLD,
@@ -118,9 +121,11 @@ import {
 import {
   buildRequiredToolEvidenceRetryInstruction,
   canRetryDelegatedOutputWithoutAdditionalToolCalls,
+  requiresWorkflowOwnedImplementationCompletion,
   resolveCorrectionAllowedToolNames,
   resolveExecutionToolContractGuidance,
   resolveLegacyCompletionCompatibility,
+  resolveRuntimeWorkflowContext,
   validateRequiredToolEvidence,
 } from "./chat-executor-contract-flow.js";
 import type { ToolContractGuidance } from "./chat-executor-contract-guidance.js";
@@ -268,6 +273,7 @@ import {
   appendUserMessage,
   buildToolExecutionGroundingMessage,
   isPlanOnlyExecutionResponse,
+  isExecutionDeferralResponse,
 } from "./chat-executor-text.js";
 import {
   summarizeStateful,
@@ -390,7 +396,7 @@ export class ChatExecutor {
     }
     this.providers = config.providers;
     this.toolHandler = config.toolHandler;
-    this.maxToolRounds = config.maxToolRounds ?? 10;
+    this.maxToolRounds = config.maxToolRounds ?? MAX_ADAPTIVE_TOOL_ROUNDS;
     this.onStreamChunk = config.onStreamChunk;
     this.allowedTools = config.allowedTools
       ? new Set(config.allowedTools)
@@ -543,7 +549,34 @@ export class ChatExecutor {
 
     // Direct path: initial LLM call + tool loop
     if (!ctx.plannerHandled) {
-      await this.executeToolCallLoop(ctx);
+      if (this.shouldBlockToolLoopAfterPlannerVeto(ctx)) {
+        this.emitExecutionTrace(ctx, {
+          type: "planner_path_finished",
+          phase: "planner",
+          callIndex: ctx.callIndex,
+          payload: {
+            routeReason: ctx.plannerSummaryState.routeReason,
+            stopReason: "validation_error",
+            stopReasonDetail:
+              "Planner produced an implementation-scoped delegated plan, but runtime delegation admission rejected it. Inline legacy fallback is disabled for this task class.",
+            diagnostics: ctx.plannerSummaryState.diagnostics,
+            handled: true,
+            enforcement: "executor_level_planner_veto_barrier",
+          },
+        });
+        this.setStopReason(
+          ctx,
+          "validation_error",
+          "Planner produced an implementation-scoped delegated plan, but runtime delegation admission rejected it. Inline legacy fallback is disabled for this task class.",
+        );
+        ctx.finalContent =
+          "Planner produced an implementation-scoped delegated plan, " +
+          `but runtime delegation admission rejected it (${ctx.plannerSummaryState.delegationDecision?.reason ?? "delegation_veto"}). ` +
+          "Inline legacy fallback is disabled for this task class; re-plan the work with a single-owner execution contract or provide an explicit workflow verification contract.";
+        ctx.plannerHandled = true;
+      } else {
+        await this.executeToolCallLoop(ctx);
+      }
     }
 
     this.enforceLegacyCompletionCompatibilityBeforeFinalization(ctx);
@@ -587,6 +620,18 @@ export class ChatExecutor {
       ctx.allToolCalls,
       ctx.messageText,
     );
+    const workflowContext = this.resolveWorkflowVerificationContext(ctx);
+    const completionProgress = deriveWorkflowProgressSnapshot({
+      stopReason: ctx.stopReason,
+      completionState: ctx.completionState,
+      stopReasonDetail: ctx.stopReasonDetail,
+      validationCode: ctx.validationCode,
+      toolCalls: ctx.allToolCalls,
+      verificationContract: workflowContext.verificationContract,
+      completionContract: workflowContext.completionContract,
+      updatedAt: Date.now(),
+    });
+
     ctx.finalContent = reconcileTerminalFailureContent({
       content: ctx.finalContent,
       stopReason: ctx.stopReason,
@@ -599,6 +644,7 @@ export class ChatExecutor {
       stopReason: ctx.stopReason,
       stopReasonDetail: ctx.stopReasonDetail,
       toolCalls: ctx.allToolCalls,
+      completionProgress,
     });
     ctx.finalContent = sanitizeFinalContent(ctx.finalContent);
 
@@ -630,19 +676,7 @@ export class ChatExecutor {
       ),
       stopReason: ctx.stopReason,
       completionState: ctx.completionState,
-      completionProgress: deriveWorkflowProgressSnapshot({
-        stopReason: ctx.stopReason,
-        completionState: ctx.completionState,
-        stopReasonDetail: ctx.stopReasonDetail,
-        validationCode: ctx.validationCode,
-        toolCalls: ctx.allToolCalls,
-        plannerUsed: ctx.plannerSummaryState.used,
-        deterministicStepsExecuted:
-          ctx.plannerSummaryState.deterministicStepsExecuted,
-        verificationContract: ctx.requiredToolEvidence?.verificationContract,
-        completionContract: ctx.requiredToolEvidence?.completionContract,
-        updatedAt: Date.now(),
-      }),
+      completionProgress,
       stopReasonDetail: ctx.stopReasonDetail,
       validationCode: ctx.validationCode,
       evaluation: ctx.evaluation,
@@ -677,21 +711,46 @@ export class ChatExecutor {
     }
   }
 
+  private resolveWorkflowVerificationContext(ctx: ExecutionContext): {
+    verificationContract?: WorkflowVerificationContract;
+    completionContract?: ImplementationCompletionContract;
+  } {
+    const workflowContext = resolveRuntimeWorkflowContext({ ctx });
+    return {
+      verificationContract: workflowContext.verificationContract,
+      completionContract: workflowContext.completionContract,
+    };
+  }
+
   private synchronizeCompletionState(ctx: ExecutionContext): void {
+    const workflowContext = this.resolveWorkflowVerificationContext(ctx);
     ctx.completionState = resolveWorkflowCompletionState({
       stopReason: ctx.stopReason,
       toolCalls: ctx.allToolCalls,
-      plannerUsed: ctx.plannerSummaryState.used,
-      deterministicStepsExecuted:
-        ctx.plannerSummaryState.deterministicStepsExecuted,
-      verificationContract: ctx.requiredToolEvidence?.verificationContract,
-      completionContract: ctx.requiredToolEvidence?.completionContract,
+      verificationContract: workflowContext.verificationContract,
+      completionContract: workflowContext.completionContract,
       validationCode: ctx.validationCode,
       verifier: {
         performed: ctx.plannerSummaryState.subagentVerification.performed,
         overall: ctx.plannerSummaryState.subagentVerification.overall,
       },
     });
+  }
+
+  private shouldBlockToolLoopAfterPlannerVeto(
+    ctx: ExecutionContext,
+  ): boolean {
+    if (!ctx.plannerImplementationFallbackBlocked) {
+      return false;
+    }
+    if (ctx.plannerHandled) {
+      return false;
+    }
+    const delegationDecision = ctx.plannerSummaryState.delegationDecision;
+    if (!delegationDecision || delegationDecision.shouldDelegate !== false) {
+      return false;
+    }
+    return ctx.plannedSubagentSteps > 0;
   }
 
   private timeoutDetail(
@@ -1176,7 +1235,11 @@ export class ChatExecutor {
       const planOnly =
         responseContent.length > 0 &&
         isPlanOnlyExecutionResponse(responseContent);
-      if (!planOnly) {
+      const executionDeferred =
+        phase === "tool_followup" &&
+        responseContent.length > 0 &&
+        isExecutionDeferralResponse(responseContent);
+      if (!planOnly && !executionDeferred) {
         this.emitExecutionTrace(ctx, {
           type: "completion_gate_checked",
           phase,
@@ -1186,6 +1249,7 @@ export class ChatExecutor {
             decision: retried ? "accept_after_retry" : "accept",
             finishReason: ctx.response?.finishReason,
             correctionAttempts,
+            executionDeferred: false,
           },
         });
         return retried ? "continue" : "not_required";
@@ -1196,7 +1260,9 @@ export class ChatExecutor {
         this.allowedTools ?? undefined,
       );
       const failureMessage =
-        "Execution task returned only a plan without grounded tool work. Start executing with tools or report a concrete blocker instead of another plan.";
+        executionDeferred
+          ? "Execution task stopped with a progress summary that deferred remaining work. Continue executing with tools or report a concrete blocker instead of asking what to do next."
+          : "Execution task returned only a plan without grounded tool work. Start executing with tools or report a concrete blocker instead of another plan.";
       if (correctionAttempts >= MAX_PLAN_ONLY_EXECUTION_CORRECTIONS) {
         this.emitExecutionTrace(ctx, {
           type: "completion_gate_checked",
@@ -1207,6 +1273,7 @@ export class ChatExecutor {
             decision: "fail",
             finishReason: ctx.response?.finishReason,
             correctionAttempts,
+            executionDeferred,
             responsePreview: truncateText(responseContent, 180),
           },
         });
@@ -1241,6 +1308,7 @@ export class ChatExecutor {
           decision: "retry",
           finishReason: ctx.response?.finishReason,
           correctionAttempts,
+          executionDeferred,
           allowedToolNames,
           responsePreview: truncateText(responseContent, 180),
         },
@@ -1414,17 +1482,22 @@ export class ChatExecutor {
     if (ctx.stopReason !== "completed") {
       return;
     }
+    const workflowContext = resolveRuntimeWorkflowContext({ ctx });
     if (
-      ctx.requiredToolEvidence?.verificationContract ||
-      ctx.requiredToolEvidence?.completionContract
+      workflowContext.verificationContract ||
+      workflowContext.completionContract
     ) {
       this.emitExecutionTrace(ctx, {
         type: "completion_gate_checked",
         phase: "tool_followup",
         callIndex: ctx.callIndex,
         payload: {
-          gate: "legacy_completion_compatibility",
-          decision: "not_required",
+          gate: "workflow_completion_truth",
+          decision:
+            ctx.completionState === "completed" ? "accept" : "accept_nonterminal",
+          ownerClass: "implementation",
+          completionState: ctx.completionState,
+          ownershipSource: workflowContext.ownershipSource,
           reason: "workflow_verification_contract_present",
         },
       });
@@ -1452,11 +1525,35 @@ export class ChatExecutor {
         phase: "tool_followup",
         callIndex: ctx.callIndex,
         payload: {
-          gate: "legacy_completion_compatibility",
-          decision: "not_required",
+          gate: "workflow_completion_truth",
+          decision:
+            ctx.completionState === "completed" ? "accept" : "accept_nonterminal",
+          ownerClass: "implementation",
+          completionState: ctx.completionState,
+          ownershipSource: "planner_owned",
           reason: "planner_verifier_passed",
         },
       });
+      return;
+    }
+
+    if (requiresWorkflowOwnedImplementationCompletion({ ctx })) {
+      const reason =
+        "Implementation-class completion requires workflow-owned verification closure before finalization.";
+      this.emitExecutionTrace(ctx, {
+        type: "completion_gate_checked",
+        phase: "tool_followup",
+        callIndex: ctx.callIndex,
+        payload: {
+          gate: "workflow_completion_truth",
+          decision: "fail",
+          ownerClass: "implementation",
+          completionState: ctx.completionState,
+          reason,
+        },
+      });
+      this.setStopReason(ctx, "validation_error", reason);
+      ctx.finalContent = reason;
       return;
     }
 
@@ -1829,6 +1926,7 @@ export class ChatExecutor {
         messageText,
         systemPrompt,
         sessionId,
+        runtimeContext: params.runtimeContext,
         signal,
         history,
         plannerDecision,

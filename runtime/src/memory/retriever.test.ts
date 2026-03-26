@@ -251,6 +251,51 @@ describe("SemanticMemoryRetriever", () => {
     expect(result.content).toContain("retry budget");
   });
 
+  it("filters untrusted delegated environment facts from working and semantic retrieval", async () => {
+    const backend = createMockVectorBackend();
+    (backend.getThread as ReturnType<typeof vi.fn>).mockResolvedValue([
+      makeEntry("Subagent cwd: /", Date.now(), "sess-1", {
+        memoryRole: "working",
+        delegatedScopeTrust: "informational_untrusted",
+        delegatedScopeContainsEnvironmentFact: true,
+      }),
+      makeEntry("Verified build command succeeded", Date.now(), "sess-1", {
+        memoryRole: "working",
+      }),
+    ]);
+    (backend.searchHybrid as ReturnType<typeof vi.fn>).mockImplementation(
+      async (
+        _query: string,
+        _embedding: number[],
+        options?: { memoryRoles?: readonly ("working" | "episodic" | "semantic")[] },
+      ) => {
+        if (!options?.memoryRoles?.includes("semantic")) return [];
+        return [
+          makeScoredEntry("Subagent cwd: /", 0.99, {
+            metadata: {
+              memoryRole: "semantic",
+              delegatedScopeTrust: "rejected_invalid_scope",
+              delegatedScopeContainsEnvironmentFact: true,
+            },
+          }),
+          makeScoredEntry("Repository uses pnpm workspaces", 0.91, {
+            metadata: {
+              memoryRole: "semantic",
+              confidence: 0.88,
+            },
+          }),
+        ];
+      },
+    );
+
+    const retriever = createRetriever({ vectorBackend: backend, maxTokenBudget: 4000 });
+    const result = await retriever.retrieveDetailed("cwd workspace", "sess-1");
+
+    expect(result.content).toContain("Verified build command succeeded");
+    expect(result.content).toContain("Repository uses pnpm workspaces");
+    expect(result.content).not.toContain("Subagent cwd: /");
+  });
+
   it("forwards session id for isolation in both thread and vector retrieval", async () => {
     const backend = createMockVectorBackend();
     const retriever = createRetriever({ vectorBackend: backend });

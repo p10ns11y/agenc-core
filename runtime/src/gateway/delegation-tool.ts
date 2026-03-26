@@ -71,55 +71,68 @@ function toOptionalTimeout(value: unknown): number | undefined {
   return rounded;
 }
 
-function toExecutionContext(value: unknown): DelegationExecutionContext | undefined {
+function hasOwnNonEmptyString(record: Record<string, unknown>, key: string): boolean {
+  const value = record[key];
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function hasOwnNonEmptyStringArray(record: Record<string, unknown>, key: string): boolean {
+  const value = record[key];
+  return Array.isArray(value) && value.some((entry) =>
+    typeof entry === "string" && entry.trim().length > 0
+  );
+}
+
+function findPublicExecutionContextAuthorityFields(
+  value: unknown,
+): readonly string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return [];
+  }
+  const record = value as Record<string, unknown>;
+  const fields: string[] = [];
+  if (
+    hasOwnNonEmptyString(record, "workspaceRoot") ||
+    hasOwnNonEmptyString(record, "workspace_root")
+  ) {
+    fields.push("executionContext.workspaceRoot");
+  }
+  if (
+    hasOwnNonEmptyStringArray(record, "allowedReadRoots") ||
+    hasOwnNonEmptyStringArray(record, "allowed_read_roots")
+  ) {
+    fields.push("executionContext.allowedReadRoots");
+  }
+  if (
+    hasOwnNonEmptyStringArray(record, "allowedWriteRoots") ||
+    hasOwnNonEmptyStringArray(record, "allowed_write_roots")
+  ) {
+    fields.push("executionContext.allowedWriteRoots");
+  }
+  return fields;
+}
+
+function toPublicExecutionContext(
+  value: unknown,
+): DelegationExecutionContext | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return undefined;
   }
   const record = value as Record<string, unknown>;
-  const workspaceRoot =
-    toNonEmptyString(record.workspaceRoot) ??
-    toNonEmptyString(record.workspace_root);
-  const allowedReadRoots =
-    toTrimmedStringArray(record.allowedReadRoots) ??
-    toTrimmedStringArray(record.allowed_read_roots);
-  const allowedWriteRoots =
-    toTrimmedStringArray(record.allowedWriteRoots) ??
-    toTrimmedStringArray(record.allowed_write_roots);
-  const allowedTools =
-    toTrimmedStringArray(record.allowedTools) ??
-    toTrimmedStringArray(record.allowed_tools);
-  const inputArtifacts =
-    toTrimmedStringArray(record.inputArtifacts) ??
-    toTrimmedStringArray(record.input_artifacts);
-  const requiredSourceArtifacts =
-    toTrimmedStringArray(record.requiredSourceArtifacts) ??
-    toTrimmedStringArray(record.required_source_artifacts);
-  const targetArtifacts =
-    toTrimmedStringArray(record.targetArtifacts) ??
-    toTrimmedStringArray(record.target_artifacts);
-  const effectClass =
-    toNonEmptyString(record.effectClass) ??
-    toNonEmptyString(record.effect_class);
-  const verificationMode =
-    toNonEmptyString(record.verificationMode) ??
-    toNonEmptyString(record.verification_mode);
-  const stepKind =
-    toNonEmptyString(record.stepKind) ??
-    toNonEmptyString(record.step_kind);
-  const fallbackPolicy =
-    toNonEmptyString(record.fallbackPolicy) ??
-    toNonEmptyString(record.fallback_policy);
-  const resumePolicy =
-    toNonEmptyString(record.resumePolicy) ??
-    toNonEmptyString(record.resume_policy);
-  const approvalProfile =
-    toNonEmptyString(record.approvalProfile) ??
-    toNonEmptyString(record.approval_profile);
+  const allowedTools = toTrimmedStringArray(record.allowedTools);
+  const inputArtifacts = toTrimmedStringArray(record.inputArtifacts);
+  const requiredSourceArtifacts = toTrimmedStringArray(
+    record.requiredSourceArtifacts,
+  );
+  const targetArtifacts = toTrimmedStringArray(record.targetArtifacts);
+  const effectClass = toNonEmptyString(record.effectClass);
+  const verificationMode = toNonEmptyString(record.verificationMode);
+  const stepKind = toNonEmptyString(record.stepKind);
+  const fallbackPolicy = toNonEmptyString(record.fallbackPolicy);
+  const resumePolicy = toNonEmptyString(record.resumePolicy);
+  const approvalProfile = toNonEmptyString(record.approvalProfile);
 
   if (
-    !workspaceRoot &&
-    !allowedReadRoots &&
-    !allowedWriteRoots &&
     !allowedTools &&
     !inputArtifacts &&
     !requiredSourceArtifacts &&
@@ -135,9 +148,6 @@ function toExecutionContext(value: unknown): DelegationExecutionContext | undefi
   }
 
   return {
-    ...(workspaceRoot ? { workspaceRoot } : {}),
-    ...(allowedReadRoots ? { allowedReadRoots } : {}),
-    ...(allowedWriteRoots ? { allowedWriteRoots } : {}),
     ...(allowedTools ? { allowedTools } : {}),
     ...(inputArtifacts ? { inputArtifacts } : {}),
     ...(requiredSourceArtifacts ? { requiredSourceArtifacts } : {}),
@@ -248,9 +258,24 @@ export function parseExecuteWithAgentInput(
   const acceptanceCriteria =
     toTrimmedStringArray(args.acceptanceCriteria) ??
     toTrimmedStringArray(args.acceptance_criteria);
-  const explicitExecutionContext =
-    toExecutionContext(args.executionContext) ??
-    toExecutionContext(args.execution_context);
+  if (Object.hasOwn(args, "execution_context")) {
+    return {
+      ok: false,
+      error:
+        'execute_with_agent does not accept "execution_context" on the public path; runtime owns child scope authority.',
+    };
+  }
+  const blockedAuthorityFields = findPublicExecutionContextAuthorityFields(
+    args.executionContext,
+  );
+  if (blockedAuthorityFields.length > 0) {
+    return {
+      ok: false,
+      error:
+        `execute_with_agent does not accept ${blockedAuthorityFields.join(", ")} on the public path; runtime owns the first trusted child root.`,
+    };
+  }
+  const explicitExecutionContext = toPublicExecutionContext(args.executionContext);
 
   return {
     ok: true,
@@ -329,20 +354,8 @@ export function createExecuteWithAgentTool(): Tool {
         executionContext: {
           type: "object",
           description:
-            "Optional structured execution envelope for the child task",
+            "Optional bounded artifact and verification hints for the child task. The runtime derives child workspace scope from trusted parent state.",
           properties: {
-            workspaceRoot: {
-              type: "string",
-              description: "Canonical workspace root for the delegated phase",
-            },
-            allowedReadRoots: {
-              type: "array",
-              items: { type: "string" },
-            },
-        allowedWriteRoots: {
-          type: "array",
-          items: { type: "string" },
-        },
             allowedTools: {
               type: "array",
               items: { type: "string" },

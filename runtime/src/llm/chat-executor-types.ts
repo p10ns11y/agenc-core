@@ -161,6 +161,11 @@ export interface ChatExecuteParams {
   readonly history: readonly LLMMessage[];
   readonly systemPrompt: string;
   readonly sessionId: string;
+  /** Runtime-owned execution context resolved before model/planner execution. */
+  readonly runtimeContext?: {
+    /** Authoritative workspace root for planning/execution when known. */
+    readonly workspaceRoot?: string;
+  };
   /** Per-call tool handler — overrides the constructor handler for this call. */
   readonly toolHandler?: ToolHandler;
   /** Per-call stream callback — overrides the constructor callback for this call. */
@@ -578,6 +583,20 @@ export interface PlannerVerifierWorkItem {
   readonly verificationContract?: WorkflowVerificationContract;
 }
 
+export type PlannerWorkflowTaskClassification =
+  | "implementation_class"
+  | "docs_research_plan_only"
+  | "invalid";
+
+export interface PlannerWorkflowAdmission {
+  readonly taskClassification: PlannerWorkflowTaskClassification;
+  readonly verificationContract?: WorkflowVerificationContract;
+  readonly completionContract?: ImplementationCompletionContract;
+  readonly verifierWorkItems: readonly PlannerVerifierWorkItem[];
+  readonly requiresMandatoryImplementationVerification: boolean;
+  readonly invalidReason?: string;
+}
+
 export interface PlannerSynthesisStepIntent extends PlannerStepBaseIntent {
   stepType: "synthesis";
   objective?: string;
@@ -746,6 +765,7 @@ export interface ExecutionContext {
   readonly messageText: string;
   readonly systemPrompt: string;
   readonly sessionId: string;
+  readonly runtimeWorkspaceRoot?: string;
   readonly signal?: AbortSignal;
   readonly activeToolHandler?: ToolHandler;
   readonly activeStreamCallback?: StreamProgressCallback;
@@ -805,6 +825,10 @@ export interface ExecutionContext {
   routedToolsExpanded: boolean;
   routedToolMisses: number;
   plannerHandled: boolean;
+  plannerImplementationFallbackBlocked: boolean;
+  plannerWorkflowTaskClassification?: PlannerWorkflowTaskClassification;
+  plannerVerificationContract?: WorkflowVerificationContract;
+  plannerCompletionContract?: ImplementationCompletionContract;
   plannerSummaryState: FullPlannerSummaryState;
   trajectoryContextClusterId: string;
   selectedBanditArm?: DelegationBanditSelection;
@@ -829,6 +853,7 @@ export interface BuildExecutionContextParams {
   readonly messageText: string;
   readonly systemPrompt: string;
   readonly sessionId: string;
+  readonly runtimeContext?: ChatExecuteParams["runtimeContext"];
   readonly signal?: AbortSignal;
   readonly history: readonly LLMMessage[];
   readonly plannerDecision: PlannerDecision;
@@ -875,6 +900,7 @@ export function buildDefaultExecutionContext(
     messageText: params.messageText,
     systemPrompt: params.systemPrompt,
     sessionId: params.sessionId,
+    runtimeWorkspaceRoot: params.runtimeContext?.workspaceRoot,
     signal: params.signal,
     activeToolHandler: params.toolHandler,
     activeStreamCallback: params.streamCallback,
@@ -949,6 +975,10 @@ export function buildDefaultExecutionContext(
     routedToolsExpanded: false,
     routedToolMisses: 0,
     plannerHandled: false,
+    plannerImplementationFallbackBlocked: false,
+    plannerWorkflowTaskClassification: undefined,
+    plannerVerificationContract: undefined,
+    plannerCompletionContract: undefined,
     plannerSummaryState: {
       enabled: config.plannerEnabled,
       used: false,

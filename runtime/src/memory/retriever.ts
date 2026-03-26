@@ -267,6 +267,15 @@ function inferProvenance(entry: MemoryEntry): string {
   return "unknown";
 }
 
+function shouldSuppressOperationalEntry(entry: MemoryEntry): boolean {
+  const metadata = entry.metadata;
+  if (!metadata) return false;
+  if (metadata.delegatedScopeContainsEnvironmentFact !== true) {
+    return false;
+  }
+  return metadata.delegatedScopeTrust !== "trusted_authoritative";
+}
+
 function truncateByTokens(text: string, maxTokens: number): string {
   if (maxTokens <= 0) return "";
   const maxChars = maxTokens * CHARS_PER_TOKEN;
@@ -497,6 +506,7 @@ export class SemanticMemoryRetriever implements MemoryRetriever {
 
     const scored: RetrievalCandidate[] = [];
     for (const entry of [...thread].reverse()) {
+      if (shouldSuppressOperationalEntry(entry)) continue;
       const role = inferRole(entry, "working");
       if (role !== "working") continue;
 
@@ -556,6 +566,7 @@ export class SemanticMemoryRetriever implements MemoryRetriever {
 
     const scored: RetrievalCandidate[] = [];
     for (const result of searchResults) {
+      if (shouldSuppressOperationalEntry(result.entry)) continue;
       const entryRole = inferRole(result.entry, role);
       if (entryRole !== role) continue;
 

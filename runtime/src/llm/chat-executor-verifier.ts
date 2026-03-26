@@ -11,6 +11,7 @@ import type {
 import type {
   PlannerDeterministicToolStepIntent,
   PlannerSubAgentTaskStepIntent,
+  PlannerWorkflowAdmission,
   PlannerVerifierWorkItem,
   PlannerPlan,
   SubagentVerifierStepVerdict,
@@ -50,20 +51,43 @@ const DIRECT_MUTATION_TOOL_NAMES = new Set([
 
 const SHELL_MUTATION_RE =
   /(?:^|[;&|]\s*|\n)\s*(?:cp|mv|rm|mkdir|touch|tee|sed|perl|python|node|ruby|go|cargo|npm|pnpm|yarn|make|cmake)\b|>>?|(?:^|[;&|]\s*|\n)\s*cat\s+.+>>?/i;
+const DETERMINISTIC_IMPLEMENTATION_COMMAND_RE =
+  /\b(?:implement|implementation|fix|repair|refactor|migrate|write|edit|update|create|build|compile|typecheck|lint|test|install|scaffold)\b/i;
 const SOURCE_LIKE_PATH_RE =
   /(?:^|\/)(?:src|lib|app|server|client|cmd|pkg|include|internal|tests?|spec)(?:\/|$)|\.(?:c|cc|cpp|cxx|h|hpp|m|mm|rs|go|py|rb|php|java|kt|swift|cs|js|jsx|ts|tsx|json|toml|yaml|yml|xml|sh|zsh|bash)$/i;
 const DOC_ONLY_PATH_RE = /\.(?:md|mdx|txt|rst|adoc)$/i;
 
-export function buildPlannerVerifierAdmission(params: {
+export function buildPlannerWorkflowAdmission(params: {
   readonly subagentSteps: readonly PlannerSubAgentTaskStepIntent[];
   readonly deterministicSteps: readonly PlannerDeterministicToolStepIntent[];
+  readonly workspaceRoot?: string;
   readonly verificationContract?: WorkflowVerificationContract;
   readonly completionContract?: ImplementationCompletionContract;
   readonly includeSubagentOutputVerification?: boolean;
-}): {
-  readonly verifierWorkItems: readonly PlannerVerifierWorkItem[];
-  readonly requiresMandatoryImplementationVerification: boolean;
-} {
+}): PlannerWorkflowAdmission {
+  const completionContract = resolvePlannerCompletionContract(params);
+  const verificationContract = buildPlannerWorkflowVerificationContract({
+    workspaceRoot: params.workspaceRoot,
+    subagentSteps: params.subagentSteps,
+    deterministicSteps: params.deterministicSteps,
+    verificationContract: params.verificationContract,
+    completionContract,
+  });
+  const taskClassification = classifyPlannerWorkflowAdmission({
+    workspaceRoot: params.workspaceRoot,
+    completionContract,
+  });
+  if (taskClassification === "invalid") {
+    return {
+      taskClassification,
+      verificationContract,
+      completionContract,
+      verifierWorkItems: [],
+      requiresMandatoryImplementationVerification: false,
+      invalidReason:
+        "Implementation-class planner work requires a runtime-owned workspace root and workflow contract before execution can begin.",
+    };
+  }
   const verifierWorkItems: PlannerVerifierWorkItem[] =
     params.includeSubagentOutputVerification === false
       ? []
@@ -76,25 +100,45 @@ export function buildPlannerVerifierAdmission(params: {
         requiredToolCapabilities: step.requiredToolCapabilities,
         resultStepNames: [step.name],
       }));
-  const completionContract = resolvePlannerCompletionContract(params);
   const requiresMandatoryImplementationVerification =
-    completionContract !== undefined &&
-    completionContract.taskClass !== "scaffold_allowed" &&
-    completionContract.taskClass !== "review_required";
+    taskClassification === "implementation_class";
 
   if (requiresMandatoryImplementationVerification) {
     verifierWorkItems.push(
       buildDeterministicImplementationVerifierWorkItem(
-        completionContract,
+        completionContract!,
+        params.subagentSteps,
         params.deterministicSteps,
-        params.verificationContract,
+        verificationContract,
       ),
     );
   }
 
   return {
+    taskClassification,
+    verificationContract,
+    completionContract,
     verifierWorkItems,
     requiresMandatoryImplementationVerification,
+  };
+}
+
+export function buildPlannerVerifierAdmission(params: {
+  readonly subagentSteps: readonly PlannerSubAgentTaskStepIntent[];
+  readonly deterministicSteps: readonly PlannerDeterministicToolStepIntent[];
+  readonly workspaceRoot?: string;
+  readonly verificationContract?: WorkflowVerificationContract;
+  readonly completionContract?: ImplementationCompletionContract;
+  readonly includeSubagentOutputVerification?: boolean;
+}): {
+  readonly verifierWorkItems: readonly PlannerVerifierWorkItem[];
+  readonly requiresMandatoryImplementationVerification: boolean;
+} {
+  const admission = buildPlannerWorkflowAdmission(params);
+  return {
+    verifierWorkItems: admission.verifierWorkItems,
+    requiresMandatoryImplementationVerification:
+      admission.requiresMandatoryImplementationVerification,
   };
 }
 
@@ -139,9 +183,23 @@ export function evaluatePlannerDeterministicChecks(
       issues.push("missing_subagent_result");
       verdict = "retry";
     } else if (step.verificationKind === "deterministic_implementation") {
+      const implementationToolCalls =
+        collectDeterministicImplementationToolCalls({
+          pipelineResult,
+          plannerToolCalls,
+          resultStepNames: step.resultStepNames,
+        });
+      const implementationProviderEvidence =
+        collectDeterministicImplementationProviderEvidence({
+          pipelineResult,
+          resultStepNames: step.resultStepNames,
+        });
       output = raw;
       status = "completed";
-      toolCallsCount = plannerToolCalls.length;
+      toolCallsCount = implementationToolCalls.length;
+      failedToolCallsCount = implementationToolCalls.filter(
+        (toolCall) => toolCall.isError === true,
+      ).length;
       if (output.trim().length === 0) {
         issues.push("missing_implementation_output_evidence");
         verdict = "retry";
@@ -149,7 +207,8 @@ export function evaluatePlannerDeterministicChecks(
         const hybridDecision = validateRuntimeVerificationContract({
           verificationContract: step.verificationContract,
           output: trimmedOrRawOutput(raw),
-          toolCalls: plannerToolCalls,
+          toolCalls: implementationToolCalls,
+          providerEvidence: implementationProviderEvidence,
         });
         if (hybridDecision && !hybridDecision.ok) {
           const hybridIssues = collectHybridVerifierIssues(hybridDecision);
@@ -647,6 +706,118 @@ function resolveVerifierWorkItemOutput(
     .join("\n");
 }
 
+function collectDeterministicImplementationToolCalls(params: {
+  readonly pipelineResult: PipelineResult;
+  readonly plannerToolCalls: readonly import("./chat-executor-types.js").ToolCallRecord[];
+  readonly resultStepNames?: readonly string[];
+}): readonly {
+  readonly name?: string;
+  readonly args?: unknown;
+  readonly result?: string;
+  readonly isError?: boolean;
+}[] {
+  const calls: {
+    readonly name?: string;
+    readonly args?: unknown;
+    readonly result?: string;
+    readonly isError?: boolean;
+  }[] = [...params.plannerToolCalls];
+  const seenSignatures = new Set(
+    calls.map((toolCall) => stableVerifierToolCallSignature(toolCall)),
+  );
+  const resultStepNames =
+    params.resultStepNames && params.resultStepNames.length > 0
+      ? params.resultStepNames
+      : Object.keys(params.pipelineResult.context.results);
+
+  for (const stepName of resultStepNames) {
+    const raw = params.pipelineResult.context.results[stepName];
+    if (typeof raw !== "string") {
+      continue;
+    }
+    const parsed = parseJsonObjectFromText(raw);
+    const nestedToolCalls = Array.isArray(parsed?.toolCalls)
+      ? parsed.toolCalls
+      : [];
+    for (const entry of nestedToolCalls) {
+      if (
+        typeof entry !== "object" ||
+        entry === null ||
+        Array.isArray(entry)
+      ) {
+        continue;
+      }
+      const toolCall = entry as {
+        readonly name?: string;
+        readonly args?: unknown;
+        readonly result?: string;
+        readonly isError?: boolean;
+      };
+      const signature = stableVerifierToolCallSignature(toolCall);
+      if (seenSignatures.has(signature)) {
+        continue;
+      }
+      seenSignatures.add(signature);
+      calls.push(toolCall);
+    }
+  }
+
+  return calls;
+}
+
+function collectDeterministicImplementationProviderEvidence(params: {
+  readonly pipelineResult: PipelineResult;
+  readonly resultStepNames?: readonly string[];
+}): { readonly citations?: readonly string[] } | undefined {
+  const citations = new Set<string>();
+  const resultStepNames =
+    params.resultStepNames && params.resultStepNames.length > 0
+      ? params.resultStepNames
+      : Object.keys(params.pipelineResult.context.results);
+
+  for (const stepName of resultStepNames) {
+    const raw = params.pipelineResult.context.results[stepName];
+    if (typeof raw !== "string") {
+      continue;
+    }
+    const parsed = parseJsonObjectFromText(raw);
+    const providerEvidence = parsed?.providerEvidence;
+    if (
+      !providerEvidence ||
+      typeof providerEvidence !== "object" ||
+      Array.isArray(providerEvidence)
+    ) {
+      continue;
+    }
+    const stepCitations = Array.isArray(
+      (providerEvidence as { citations?: unknown }).citations,
+    )
+      ? (providerEvidence as { citations: unknown[] }).citations
+      : [];
+    for (const citation of stepCitations) {
+      if (typeof citation === "string" && citation.trim().length > 0) {
+        citations.add(citation.trim());
+      }
+    }
+  }
+
+  return citations.size > 0 ? { citations: [...citations] } : undefined;
+}
+
+function stableVerifierToolCallSignature(toolCall: {
+  readonly name?: string;
+  readonly args?: unknown;
+  readonly result?: string;
+  readonly isError?: boolean;
+}): string {
+  return safeStringify({
+    name: toolCall.name,
+    args: toolCall.args,
+    result: toolCall.result,
+    isError: toolCall.isError === true,
+  });
+}
+
 function resolvePlannerCompletionContract(params: {
   readonly subagentSteps: readonly PlannerSubAgentTaskStepIntent[];
   readonly deterministicSteps: readonly PlannerDeterministicToolStepIntent[];
@@ -668,15 +839,14 @@ function resolvePlannerCompletionContract(params: {
   if (subagentCompletionContract) {
     return subagentCompletionContract;
   }
-  if (!hasDeterministicImplementationMutation(params.deterministicSteps)) {
+  const deterministicCompletionContract =
+    resolveDeterministicImplementationCompletionContract(
+      params.deterministicSteps,
+    );
+  if (!deterministicCompletionContract) {
     return undefined;
   }
-  return {
-    taskClass: "artifact_only",
-    placeholdersAllowed: false,
-    partialCompletionAllowed: false,
-    placeholderTaxonomy: "implementation",
-  };
+  return deterministicCompletionContract;
 }
 
 function resolvePlannerSubagentCompletionContract(
@@ -712,8 +882,183 @@ function resolvePlannerSubagentCompletionContract(
   return fallbackContract;
 }
 
+function buildPlannerWorkflowVerificationContract(params: {
+  readonly workspaceRoot?: string;
+  readonly subagentSteps: readonly PlannerSubAgentTaskStepIntent[];
+  readonly deterministicSteps: readonly PlannerDeterministicToolStepIntent[];
+  readonly verificationContract?: WorkflowVerificationContract;
+  readonly completionContract?: ImplementationCompletionContract;
+}): WorkflowVerificationContract | undefined {
+  const workspaceRoot =
+    typeof params.workspaceRoot === "string" &&
+      params.workspaceRoot.trim().length > 0
+      ? params.workspaceRoot.trim()
+      : typeof params.verificationContract?.workspaceRoot === "string" &&
+          params.verificationContract.workspaceRoot.trim().length > 0
+        ? params.verificationContract.workspaceRoot.trim()
+        : undefined;
+  const acceptanceCriteria = [
+    ...(params.verificationContract?.acceptanceCriteria ?? []),
+    ...params.subagentSteps.flatMap((step) => step.acceptanceCriteria),
+  ].filter((criterion) => criterion.trim().length > 0);
+  const inputArtifacts = Array.from(
+    new Set(
+      params.subagentSteps.flatMap(
+        (step) => step.executionContext?.inputArtifacts ?? [],
+      ),
+    ),
+  );
+  const requiredSourceArtifacts = Array.from(
+    new Set(
+      params.subagentSteps.flatMap(
+        (step) => step.executionContext?.requiredSourceArtifacts ??
+          step.executionContext?.inputArtifacts ??
+          [],
+      ),
+    ),
+  );
+  const targetArtifacts = Array.from(
+    new Set(
+      params.subagentSteps.flatMap(
+        (step) => step.executionContext?.targetArtifacts ?? [],
+      ),
+    ),
+  );
+  const verificationMode = selectPlannerVerificationMode({
+    explicit: params.verificationContract?.verificationMode,
+    subagentSteps: params.subagentSteps,
+    deterministicSteps: params.deterministicSteps,
+    completionContract: params.completionContract,
+  });
+  const stepKind = selectPlannerStepKind({
+    explicit: params.verificationContract?.stepKind,
+    subagentSteps: params.subagentSteps,
+    completionContract: params.completionContract,
+  });
+  if (
+    !workspaceRoot &&
+    acceptanceCriteria.length === 0 &&
+    inputArtifacts.length === 0 &&
+    requiredSourceArtifacts.length === 0 &&
+    targetArtifacts.length === 0 &&
+    !verificationMode &&
+    !stepKind &&
+    !params.completionContract
+  ) {
+    return undefined;
+  }
+  return {
+    ...(workspaceRoot ? { workspaceRoot } : {}),
+    ...(inputArtifacts.length > 0 ? { inputArtifacts } : {}),
+    ...(requiredSourceArtifacts.length > 0 ? { requiredSourceArtifacts } : {}),
+    ...(targetArtifacts.length > 0 ? { targetArtifacts } : {}),
+    ...(acceptanceCriteria.length > 0
+      ? { acceptanceCriteria: Array.from(new Set(acceptanceCriteria)) }
+      : {}),
+    ...(verificationMode ? { verificationMode } : {}),
+    ...(stepKind ? { stepKind } : {}),
+    ...(params.completionContract
+      ? { completionContract: params.completionContract }
+      : {}),
+  };
+}
+
+function classifyPlannerWorkflowAdmission(params: {
+  readonly workspaceRoot?: string;
+  readonly completionContract?: ImplementationCompletionContract;
+}): PlannerWorkflowAdmission["taskClassification"] {
+  const completionContract = params.completionContract;
+  if (
+    !completionContract ||
+    completionContract.taskClass === "scaffold_allowed" ||
+    completionContract.taskClass === "review_required"
+  ) {
+    return "docs_research_plan_only";
+  }
+  if (
+    typeof params.workspaceRoot !== "string" ||
+    params.workspaceRoot.trim().length === 0
+  ) {
+    return "invalid";
+  }
+  return "implementation_class";
+}
+
+function selectPlannerVerificationMode(params: {
+  readonly explicit?: WorkflowVerificationContract["verificationMode"];
+  readonly subagentSteps: readonly PlannerSubAgentTaskStepIntent[];
+  readonly deterministicSteps: readonly PlannerDeterministicToolStepIntent[];
+  readonly completionContract?: ImplementationCompletionContract;
+}): WorkflowVerificationContract["verificationMode"] | undefined {
+  if (params.explicit) {
+    return params.explicit;
+  }
+  for (const step of params.subagentSteps) {
+    if (step.executionContext?.verificationMode === "mutation_required") {
+      return "mutation_required";
+    }
+  }
+  if (
+    hasDeterministicImplementationMutation(params.deterministicSteps) ||
+    params.completionContract?.taskClass === "artifact_only" ||
+    params.completionContract?.taskClass === "build_required" ||
+    params.completionContract?.taskClass === "behavior_required"
+  ) {
+    return "mutation_required";
+  }
+  for (const step of params.subagentSteps) {
+    if (step.executionContext?.verificationMode === "deterministic_followup") {
+      return "deterministic_followup";
+    }
+  }
+  for (const step of params.subagentSteps) {
+    if (step.executionContext?.verificationMode === "grounded_read") {
+      return "grounded_read";
+    }
+  }
+  return undefined;
+}
+
+function selectPlannerStepKind(params: {
+  readonly explicit?: WorkflowVerificationContract["stepKind"];
+  readonly subagentSteps: readonly PlannerSubAgentTaskStepIntent[];
+  readonly completionContract?: ImplementationCompletionContract;
+}): WorkflowVerificationContract["stepKind"] | undefined {
+  if (params.explicit) {
+    return params.explicit;
+  }
+  for (const step of params.subagentSteps) {
+    if (step.executionContext?.stepKind === "delegated_write") {
+      return "delegated_write";
+    }
+  }
+  for (const step of params.subagentSteps) {
+    if (step.executionContext?.stepKind === "delegated_validation") {
+      return "delegated_validation";
+    }
+  }
+  for (const step of params.subagentSteps) {
+    if (step.executionContext?.stepKind === "delegated_review") {
+      return "delegated_review";
+    }
+  }
+  for (const step of params.subagentSteps) {
+    if (step.executionContext?.stepKind === "delegated_scaffold") {
+      return "delegated_scaffold";
+    }
+  }
+  if (params.completionContract?.taskClass === "review_required") {
+    return "delegated_review";
+  }
+  if (params.completionContract?.taskClass === "scaffold_allowed") {
+    return "delegated_scaffold";
+  }
+  return undefined;
+}
+
 function buildDeterministicImplementationVerifierWorkItem(
   completionContract: ImplementationCompletionContract,
+  subagentSteps: readonly PlannerSubAgentTaskStepIntent[],
   deterministicSteps: readonly PlannerDeterministicToolStepIntent[],
   verificationContract?: WorkflowVerificationContract,
 ): PlannerVerifierWorkItem {
@@ -729,8 +1074,18 @@ function buildDeterministicImplementationVerifierWorkItem(
     inputContract:
       "Assess the deterministic tool outputs and resulting artifacts against the implementation completion contract.",
     acceptanceCriteria,
-    requiredToolCapabilities: [...new Set(deterministicSteps.map((step) => step.tool))],
-    resultStepNames: deterministicSteps.map((step) => step.name),
+    requiredToolCapabilities: [
+      ...new Set([
+        ...subagentSteps.flatMap((step) => step.requiredToolCapabilities),
+        ...deterministicSteps.map((step) => step.tool),
+      ]),
+    ],
+    resultStepNames: [
+      ...new Set([
+        ...subagentSteps.map((step) => step.name),
+        ...deterministicSteps.map((step) => step.name),
+      ]),
+    ],
     verificationContract:
       verificationContract || acceptanceCriteria.length > 0
         ? {
@@ -761,6 +1116,62 @@ function hasDeterministicImplementationMutation(
   return deterministicSteps.some((step) => isImplementationMutationStep(step));
 }
 
+function resolveDeterministicImplementationCompletionContract(
+  deterministicSteps: readonly PlannerDeterministicToolStepIntent[],
+): ImplementationCompletionContract | undefined {
+  if (hasDeterministicBehaviorVerification(deterministicSteps)) {
+    return {
+      taskClass: "behavior_required",
+      placeholdersAllowed: false,
+      partialCompletionAllowed: false,
+      placeholderTaxonomy: "implementation",
+    };
+  }
+  if (hasDeterministicBuildVerification(deterministicSteps)) {
+    return {
+      taskClass: "build_required",
+      placeholdersAllowed: false,
+      partialCompletionAllowed: false,
+      placeholderTaxonomy: "implementation",
+    };
+  }
+  if (hasDeterministicImplementationMutation(deterministicSteps)) {
+    return {
+      taskClass: "artifact_only",
+      placeholdersAllowed: false,
+      partialCompletionAllowed: false,
+      placeholderTaxonomy: "implementation",
+    };
+  }
+  return undefined;
+}
+
+function hasDeterministicBuildVerification(
+  deterministicSteps: readonly PlannerDeterministicToolStepIntent[],
+): boolean {
+  return deterministicSteps.some((step) => {
+    if (step.tool !== "system.bash" && step.tool !== "desktop.bash") {
+      return false;
+    }
+    const commandText = extractCommandText(step.args);
+    return /\b(?:build|compile|typecheck|lint|install)\b/i.test(commandText);
+  });
+}
+
+function hasDeterministicBehaviorVerification(
+  deterministicSteps: readonly PlannerDeterministicToolStepIntent[],
+): boolean {
+  return deterministicSteps.some((step) => {
+    if (step.tool !== "system.bash" && step.tool !== "desktop.bash") {
+      return false;
+    }
+    const commandText = extractCommandText(step.args);
+    return /\b(?:test|tests|testing|vitest|jest|pytest|playwright|ctest|cargo test|go test|smoke|scenario|e2e|end-to-end)\b/i.test(
+      commandText,
+    );
+  });
+}
+
 function isImplementationMutationStep(
   step: PlannerDeterministicToolStepIntent,
 ): boolean {
@@ -775,6 +1186,9 @@ function isImplementationMutationStep(
     return false;
   }
   const commandText = extractCommandText(step.args);
+  if (DETERMINISTIC_IMPLEMENTATION_COMMAND_RE.test(commandText)) {
+    return true;
+  }
   if (!SHELL_MUTATION_RE.test(commandText)) {
     return false;
   }

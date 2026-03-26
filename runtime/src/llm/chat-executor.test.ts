@@ -175,7 +175,14 @@ function plannerWriteExecutionContext(
 
 function completedDelegatedPlannerResult(
   output: string,
-  toolNames: readonly string[] = ["system.writeFile"],
+  toolCalls:
+    | readonly string[]
+    | readonly {
+      readonly name?: string;
+      readonly args?: unknown;
+      readonly result?: string;
+      readonly isError?: boolean;
+    }[] = ["system.writeFile"],
 ): string {
   return safeJson({
     status: "completed",
@@ -183,10 +190,17 @@ function completedDelegatedPlannerResult(
     success: true,
     durationMs: 12,
     failedToolCalls: 0,
-    toolCalls: toolNames.map((name) => ({
-      name,
-      isError: false,
-    })),
+    toolCalls: toolCalls.map((entry) =>
+      typeof entry === "string"
+        ? {
+          name: entry,
+          isError: false,
+        }
+        : {
+          ...entry,
+          isError: entry.isError === true,
+        }
+    ),
   });
 }
 
@@ -1270,15 +1284,133 @@ describe("ChatExecutor", () => {
             type: "completion_gate_checked",
             phase: "tool_followup",
             payload: expect.objectContaining({
-              gate: "legacy_completion_compatibility",
-              decision: "not_required",
+              gate: "workflow_completion_truth",
+              decision: "accept",
+              ownerClass: "implementation",
+              ownershipSource: "required_tool_evidence",
+              completionState: "completed",
             }),
           }),
         ]),
       );
     });
 
-    it("rejects legacy direct implementation completion without a workflow verification contract", async () => {
+    it("retries deferred execution summaries instead of stopping mid-implementation", async () => {
+      const events: Record<string, unknown>[] = [];
+      const toolHandler = vi.fn()
+        .mockResolvedValueOnce("wrote main")
+        .mockResolvedValueOnce("wrote readme");
+      const provider = createMockProvider("primary", {
+        chat: vi
+          .fn()
+          .mockResolvedValueOnce(
+            mockResponse({
+              content: "",
+              finishReason: "tool_calls",
+              toolCalls: [
+                {
+                  id: "tc-main",
+                  name: "system.writeFile",
+                  arguments: safeJson({
+                    path: "/tmp/tui-smoke/main.c",
+                    content: "int main(void) { return 0; }\n",
+                  }),
+                },
+              ],
+            }),
+          )
+          .mockResolvedValueOnce(
+            mockResponse({
+              content:
+                "**Implementation complete where implemented.**\n\n" +
+                "**Summary of process:**\n" +
+                "- Updated `main.c`\n" +
+                "- Current status: compilable and aligned\n\n" +
+                "Ready for targeted module completion. Let me know specific feature to deepen next.",
+            }),
+          )
+          .mockResolvedValueOnce(
+            mockResponse({
+              content: "",
+              finishReason: "tool_calls",
+              toolCalls: [
+                {
+                  id: "tc-readme",
+                  name: "system.writeFile",
+                  arguments: safeJson({
+                    path: "/tmp/tui-smoke/README.md",
+                    content: "done\n",
+                  }),
+                },
+              ],
+            }),
+          )
+          .mockResolvedValueOnce(
+            mockResponse({
+              content:
+                "Created `main.c` and `README.md` with grounded tool execution.",
+            }),
+          ),
+      });
+
+      const executor = new ChatExecutor({
+        providers: [provider],
+        toolHandler,
+        allowedTools: ["system.writeFile", "system.bash"],
+      });
+      const result = await executor.execute(
+        createParams({
+          message: createMessage(
+            "In /tmp/tui-smoke only, create main.c and README.md.",
+          ),
+          runtimeContext: {
+            workspaceRoot: "/tmp/tui-smoke",
+          },
+          trace: {
+            onExecutionTraceEvent: (event) => {
+              events.push(event as unknown as Record<string, unknown>);
+            },
+          },
+        }),
+      );
+
+      expect(result.stopReason).toBe("completed");
+      expect(result.content).toContain("main.c");
+      expect(result.content).toContain("README.md");
+      expect(toolHandler).toHaveBeenNthCalledWith(1, "system.writeFile", {
+        path: "/tmp/tui-smoke/main.c",
+        content: "int main(void) { return 0; }\n",
+      });
+      expect(toolHandler).toHaveBeenNthCalledWith(2, "system.writeFile", {
+        path: "/tmp/tui-smoke/README.md",
+        content: "done\n",
+      });
+      expect(provider.chat).toHaveBeenCalledTimes(4);
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "completion_gate_checked",
+            phase: "tool_followup",
+            payload: expect.objectContaining({
+              gate: "plan_only_execution",
+              decision: "retry",
+              executionDeferred: true,
+            }),
+          }),
+          expect.objectContaining({
+            type: "completion_gate_checked",
+            phase: "tool_followup",
+            payload: expect.objectContaining({
+              gate: "plan_only_execution",
+              decision: "accept",
+              executionDeferred: false,
+            }),
+          }),
+        ]),
+      );
+    });
+
+    it("materializes a runtime-owned workflow contract for direct implementation instead of falling back to legacy compatibility", async () => {
       const events: Record<string, unknown>[] = [];
       const toolHandler = vi.fn().mockResolvedValue("wrote source");
       const provider = createMockProvider("primary", {
@@ -1317,6 +1449,83 @@ describe("ChatExecutor", () => {
           message: createMessage(
             "In /tmp/phase9-direct only, implement src/main.c and finish when the implementation is done.",
           ),
+          runtimeContext: {
+            workspaceRoot: "/tmp/phase9-direct",
+          },
+          trace: {
+            onExecutionTraceEvent: (event) => {
+              events.push(event as unknown as Record<string, unknown>);
+            },
+          },
+        }),
+      );
+
+      expect(result.stopReason).toBe("completed");
+      expect(result.completionState).toBe("completed");
+      expect(result.completionProgress?.verificationContract).toMatchObject({
+        workspaceRoot: "/tmp/phase9-direct",
+        targetArtifacts: ["/tmp/phase9-direct/src/main.c"],
+        verificationMode: "mutation_required",
+        completionContract: expect.objectContaining({
+          taskClass: "artifact_only",
+        }),
+      });
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "completion_gate_checked",
+            phase: "tool_followup",
+            payload: expect.objectContaining({
+              gate: "workflow_completion_truth",
+              decision: "accept",
+              ownerClass: "implementation",
+              ownershipSource: "direct_deterministic_implementation",
+              reason: "workflow_verification_contract_present",
+            }),
+          }),
+        ]),
+      );
+    });
+
+    it("fails implementation-class completion through the workflow gate when no runtime-owned contract exists", async () => {
+      const events: Record<string, unknown>[] = [];
+      const toolHandler = vi.fn().mockResolvedValue("wrote source");
+      const provider = createMockProvider("primary", {
+        chat: vi
+          .fn()
+          .mockResolvedValueOnce(
+            mockResponse({
+              content: "",
+              finishReason: "tool_calls",
+              toolCalls: [
+                {
+                  id: "tc-missing-contract",
+                  name: "system.writeFile",
+                  arguments: safeJson({
+                    path: "/tmp/phase9-missing-contract/src/main.c",
+                    content: "int main(void) { return 0; }\n",
+                  }),
+                },
+              ],
+            }),
+          )
+          .mockResolvedValueOnce(
+            mockResponse({
+              content: "Implemented src/main.c successfully.",
+            }),
+          ),
+      });
+
+      const executor = new ChatExecutor({
+        providers: [provider],
+        toolHandler,
+        allowedTools: ["system.writeFile"],
+      });
+      const result = await executor.execute(
+        createParams({
+          message: createMessage(
+            "Implement src/main.c and finish when the implementation is done.",
+          ),
           trace: {
             onExecutionTraceEvent: (event) => {
               events.push(event as unknown as Record<string, unknown>);
@@ -1327,23 +1536,142 @@ describe("ChatExecutor", () => {
 
       expect(result.stopReason).toBe("validation_error");
       expect(result.stopReasonDetail).toContain(
-        "workflow verification contract",
+        "workflow-owned verification closure",
       );
-      expect(result.completionState).toBe("partial");
-      expect(result.content).toContain("Only docs, research, and plan-only turns");
+      expect(result.content).toContain(
+        "workflow-owned verification closure",
+      );
       expect(events).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             type: "completion_gate_checked",
             phase: "tool_followup",
             payload: expect.objectContaining({
-              gate: "legacy_completion_compatibility",
+              gate: "workflow_completion_truth",
               decision: "fail",
-              compatibilityClass: "implementation",
+              ownerClass: "implementation",
             }),
           }),
         ]),
       );
+      expect(events).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "completion_gate_checked",
+            phase: "tool_followup",
+            payload: expect.objectContaining({
+              gate: "legacy_completion_compatibility",
+            }),
+          }),
+        ]),
+      );
+    });
+
+    it("reports equivalent completion semantics for direct and planner deterministic implementation", async () => {
+      const directProvider = createMockProvider("primary", {
+        chat: vi
+          .fn()
+          .mockResolvedValueOnce(
+            mockResponse({
+              content: "",
+              finishReason: "tool_calls",
+              toolCalls: [
+                {
+                  id: "tc-direct",
+                  name: "system.writeFile",
+                  arguments: safeJson({
+                    path: "/tmp/phase9-parity/src/main.c",
+                    content: "int main(void) { return 0; }\n",
+                  }),
+                },
+              ],
+            }),
+          )
+          .mockResolvedValueOnce(
+            mockResponse({
+              content: "Implemented src/main.c successfully.",
+            }),
+          ),
+      });
+      const directExecutor = new ChatExecutor({
+        providers: [directProvider],
+        toolHandler: vi.fn().mockResolvedValue("wrote source"),
+        allowedTools: ["system.writeFile"],
+      });
+      const directResult = await directExecutor.execute(
+        createParams({
+          message: createMessage(
+            "In /tmp/phase9-parity only, implement src/main.c and finish only when the implementation is complete.",
+          ),
+          runtimeContext: {
+            workspaceRoot: "/tmp/phase9-parity",
+          },
+        }),
+      );
+
+      const plannerProvider = createMockProvider("primary", {
+        chat: vi.fn().mockResolvedValue(
+          mockResponse({
+            content: safeJson({
+              reason: "planner_parity_contract",
+              requiresSynthesis: false,
+              steps: [
+                {
+                  name: "write_source",
+                  step_type: "deterministic_tool",
+                  tool: "system.writeFile",
+                  args: {
+                    path: "/tmp/phase9-parity/src/main.c",
+                    content: "int main(void) { return 0; }\n",
+                  },
+                },
+              ],
+            }),
+          }),
+        ),
+      });
+      const plannerExecutor = new ChatExecutor({
+        providers: [plannerProvider],
+        toolHandler: vi.fn().mockResolvedValue("unused"),
+        plannerEnabled: true,
+        pipelineExecutor: {
+          execute: vi.fn().mockResolvedValue({
+            status: "completed",
+            completionState: "needs_verification",
+            context: {
+              results: {
+                write_source: safeJson({
+                  path: "/tmp/phase9-parity/src/main.c",
+                  bytesWritten: 30,
+                }),
+              },
+            },
+            completedSteps: 1,
+            totalSteps: 1,
+          }),
+        } as any,
+      });
+      const plannerResult = await plannerExecutor.execute(
+        createParams({
+          message: createMessage(
+            "In /tmp/phase9-parity only, implement src/main.c and finish only when the implementation is complete.",
+          ),
+          runtimeContext: {
+            workspaceRoot: "/tmp/phase9-parity",
+          },
+        }),
+      );
+
+      expect(directResult.completionState).toBe("completed");
+      expect(plannerResult.completionState).toBe("completed");
+      expect(directResult.completionProgress).toMatchObject({
+        requiredRequirements: [],
+        remainingRequirements: [],
+      });
+      expect(plannerResult.completionProgress).toMatchObject({
+        requiredRequirements: [],
+        remainingRequirements: [],
+      });
     });
 
     it("preserves legacy completion compatibility for documentation-only direct writes", async () => {
@@ -8782,6 +9110,9 @@ describe("ChatExecutor", () => {
           message: createMessage(
             "Implement a minimal C entrypoint under src/main.c and finish only when the implementation is actually complete.",
           ),
+          runtimeContext: {
+            workspaceRoot: "/tmp/phase3-shell",
+          },
         }),
       );
 
@@ -8864,6 +9195,9 @@ describe("ChatExecutor", () => {
           message: createMessage(
             "Implement the job table in src/jobs.c and only report success if the implementation has actually been verified.",
           ),
+          runtimeContext: {
+            workspaceRoot: "/tmp/phase3-shell",
+          },
         }),
       );
 
@@ -8963,6 +9297,9 @@ describe("ChatExecutor", () => {
           message: createMessage(
             "Implement src/jobs.c for the shell and only finish when the implementation is actually complete.",
           ),
+          runtimeContext: {
+            workspaceRoot: "/tmp/phase4-shell",
+          },
         }),
       );
 
@@ -9514,6 +9851,26 @@ describe("ChatExecutor", () => {
                 ],
               }),
             }),
+          )
+          .mockResolvedValueOnce(
+            mockResponse({
+              content: safeJson({
+                overall: "pass",
+                confidence: 0.92,
+                unresolved: [],
+                steps: [
+                  {
+                    name: "implementation_completion",
+                    verdict: "pass",
+                    confidence: 0.92,
+                    retryable: true,
+                    issues: [],
+                    summary:
+                      "deterministic implementation outputs and test evidence satisfy the implementation contract",
+                  },
+                ],
+              }),
+            }),
           ),
       });
       const pipelineExecutor = {
@@ -9524,9 +9881,35 @@ describe("ChatExecutor", () => {
             context: {
               results: {
                 setup_workspace:
-                  '{"status":"completed","success":true,"output":"Workspace prepared"}',
+                  completedDelegatedPlannerResult("Workspace prepared", [
+                    {
+                      name: "system.writeFile",
+                      args: {
+                        path: "package.json",
+                        content: "{\"name\":\"gameplay-app\"}",
+                      },
+                    },
+                  ]),
                 implement_core:
-                  '{"status":"completed","success":true,"output":"Core implemented"}',
+                  completedDelegatedPlannerResult("Core implemented", [
+                    {
+                      name: "system.readFile",
+                      args: {
+                        path: "packages/core/test/index.test.ts",
+                      },
+                      result: safeJson({
+                        path: "packages/core/test/index.test.ts",
+                        content: "expect(findPath()).toBe(Infinity)",
+                      }),
+                    },
+                    {
+                      name: "system.writeFile",
+                      args: {
+                        path: "packages/core/src/index.ts",
+                        content: "export function findPath() { return Infinity; }",
+                      },
+                    },
+                  ]),
               },
             },
             completedSteps: 2,
@@ -9540,9 +9923,41 @@ describe("ChatExecutor", () => {
             context: {
               results: {
                 diagnose_test_failure:
-                  '{"status":"completed","success":true,"output":"Root cause identified"}',
+                  completedDelegatedPlannerResult("Root cause identified", [
+                    {
+                      name: "system.readFile",
+                      args: {
+                        path: "packages/core/test/index.test.ts",
+                      },
+                      result: safeJson({
+                        path: "packages/core/test/index.test.ts",
+                        content: "expect(findPath()).toBe(Infinity)",
+                      }),
+                    },
+                  ]),
                 repair_unreachable_behavior:
-                  '{"status":"completed","success":true,"output":"Unreachable-path behavior repaired"}',
+                  completedDelegatedPlannerResult(
+                    "Unreachable-path behavior repaired",
+                    [
+                      {
+                        name: "system.readFile",
+                        args: {
+                          path: "packages/core/test/index.test.ts",
+                        },
+                        result: safeJson({
+                          path: "packages/core/test/index.test.ts",
+                          content: "expect(findPath()).toBe(Infinity)",
+                        }),
+                      },
+                      {
+                        name: "system.writeFile",
+                        args: {
+                          path: "packages/core/src/index.ts",
+                          content: "export function findPath() { return Infinity; }",
+                        },
+                      },
+                    ],
+                  ),
                 run_tests: '{"exitCode":0,"stdout":"2 passed"}',
               },
             },
@@ -9569,6 +9984,9 @@ describe("ChatExecutor", () => {
           message: createMessage(
             "Implement the gameplay flow, verify it with tests, and repair any failing behavior before finishing.",
           ),
+          runtimeContext: {
+            workspaceRoot: "/tmp/gameplay-app",
+          },
         }),
       );
 
@@ -9931,6 +10349,27 @@ describe("ChatExecutor", () => {
                 ],
               }),
             }),
+          )
+          .mockResolvedValueOnce(
+            mockResponse({
+              content:
+                safeJson({
+                  overall: "pass",
+                  confidence: 0.94,
+                  unresolved: [],
+                  steps: [
+                    {
+                      name: "implementation_completion",
+                      verdict: "pass",
+                      confidence: 0.94,
+                      retryable: true,
+                      issues: [],
+                      summary:
+                        "deterministic implementation outputs and repeated test evidence satisfy the implementation contract",
+                    },
+                  ],
+                }),
+            }),
           ),
       });
       const pipelineExecutor = {
@@ -9940,9 +10379,35 @@ describe("ChatExecutor", () => {
             context: {
               results: {
                 setup_workspace:
-                  '{"status":"completed","success":true,"output":"Workspace prepared"}',
+                  completedDelegatedPlannerResult("Workspace prepared", [
+                    {
+                      name: "system.writeFile",
+                      args: {
+                        path: "package.json",
+                        content: "{\"name\":\"gameplay-app\"}",
+                      },
+                    },
+                  ]),
                 implement_core:
-                  '{"status":"completed","success":true,"output":"Core implemented"}',
+                  completedDelegatedPlannerResult("Core implemented", [
+                    {
+                      name: "system.readFile",
+                      args: {
+                        path: "artifacts/type-error.log",
+                      },
+                      result: safeJson({
+                        path: "artifacts/type-error.log",
+                        content: "TS2365 operator '+' cannot be applied",
+                      }),
+                    },
+                    {
+                      name: "system.writeFile",
+                      args: {
+                        path: "packages/core/src/index.ts",
+                        content: "export const total = Number(a) + Number(b);",
+                      },
+                    },
+                  ]),
               },
             },
             completedSteps: 2,
@@ -9956,9 +10421,43 @@ describe("ChatExecutor", () => {
             context: {
               results: {
                 diagnose_type_failure:
-                  '{"status":"completed","success":true,"output":"Type root cause identified"}',
+                  completedDelegatedPlannerResult(
+                    "Type root cause identified",
+                    [
+                      {
+                        name: "system.readFile",
+                        args: {
+                          path: "artifacts/type-error.log",
+                        },
+                        result: safeJson({
+                          path: "artifacts/type-error.log",
+                          content:
+                            "TS2365 operator '+' cannot be applied to number and string | number",
+                        }),
+                      },
+                    ],
+                  ),
                 repair_type_failure:
-                  '{"status":"completed","success":true,"output":"Type failure resolved"}',
+                  completedDelegatedPlannerResult("Type failure resolved", [
+                    {
+                      name: "system.readFile",
+                      args: {
+                        path: "artifacts/type-error.log",
+                      },
+                      result: safeJson({
+                        path: "artifacts/type-error.log",
+                        content:
+                          "TS2365 operator '+' cannot be applied to number and string | number",
+                      }),
+                    },
+                    {
+                      name: "system.writeFile",
+                      args: {
+                        path: "packages/core/src/index.ts",
+                        content: "export const total = Number(a) + Number(b);",
+                      },
+                    },
+                  ]),
               },
             },
             completedSteps: 2,
@@ -9972,9 +10471,43 @@ describe("ChatExecutor", () => {
             context: {
               results: {
                 diagnose_import_failure:
-                  '{"status":"completed","success":true,"output":"Import root cause identified"}',
+                  completedDelegatedPlannerResult(
+                    "Import root cause identified",
+                    [
+                      {
+                        name: "system.readFile",
+                        args: {
+                          path: "artifacts/import-error.log",
+                        },
+                        result: safeJson({
+                          path: "artifacts/import-error.log",
+                          content:
+                            "TS5097 import path can only end with .ts when allowImportingTsExtensions is enabled",
+                        }),
+                      },
+                    ],
+                  ),
                 repair_import_failure:
-                  '{"status":"completed","success":true,"output":"Import failure resolved"}',
+                  completedDelegatedPlannerResult("Import failure resolved", [
+                    {
+                      name: "system.readFile",
+                      args: {
+                        path: "artifacts/import-error.log",
+                      },
+                      result: safeJson({
+                        path: "artifacts/import-error.log",
+                        content:
+                          "TS5097 import path can only end with .ts when allowImportingTsExtensions is enabled",
+                      }),
+                    },
+                    {
+                      name: "system.writeFile",
+                      args: {
+                        path: "packages/core/tests/index.test.ts",
+                        content: "import { total } from '../src/index.js';",
+                      },
+                    },
+                  ]),
                 run_tests: '{"exitCode":0,"stdout":"2 passed"}',
               },
             },
@@ -10001,6 +10534,9 @@ describe("ChatExecutor", () => {
           message: createMessage(
             "Implement the gameplay flow, verify it with tests, and keep repairing deterministic failures until the tests are green.",
           ),
+          runtimeContext: {
+            workspaceRoot: "/tmp/gameplay-app",
+          },
         }),
       );
 
@@ -12285,6 +12821,9 @@ describe("ChatExecutor", () => {
               "- add Vitest coverage\n" +
               "- write a README and report exact passing commands",
           ),
+          runtimeContext: {
+            workspaceRoot: "/tmp",
+          },
         }),
       );
 
@@ -12415,6 +12954,84 @@ describe("ChatExecutor", () => {
       expect(result.plannerSummary).toMatchObject({
         used: true,
         routeReason: "expand_plan_artifact",
+        plannerCalls: 1,
+        plannedSteps: 2,
+        deterministicStepsExecuted: 2,
+      });
+      expect(result.callUsage.map((entry) => entry.phase)).toEqual(["planner"]);
+    });
+
+    it("routes plan-artifact execution requests through the planner instead of the direct tool loop", async () => {
+      const provider = createMockProvider("primary", {
+        chat: vi.fn().mockResolvedValueOnce(
+          mockResponse({
+            content: safeJson({
+              reason: "complete_plan_artifact_execution",
+              requiresSynthesis: false,
+              steps: [
+                {
+                  name: "read_plan",
+                  step_type: "deterministic_tool",
+                  tool: "system.readFile",
+                  args: {
+                    path: "/home/tetsuo/git/stream-test/agenc-shell/PLAN.md",
+                  },
+                },
+                {
+                  name: "write_phase_summary",
+                  step_type: "deterministic_tool",
+                  depends_on: ["read_plan"],
+                  tool: "system.writeFile",
+                  args: {
+                    path: "/home/tetsuo/git/stream-test/agenc-shell/PHASE_SUMMARY.md",
+                    content: "# Phase summary\n",
+                  },
+                },
+              ],
+            }),
+          }),
+        ),
+      });
+      const pipelineExecutor = {
+        execute: vi.fn().mockResolvedValue({
+          status: "completed",
+          context: {
+            results: {
+              read_plan: safeJson({
+                path: "/home/tetsuo/git/stream-test/agenc-shell/PLAN.md",
+                size: 4096,
+              }),
+              write_phase_summary: safeJson({
+                path: "/home/tetsuo/git/stream-test/agenc-shell/PHASE_SUMMARY.md",
+                bytesWritten: 16,
+              }),
+            },
+          },
+          completedSteps: 2,
+          totalSteps: 2,
+        }),
+      };
+      const executor = new ChatExecutor({
+        providers: [provider],
+        toolHandler: vi.fn().mockResolvedValue("unused"),
+        plannerEnabled: true,
+        pipelineExecutor: pipelineExecutor as any,
+      });
+
+      const result = await executor.execute(
+        createParams({
+          message: createMessage(
+            "You are to read all of @PLAN.md and complete every single phase in full.",
+          ),
+        }),
+      );
+
+      expect(provider.chat).toHaveBeenCalledTimes(1);
+      expect(pipelineExecutor.execute).toHaveBeenCalledTimes(1);
+      expect(result.stopReason).toBe("completed");
+      expect(result.plannerSummary).toMatchObject({
+        used: true,
+        routeReason: "complete_plan_artifact_execution",
         plannerCalls: 1,
         plannedSteps: 2,
         deterministicStepsExecuted: 2,
@@ -13691,6 +14308,492 @@ describe("ChatExecutor", () => {
       });
     });
 
+    it("refines the traced mixed implementation plan into a single-owner workflow before execution", async () => {
+      const events: Record<string, unknown>[] = [];
+      const workspaceRoot = "/home/tetsuo/git/AgenC";
+      const toolHandler = vi.fn().mockResolvedValue("unexpected inline execution");
+      const refinedSingleOwnerPlan = mockResponse({
+        content: safeJson({
+          reason: "single_owner_plan_artifact_execution",
+          requiresSynthesis: false,
+          steps: [
+            {
+              name: "read_plan",
+              step_type: "deterministic_tool",
+              tool: "system.readFile",
+              args: {
+                path: `${workspaceRoot}/PLAN.md`,
+              },
+              onError: "abort",
+            },
+            {
+              name: "analyze_plan",
+              step_type: "subagent_task",
+              objective:
+                "Read PLAN.md completely and write a bounded implementation analysis artifact.",
+              input_contract: "PLAN.md text only.",
+              acceptance_criteria: [
+                "ANALYSIS.md cites the full PLAN.md requirements.",
+              ],
+              required_tool_capabilities: ["read_file", "write_file"],
+              context_requirements: ["read_plan"],
+              execution_context: {
+                version: "v1",
+                workspace_root: workspaceRoot,
+                allowed_read_roots: [workspaceRoot],
+                allowed_write_roots: [workspaceRoot],
+                required_source_artifacts: [`${workspaceRoot}/PLAN.md`],
+                target_artifacts: [`${workspaceRoot}/ANALYSIS.md`],
+                effect_class: "read_only",
+                verification_mode: "grounded_read",
+                step_kind: "delegated_research",
+                fallback_policy: "continue_without_delegation",
+                resume_policy: "stateless_retry",
+                approval_profile: "read_only",
+              },
+              max_budget_hint: "10m",
+              can_run_parallel: false,
+              depends_on: ["read_plan"],
+            },
+            {
+              name: "implement_owner",
+              step_type: "subagent_task",
+              objective:
+                "Own the code changes required by PLAN.md inside the repo workspace.",
+              input_contract: "PLAN.md plus the bounded analysis artifact.",
+              acceptance_criteria: [
+                "src/main.ts contains the required implementation changes.",
+              ],
+              required_tool_capabilities: [
+                "read_file",
+                "write_file",
+                "execute_command",
+              ],
+              context_requirements: ["analyze_plan"],
+              execution_context: {
+                version: "v1",
+                workspace_root: workspaceRoot,
+                allowed_read_roots: [workspaceRoot],
+                allowed_write_roots: [workspaceRoot],
+                required_source_artifacts: [
+                  `${workspaceRoot}/PLAN.md`,
+                  `${workspaceRoot}/ANALYSIS.md`,
+                ],
+                target_artifacts: [`${workspaceRoot}/src`],
+                effect_class: "filesystem_write",
+                verification_mode: "mutation_required",
+                step_kind: "delegated_write",
+                fallback_policy: "continue_without_delegation",
+                resume_policy: "stateless_retry",
+                approval_profile: "filesystem_write",
+              },
+              max_budget_hint: "30m",
+              can_run_parallel: false,
+              depends_on: ["analyze_plan"],
+            },
+            {
+              name: "verify_build",
+              step_type: "deterministic_tool",
+              tool: "system.bash",
+              args: {
+                command: "npm",
+                args: ["test"],
+                cwd: workspaceRoot,
+              },
+              onError: "abort",
+              depends_on: ["implement_owner"],
+            },
+          ],
+        }),
+      });
+      const provider = createMockProvider("primary", {
+        chat: vi
+          .fn()
+          .mockResolvedValueOnce(
+            mockResponse({
+              content: safeJson({
+                reason:
+                  "Phased implementation of PLAN.md with sequential setup/impl/test and verification",
+                requiresSynthesis: true,
+                steps: [
+                  {
+                    name: "read_plan",
+                    step_type: "deterministic_tool",
+                    tool: "system.readFile",
+                    args: {
+                      path: `${workspaceRoot}/PLAN.md`,
+                    },
+                    onError: "abort",
+                  },
+                  {
+                    name: "setup_phase",
+                    step_type: "subagent_task",
+                    objective:
+                      "Author initial setup files and scaffolding per first phase of PLAN.md",
+                    input_contract: "PLAN.md content plus current workspace files",
+                    acceptance_criteria: [
+                      "Required config and source files created/updated",
+                      "Directory structure matches plan",
+                    ],
+                    required_tool_capabilities: [
+                      "read_file",
+                      "write_file",
+                      "list_dir",
+                    ],
+                    context_requirements: ["repo_context", "read_plan"],
+                    execution_context: {
+                      version: "v1",
+                      workspace_root: workspaceRoot,
+                      allowed_read_roots: [workspaceRoot],
+                      allowed_write_roots: [workspaceRoot],
+                      allowed_tools: [
+                        "system.readFile",
+                        "system.writeFile",
+                        "system.listDir",
+                      ],
+                      required_source_artifacts: [`${workspaceRoot}/PLAN.md`],
+                      target_artifacts: [workspaceRoot],
+                      effect_class: "filesystem_scaffold",
+                      verification_mode: "grounded_read",
+                      step_kind: "delegated_scaffold",
+                      fallback_policy: "continue_without_delegation",
+                      resume_policy: "stateless_retry",
+                      approval_profile: "filesystem_write",
+                    },
+                    max_budget_hint: "20m",
+                    can_run_parallel: false,
+                    depends_on: ["read_plan"],
+                  },
+                  {
+                    name: "install_deps",
+                    step_type: "deterministic_tool",
+                    tool: "system.bash",
+                    args: {
+                      command: "npm",
+                      args: ["install"],
+                      cwd: workspaceRoot,
+                    },
+                    onError: "abort",
+                    depends_on: ["setup_phase"],
+                  },
+                  {
+                    name: "core_implementation",
+                    step_type: "subagent_task",
+                    objective: "Implement core functionality phase from PLAN.md",
+                    input_contract:
+                      "Setup complete, PLAN.md phase details, current code",
+                    acceptance_criteria: [
+                      "Core features coded per plan",
+                      "Changes limited to target artifacts",
+                    ],
+                    required_tool_capabilities: [
+                      "read_file",
+                      "write_file",
+                      "execute_command",
+                    ],
+                    context_requirements: ["repo_context", "setup_phase"],
+                    execution_context: {
+                      version: "v1",
+                      workspace_root: workspaceRoot,
+                      allowed_read_roots: [workspaceRoot],
+                      allowed_write_roots: [workspaceRoot],
+                      required_source_artifacts: [
+                        `${workspaceRoot}/src`,
+                        `${workspaceRoot}/PLAN.md`,
+                      ],
+                      target_artifacts: [`${workspaceRoot}/src`],
+                      effect_class: "filesystem_write",
+                      verification_mode: "mutation_required",
+                      step_kind: "delegated_write",
+                      fallback_policy: "continue_without_delegation",
+                      resume_policy: "stateless_retry",
+                      approval_profile: "filesystem_write",
+                    },
+                    max_budget_hint: "30m",
+                    can_run_parallel: false,
+                    depends_on: ["install_deps"],
+                  },
+                  {
+                    name: "testing_phase",
+                    step_type: "subagent_task",
+                    objective:
+                      "Run test and verification phase from PLAN.md and report failing or passing commands",
+                    input_contract: "Implementation complete, return grounded test results",
+                    acceptance_criteria: [
+                      "Relevant tests or validation commands executed",
+                      "Failures and passes reported concretely",
+                    ],
+                    required_tool_capabilities: [
+                      "read_file",
+                      "execute_command",
+                    ],
+                    context_requirements: ["repo_context", "core_implementation"],
+                    execution_context: {
+                      version: "v1",
+                      workspace_root: workspaceRoot,
+                      allowed_read_roots: [workspaceRoot],
+                      allowed_write_roots: [workspaceRoot],
+                      required_source_artifacts: [`${workspaceRoot}/src`],
+                      effect_class: "shell",
+                      verification_mode: "deterministic_followup",
+                      step_kind: "delegated_validation",
+                      fallback_policy: "continue_without_delegation",
+                      resume_policy: "stateless_retry",
+                      approval_profile: "filesystem_write",
+                    },
+                    max_budget_hint: "20m",
+                    can_run_parallel: false,
+                    depends_on: ["core_implementation"],
+                  },
+                  {
+                    name: "final_synthesis",
+                    step_type: "synthesis",
+                    depends_on: ["testing_phase"],
+                  },
+                ],
+              }),
+            }),
+          )
+          .mockResolvedValueOnce(refinedSingleOwnerPlan)
+          .mockResolvedValueOnce(
+            mockResponse({
+              content:
+                "Implementation completed successfully. PLAN.md was analyzed, the owned source artifacts were updated, and npm test passed in the workspace.",
+            }),
+          ),
+      });
+      const pipelineExecutor = {
+        execute: vi.fn().mockResolvedValue({
+          status: "completed",
+          context: {
+            results: {
+              read_plan: safeJson({
+                path: `${workspaceRoot}/PLAN.md`,
+                size: 4096,
+              }),
+              analyze_plan: completedDelegatedPlannerResult(
+                "ANALYSIS.md captures the full PLAN.md requirements and implementation order.",
+                [
+                  {
+                    name: "system.readFile",
+                    args: {
+                      path: `${workspaceRoot}/PLAN.md`,
+                    },
+                  },
+                  {
+                    name: "system.writeFile",
+                    args: {
+                      path: `${workspaceRoot}/ANALYSIS.md`,
+                      content: "analysis artifact",
+                    },
+                  },
+                ],
+              ),
+              implement_owner: completedDelegatedPlannerResult(
+                "Updated src/main.ts with the required implementation changes and verified tests passed.",
+                [
+                  {
+                    name: "system.readFile",
+                    args: {
+                      path: `${workspaceRoot}/ANALYSIS.md`,
+                    },
+                  },
+                  {
+                    name: "system.writeFile",
+                    args: {
+                      path: `${workspaceRoot}/src/main.ts`,
+                      content: "export const ready = true;\n",
+                    },
+                  },
+                  {
+                    name: "system.bash",
+                    args: {
+                      command: "npm",
+                      args: ["test"],
+                      cwd: workspaceRoot,
+                    },
+                    result: safeJson({
+                      exitCode: 0,
+                      stdout: "tests passed",
+                    }),
+                  },
+                ],
+              ),
+              verify_build: safeJson({
+                exitCode: 0,
+                stdout: "tests passed",
+              }),
+            },
+          },
+          completedSteps: 4,
+          totalSteps: 4,
+        }),
+      };
+      const executor = new ChatExecutor({
+        providers: [provider],
+        toolHandler,
+        plannerEnabled: true,
+        pipelineExecutor: pipelineExecutor as any,
+        delegationDecision: {
+          enabled: true,
+          scoreThreshold: 0.2,
+        },
+      });
+
+      const result = await executor.execute(
+        createParams({
+          message: {
+            ...createMessage(
+              "Can you go through @PLAN.md and implement it in full. Make sure each phase is fully tested and working before moving on.",
+            ),
+            metadata: undefined,
+          } as GatewayMessage,
+          runtimeContext: {
+            workspaceRoot,
+          },
+          trace: {
+            onExecutionTraceEvent: (event) => {
+              events.push(event as unknown as Record<string, unknown>);
+            },
+          },
+        }),
+      );
+
+      expect(provider.chat).toHaveBeenCalledTimes(2);
+      expect(toolHandler).not.toHaveBeenCalled();
+      expect(pipelineExecutor.execute).toHaveBeenCalledTimes(1);
+      expect(result.stopReason).toBe("completed");
+      expect(result.completionState).toBe("completed");
+      expect(result.completionProgress).toMatchObject({
+        completionState: "completed",
+        remainingRequirements: [],
+      });
+      expect(result.plannerSummary?.routeReason).toBe(
+        "single_owner_plan_artifact_execution",
+      );
+      expect(result.plannerSummary?.delegationDecision).toMatchObject({
+        shouldDelegate: true,
+      });
+      expect(result.plannerSummary?.diagnostics).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            category: "validation",
+            code: "planner_plan_artifact_single_owner_required",
+          }),
+          expect.objectContaining({
+            category: "policy",
+            code: "planner_step_contract_retry",
+          }),
+        ]),
+      );
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "planner_refinement_requested",
+            phase: "planner",
+            payload: expect.objectContaining({
+              reason: "planner_step_contract_retry",
+            }),
+          }),
+        ]),
+      );
+      expect(
+        events.some((event) =>
+          event.type === "planner_path_finished" &&
+          event.phase === "planner" &&
+          typeof (event.payload as { routeReason?: unknown })?.routeReason === "string" &&
+          /^delegation_veto_/.test(
+            String((event.payload as { routeReason?: unknown }).routeReason),
+          ) &&
+          (event.payload as { handled?: unknown })?.handled === false
+        ),
+      ).toBe(false);
+      expect(result.callUsage.map((entry) => entry.phase)).toEqual([
+        "planner",
+        "planner",
+      ]);
+    });
+
+    it("keeps an executor-level barrier if planner veto handling ever regresses to unhandled", async () => {
+      const events: Record<string, unknown>[] = [];
+      const toolHandler = vi.fn().mockResolvedValue("unexpected inline execution");
+      const provider = createMockProvider("primary");
+      const pipelineExecutor = { execute: vi.fn() };
+      const executor = new ChatExecutor({
+        providers: [provider],
+        toolHandler,
+        plannerEnabled: true,
+        pipelineExecutor: pipelineExecutor as any,
+      });
+
+      vi.spyOn(executor as any, "executePlannerPath").mockImplementation(
+        async (ctx: any) => {
+          ctx.plannerHandled = false;
+          ctx.plannerImplementationFallbackBlocked = true;
+          ctx.plannedSubagentSteps = 2;
+          ctx.plannerSummaryState.routeReason =
+            "delegation_veto_shared_artifact_writer_inline";
+          ctx.plannerSummaryState.delegationDecision = {
+            shouldDelegate: false,
+            reason: "shared_artifact_writer_inline",
+            threshold: 0.2,
+            utilityScore: 0.37,
+            decompositionBenefit: 0.4,
+            coordinationOverhead: 0.5,
+            latencyCostRisk: 0.1,
+            safetyRisk: 0.05,
+            confidence: 0.9,
+            hardBlockedTaskClass: null,
+            hardBlockedTaskClassSource: null,
+            hardBlockedTaskClassSignal: null,
+            diagnostics: {},
+          };
+          ctx.plannerSummaryState.diagnostics.push({
+            category: "policy",
+            code: "delegation_veto",
+            message:
+              "Delegation vetoed by runtime admission policy: shared_artifact_writer_inline",
+            details: {
+              reason: "shared_artifact_writer_inline",
+            },
+          });
+        },
+      );
+
+      const result = await executor.execute(
+        createParams({
+          message: createMessage(
+            "Read PLAN.md, implement the project in phases, test each phase, and only finish when verification is complete.",
+          ),
+          trace: {
+            onExecutionTraceEvent: (event) => {
+              events.push(event as unknown as Record<string, unknown>);
+            },
+          },
+        }),
+      );
+
+      expect(toolHandler).not.toHaveBeenCalled();
+      expect(result.stopReason).toBe("validation_error");
+      expect(result.completionState).toBe("blocked");
+      expect(result.content).toContain(
+        "Inline legacy fallback is disabled for this task class.",
+      );
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "planner_path_finished",
+            phase: "planner",
+            payload: expect.objectContaining({
+              routeReason: "delegation_veto_shared_artifact_writer_inline",
+              handled: true,
+              enforcement: "executor_level_planner_veto_barrier",
+            }),
+          }),
+        ]),
+      );
+    });
+
     it("applies live delegation threshold resolver for aggressiveness overrides", async () => {
       const provider = createMockProvider("primary", {
         chat: vi
@@ -14668,6 +15771,39 @@ describe("ChatExecutor", () => {
             results: {
               create_root_directory:
                 "mkdir -p /tmp/transit-weave/packages/core/src /tmp/transit-weave/packages/cli/src /tmp/transit-weave/packages/web/src /tmp/transit-weave/fixtures",
+              scaffold_monorepo_configs: completedDelegatedPlannerResult(
+                "Root workspace and per-package manifests/configs were scaffolded without implementation source files.",
+                [
+                  {
+                    name: "system.writeFile",
+                    args: {
+                      path: "package.json",
+                      content: "{\"private\":true,\"workspaces\":[\"packages/*\"]}",
+                    },
+                  },
+                  {
+                    name: "system.writeFile",
+                    args: {
+                      path: "packages/core/package.json",
+                      content: "{\"name\":\"@transit-weave/core\"}",
+                    },
+                  },
+                  {
+                    name: "system.writeFile",
+                    args: {
+                      path: "packages/cli/package.json",
+                      content: "{\"name\":\"@transit-weave/cli\"}",
+                    },
+                  },
+                  {
+                    name: "system.writeFile",
+                    args: {
+                      path: "packages/web/package.json",
+                      content: "{\"name\":\"@transit-weave/web\"}",
+                    },
+                  },
+                ],
+              ),
               install_dependencies:
                 "npm install completed in /tmp/transit-weave with workspace dependencies resolved.",
               run_build:
@@ -14676,19 +15812,178 @@ describe("ChatExecutor", () => {
                 "npm test completed successfully; stdout line 41 confirms the Vitest workspace suite passed with the fixture-backed route scenarios.",
               implement_core: completedDelegatedPlannerResult(
                 "packages/core/src/index.ts file exports parseNetwork and findRoutes with types; build log line 14 shows the core route search compiles cleanly and returns the best itinerary plus two alternatives.",
-                ["system.writeFile", "system.readFile", "system.bash"],
+                [
+                  {
+                    name: "system.readFile",
+                    args: {
+                      path: "packages/core/package.json",
+                    },
+                    result: safeJson({
+                      path: "packages/core/package.json",
+                      content: "{\"name\":\"@transit-weave/core\"}",
+                    }),
+                  },
+                  {
+                    name: "system.writeFile",
+                    args: {
+                      path: "packages/core/src/index.ts",
+                      content:
+                        "export function parseNetwork(){} export function findRoutes(){}",
+                    },
+                  },
+                  {
+                    name: "system.bash",
+                    args: {
+                      command: "npm",
+                      args: ["run", "build"],
+                      cwd: "/tmp/transit-weave",
+                    },
+                    result: safeJson({
+                      exitCode: 0,
+                      stdout:
+                        "build completed successfully for @transit-weave/core",
+                    }),
+                  },
+                ],
               ),
               implement_cli: completedDelegatedPlannerResult(
                 "packages/cli/src/index.ts file wires validate and route commander commands; stdout line 22 shows the CLI prints cost, transfer count, and ordered steps using the core package.",
-                ["system.writeFile", "system.readFile", "system.bash"],
+                [
+                  {
+                    name: "system.readFile",
+                    args: {
+                      path: "packages/cli/package.json",
+                    },
+                    result: safeJson({
+                      path: "packages/cli/package.json",
+                      content: "{\"name\":\"@transit-weave/cli\"}",
+                    }),
+                  },
+                  {
+                    name: "system.writeFile",
+                    args: {
+                      path: "packages/cli/src/index.ts",
+                      content: "console.log('route');",
+                    },
+                  },
+                  {
+                    name: "system.bash",
+                    args: {
+                      command: "npm",
+                      args: ["run", "build"],
+                      cwd: "/tmp/transit-weave",
+                    },
+                    result: safeJson({
+                      exitCode: 0,
+                      stdout:
+                        "build completed successfully for @transit-weave/cli",
+                    }),
+                  },
+                ],
               ),
               implement_web: completedDelegatedPlannerResult(
                 "packages/web/src/App.tsx file renders the editable sample network UI with origin and destination selectors; build log line 31 confirms the Vite React app compiles successfully.",
-                ["system.writeFile", "system.readFile", "system.bash"],
+                [
+                  {
+                    name: "system.readFile",
+                    args: {
+                      path: "packages/web/package.json",
+                    },
+                    result: safeJson({
+                      path: "packages/web/package.json",
+                      content: "{\"name\":\"@transit-weave/web\"}",
+                    }),
+                  },
+                  {
+                    name: "system.writeFile",
+                    args: {
+                      path: "packages/web/src/App.tsx",
+                      content: "export default function App(){ return null; }",
+                    },
+                  },
+                  {
+                    name: "system.bash",
+                    args: {
+                      command: "npm",
+                      args: ["run", "build"],
+                      cwd: "/tmp/transit-weave",
+                    },
+                    result: safeJson({
+                      exitCode: 0,
+                      stdout:
+                        "build completed successfully for @transit-weave/web",
+                    }),
+                  },
+                ],
               ),
               add_fixtures_tests_readme: completedDelegatedPlannerResult(
                 "fixtures/sample-network.txt, README.md, and packages/core/test/index.test.ts were authored; test log line 44 shows the fixture-backed tests and coverage passed.",
-                ["system.writeFile", "system.readFile", "system.bash"],
+                [
+                  {
+                    name: "system.readFile",
+                    args: {
+                      path: "packages/core/src/index.ts",
+                    },
+                    result: safeJson({
+                      path: "packages/core/src/index.ts",
+                      content:
+                        "export function parseNetwork(){} export function findRoutes(){}",
+                    }),
+                  },
+                  {
+                    name: "system.readFile",
+                    args: {
+                      path: "packages/cli/src/index.ts",
+                    },
+                    result: safeJson({
+                      path: "packages/cli/src/index.ts",
+                      content: "console.log('route');",
+                    }),
+                  },
+                  {
+                    name: "system.readFile",
+                    args: {
+                      path: "packages/web/src/App.tsx",
+                    },
+                    result: safeJson({
+                      path: "packages/web/src/App.tsx",
+                      content: "export default function App(){ return null; }",
+                    }),
+                  },
+                  {
+                    name: "system.writeFile",
+                    args: {
+                      path: "fixtures/sample-network.txt",
+                      content: "A B 5",
+                    },
+                  },
+                  {
+                    name: "system.writeFile",
+                    args: {
+                      path: "README.md",
+                      content: "# Transit weave",
+                    },
+                  },
+                  {
+                    name: "system.writeFile",
+                    args: {
+                      path: "packages/core/test/index.test.ts",
+                      content: "it('routes', () => expect(true).toBe(true));",
+                    },
+                  },
+                  {
+                    name: "system.bash",
+                    args: {
+                      command: "npm",
+                      args: ["test"],
+                      cwd: "/tmp/transit-weave",
+                    },
+                    result: safeJson({
+                      exitCode: 0,
+                      stdout: "tests passed with coverage",
+                    }),
+                  },
+                ],
               ),
               final_synthesis: "Transit weave monorepo completed successfully.",
             },
@@ -14713,6 +16008,9 @@ describe("ChatExecutor", () => {
           message: createMessage(
             "Create a TypeScript npm-workspaces monorepo with core, cli, and web, then install, build, and test it.",
           ),
+          runtimeContext: {
+            workspaceRoot: "/tmp/transit-weave",
+          },
         }),
       );
 
@@ -15784,6 +17082,171 @@ describe("ChatExecutor", () => {
         "system.readFile",
         "system.searchFiles",
       ]);
+    });
+
+    it("uses the runtime-owned workspace root for planner context instead of conflicting message metadata or host fallback", async () => {
+      const provider = createMockProvider("primary", {
+        chat: vi.fn().mockResolvedValue(
+          mockResponse({
+            content: safeJson({
+              reason: "single_root",
+              requiresSynthesis: false,
+              steps: [
+                {
+                  name: "inspect_workspace",
+                  step_type: "deterministic_tool",
+                  tool: "system.bash",
+                  args: { command: "pwd" },
+                },
+              ],
+            }),
+          }),
+        ),
+      });
+      const pipelineExecutor = {
+        execute: vi.fn().mockResolvedValue({
+          status: "completed",
+          completionState: "completed",
+          context: {
+            results: {
+              inspect_workspace: "/home/tetsuo/git/stream-test/agenc-shell",
+            },
+          },
+          completedSteps: 1,
+          totalSteps: 1,
+        }),
+      };
+      const executor = new ChatExecutor({
+        providers: [provider],
+        toolHandler: vi.fn().mockResolvedValue("unused"),
+        plannerEnabled: true,
+        pipelineExecutor: pipelineExecutor as any,
+        resolveHostWorkspaceRoot: () => "/home/tetsuo/git/AgenC",
+      });
+
+      await executor.execute(
+        createParams({
+          message: {
+            ...createMessage(
+              "Inspect the current workspace, then report the deterministic execution root.",
+            ),
+            metadata: { workspaceRoot: "/wrong/message/root" },
+          },
+          runtimeContext: {
+            workspaceRoot: "/home/tetsuo/git/stream-test/agenc-shell",
+          },
+        }),
+      );
+
+      const pipelineArg = (pipelineExecutor.execute as ReturnType<typeof vi.fn>).mock
+        .calls[0][0] as {
+          plannerContext?: {
+            workspaceRoot?: string;
+          };
+        };
+      expect(pipelineArg.plannerContext?.workspaceRoot).toBe(
+        "/home/tetsuo/git/stream-test/agenc-shell",
+      );
+    });
+
+    it("materializes a planner-owned workflow contract before implementation execution begins", async () => {
+      const events: Record<string, unknown>[] = [];
+      const provider = createMockProvider("primary", {
+        chat: vi.fn().mockResolvedValue(
+          mockResponse({
+            content: safeJson({
+              reason: "planner_implementation_contract",
+              requiresSynthesis: false,
+              steps: [
+                {
+                  name: "implement_core",
+                  step_type: "deterministic_tool",
+                  tool: "system.writeFile",
+                  args: {
+                    path: "/home/tetsuo/git/stream-test/agenc-shell/src/main.ts",
+                    content: "export {};\n",
+                  },
+                },
+              ],
+            }),
+          }),
+        ),
+      });
+      const pipelineExecutor = {
+        execute: vi.fn().mockResolvedValue({
+          status: "completed",
+          completionState: "completed",
+          context: {
+            results: {
+              implement_core: "built successfully",
+            },
+          },
+          completedSteps: 1,
+          totalSteps: 1,
+        }),
+      };
+      const executor = new ChatExecutor({
+        providers: [provider],
+        toolHandler: vi.fn().mockResolvedValue("unused"),
+        plannerEnabled: true,
+        pipelineExecutor: pipelineExecutor as any,
+      });
+
+      const result = await executor.execute(
+        createParams({
+          message: createMessage(
+            "Implement the requested change in the current workspace and finish only when the implementation is complete.",
+          ),
+          runtimeContext: {
+            workspaceRoot: "/home/tetsuo/git/stream-test/agenc-shell",
+          },
+          trace: {
+            onExecutionTraceEvent: (event) => {
+              events.push(event as unknown as Record<string, unknown>);
+            },
+          },
+        }),
+      );
+
+      expect(result.completionProgress?.verificationContract).toMatchObject({
+        workspaceRoot: "/home/tetsuo/git/stream-test/agenc-shell",
+        verificationMode: "mutation_required",
+        completionContract: expect.objectContaining({
+          taskClass: "artifact_only",
+        }),
+      });
+      expect(result.stopReason).toBe("completed");
+      expect(result.completionState).toBe("completed");
+      expect(result.completionProgress).toMatchObject({
+        completionState: "completed",
+        requiredRequirements: [],
+        remainingRequirements: [],
+      });
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "completion_gate_checked",
+            phase: "tool_followup",
+            payload: expect.objectContaining({
+              gate: "workflow_completion_truth",
+              decision: expect.stringMatching(/^accept/),
+              ownerClass: "implementation",
+              reason: "workflow_verification_contract_present",
+            }),
+          }),
+        ]),
+      );
+      expect(events).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "completion_gate_checked",
+            phase: "tool_followup",
+            payload: expect.objectContaining({
+              gate: "legacy_completion_compatibility",
+            }),
+          }),
+        ]),
+      );
     });
 
     it("forwards expanded routed tools into planner context for child scoping when available", async () => {

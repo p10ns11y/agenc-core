@@ -22,6 +22,7 @@ import {
   createIngestionHooks,
 } from "../memory/ingestion.js";
 import { CuratedMemoryManager, DailyLogManager } from "../memory/structured.js";
+import { sanitizeDelegatedAssistantEnvironmentSummary } from "../utils/delegated-scope-trust.js";
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -168,7 +169,15 @@ export function createBasicHistoryRetriever(
         const lines: string[] = [];
         let used = 0;
         for (const entry of entries) {
-          const normalized = entry.content.trim();
+          const shouldSuppressDelegatedEnvironmentFact =
+            entry.metadata?.delegatedScopeContainsEnvironmentFact === true &&
+            entry.metadata?.delegatedScopeTrust !== "trusted_authoritative";
+          if (shouldSuppressDelegatedEnvironmentFact) {
+            continue;
+          }
+          const normalized = sanitizeDelegatedAssistantEnvironmentSummary(
+            entry.content.trim(),
+          );
           const clipped =
             normalized.length > BASIC_MAX_ENTRY_CHARS
               ? normalized.slice(0, BASIC_MAX_ENTRY_CHARS - 3) + "..."

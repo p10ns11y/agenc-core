@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildWorkflowRecoveryStateLines,
   buildRecoveryHints,
   computeQualityProxy,
   inferRecoveryHint,
@@ -371,6 +372,33 @@ describe("chat-executor-recovery", () => {
         verifierOverall: "skipped",
         failedToolCalls: 0,
       }),
+    );
+  });
+
+  it("preserves workflow-owned remaining requirements in recovery state lines", () => {
+    const lines = buildWorkflowRecoveryStateLines({
+      completionState: "needs_verification",
+      stopReason: "completed",
+      requiredRequirements: ["build_verification", "workflow_verifier_pass"],
+      satisfiedRequirements: ["build_verification"],
+      remainingRequirements: ["workflow_verifier_pass"],
+      reusableEvidence: [
+        {
+          requirement: "build_verification",
+          summary: "make test",
+          observedAt: 10,
+        },
+      ],
+      updatedAt: 10,
+    });
+
+    expect(lines).toEqual(
+      expect.arrayContaining([
+        "Workflow state: needs_verification",
+        "Still required before completion: workflow_verifier_pass",
+        "Reusable grounded evidence: make test",
+        "Do not mark this implementation complete until the remaining verifier requirements pass.",
+      ]),
     );
   });
 });

@@ -96,7 +96,7 @@ export const REPETITIVE_LINE_MAX_UNIQUE_RATIO = 0.35;
 /** Upper bound on additive runtime hint system messages per execution. */
 export const DEFAULT_MAX_RUNTIME_SYSTEM_HINTS = 4;
 /** Default max planner output budget in tokens (soft, prompt-enforced). */
-export const DEFAULT_PLANNER_MAX_TOKENS = 256;
+export const DEFAULT_PLANNER_MAX_TOKENS = 8_192;
 /** Bounded planner retries when a delegated step is rejected for decomposition. */
 export const DEFAULT_PLANNER_MAX_REFINEMENT_ATTEMPTS = 2;
 /** Default retries reserved for planner step-contract cleanup before structural replans. */
@@ -117,7 +117,7 @@ export const MAX_PLANNER_CONTEXT_MEMORY_CHARS = 1_200;
 /** Max chars retained for one planner tool-output candidate entry. */
 export const MAX_PLANNER_CONTEXT_TOOL_OUTPUT_CHARS = 1_200;
 /** Default per-request tool-call budget. */
-export const DEFAULT_TOOL_BUDGET_PER_REQUEST = 24;
+export const DEFAULT_TOOL_BUDGET_PER_REQUEST = 2_048;
 /** Default per-request model recall budget (calls after first). 0 = unlimited. */
 export const DEFAULT_MODEL_RECALLS_PER_REQUEST = 0;
 /** Default per-request failed-tool-call budget. */
@@ -130,7 +130,7 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 0;
  * Absolute adaptive ceiling for tool rounds.
  * Keep aligned with gateway config validation for `llm.maxToolRounds`.
  */
-export const MAX_ADAPTIVE_TOOL_ROUNDS = 64;
+export const MAX_ADAPTIVE_TOOL_ROUNDS = 2_048;
 /** Default minimum verifier confidence for accepting subagent outputs. */
 export const DEFAULT_SUBAGENT_VERIFIER_MIN_CONFIDENCE = 0.65;
 /** Default max rounds for verifier/critique loops (initial round included). */

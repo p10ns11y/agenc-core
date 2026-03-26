@@ -223,6 +223,45 @@ describe("MemoryIngestionEngine", () => {
       expect(logManager.append).toHaveBeenCalledTimes(2);
     });
 
+    it("preserves delegated scope trust metadata on indexed turn entries", async () => {
+      const engine = createEngine();
+      await engine.ingestTurn(
+        "sess-1",
+        "what is the child cwd?",
+        "Subagent cwd: /",
+        {
+          agentResponseMetadata: {
+            delegatedScopeTrust: "informational_untrusted",
+            delegatedScopeTrustReason: "assistant_delegated_environment_summary",
+            delegatedScopeContainsEnvironmentFact: true,
+          },
+        },
+      );
+
+      expect(vectorStore.storeWithEmbedding).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            delegatedScopeTrust: "informational_untrusted",
+            delegatedScopeTrustReason:
+              "assistant_delegated_environment_summary",
+            delegatedScopeContainsEnvironmentFact: true,
+          }),
+        }),
+        new Array(128).fill(0.1),
+      );
+      expect(vectorStore.storeWithEmbedding).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            delegatedScopeTrust: "informational_untrusted",
+            delegatedScopeContainsEnvironmentFact: true,
+          }),
+        }),
+        new Array(128).fill(0.1),
+      );
+    });
+
     it("deduplicates near-identical turns per role", async () => {
       (vectorStore.query as ReturnType<typeof vi.fn>).mockResolvedValue([
         {
@@ -418,7 +457,34 @@ describe("MemoryIngestionEngine", () => {
       expect(result.continue).toBe(true);
 
       await new Promise((resolve) => setTimeout(resolve, 5));
-      expect(ingestSpy).toHaveBeenCalledWith("sess-1", "hello", "hi");
+      expect(ingestSpy).toHaveBeenCalledWith("sess-1", "hello", "hi", {
+        agentResponseMetadata: undefined,
+      });
+    });
+
+    it("passes outbound assistant delegated scope metadata into ingestion", async () => {
+      const engine = createEngine();
+      const ingestSpy = vi.spyOn(engine, "ingestTurn").mockResolvedValue(undefined);
+      const hooks = createIngestionHooks(engine, logger);
+
+      const ctx = createHookContext("message:outbound", {
+        sessionId: "sess-1",
+        userMessage: "hello",
+        agentResponse: "Subagent cwd: /",
+        agentResponseMetadata: {
+          delegatedScopeTrust: "informational_untrusted",
+          delegatedScopeContainsEnvironmentFact: true,
+        },
+      });
+
+      await hooks[0].handler(ctx);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(ingestSpy).toHaveBeenCalledWith("sess-1", "hello", "Subagent cwd: /", {
+        agentResponseMetadata: {
+          delegatedScopeTrust: "informational_untrusted",
+          delegatedScopeContainsEnvironmentFact: true,
+        },
+      });
     });
 
     it("session end hook attaches ingestion result", async () => {

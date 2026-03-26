@@ -5,6 +5,7 @@ import type {
 } from "../workflow/pipeline.js";
 import type { PlannerSubAgentTaskStepIntent } from "./chat-executor-types.js";
 import {
+  buildPlannerWorkflowAdmission,
   buildPlannerVerifierAdmission,
   evaluatePlannerDeterministicChecks,
 } from "./chat-executor-verifier.js";
@@ -203,5 +204,61 @@ describe("evaluateSubagentDeterministicChecks", () => {
     expect(decision.steps[0]?.issues).not.toContain(
       "missing_successful_tool_evidence",
     );
+  });
+});
+
+describe("buildPlannerWorkflowAdmission", () => {
+  it("synthesizes a runtime-owned workflow contract for implementation-class planner work", () => {
+    const admission = buildPlannerWorkflowAdmission({
+      workspaceRoot: "/tmp/project",
+      subagentSteps: [],
+      deterministicSteps: [
+        {
+          name: "implement_core",
+          stepType: "deterministic_tool",
+          tool: "system.writeFile",
+          args: { path: "/tmp/project/src/main.ts", content: "export {};\n" },
+        },
+      ],
+    });
+
+    expect(admission.taskClassification).toBe("implementation_class");
+    expect(admission.requiresMandatoryImplementationVerification).toBe(true);
+    expect(admission.completionContract).toMatchObject({
+      taskClass: "artifact_only",
+    });
+    expect(admission.verificationContract).toMatchObject({
+      workspaceRoot: "/tmp/project",
+      verificationMode: "mutation_required",
+      completionContract: expect.objectContaining({
+        taskClass: "artifact_only",
+      }),
+    });
+  });
+
+  it("keeps docs and research planner work lightweight", () => {
+    const admission = buildPlannerWorkflowAdmission({
+      workspaceRoot: "/tmp/project",
+      subagentSteps: [
+        createStep({
+          objective: "Review PLAN.md",
+          acceptanceCriteria: ["Summarize findings"],
+          executionContext: {
+            version: "v1",
+            workspaceRoot: "/tmp/project",
+            allowedReadRoots: ["/tmp/project"],
+            requiredSourceArtifacts: ["/tmp/project/PLAN.md"],
+            verificationMode: "grounded_read",
+            stepKind: "delegated_review",
+            effectClass: "read_only",
+          },
+        }),
+      ],
+      deterministicSteps: [],
+    });
+
+    expect(admission.taskClassification).toBe("docs_research_plan_only");
+    expect(admission.requiresMandatoryImplementationVerification).toBe(false);
+    expect(admission.completionContract?.taskClass).toBe("review_required");
   });
 });

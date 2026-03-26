@@ -209,6 +209,67 @@ describe("chat-executor-contract-guidance", () => {
     });
   });
 
+  it("keeps trivial cwd introspection on the parent shell path", () => {
+    const guidance = resolveToolContractGuidance({
+      phase: "initial",
+      messageText: "what is the current working directory?",
+      toolCalls: [],
+      allowedToolNames: ["system.bash", "execute_with_agent"],
+    });
+
+    expect(guidance).toEqual({
+      source: "parent-safe-introspection",
+      runtimeInstruction:
+        "This is a trivial read-only workspace introspection turn. " +
+        "Run `pwd` directly on the parent session with `system.bash` and answer from that output. " +
+        "Do not delegate a child agent unless the user explicitly asked for child isolation.",
+      routedToolNames: ["system.bash"],
+      toolChoice: "required",
+      enforcement: {
+        mode: "block_other_tools",
+        message:
+          "This trivial read-only workspace introspection request should stay on the parent session tool path. " +
+          "Run `pwd` directly instead of using child delegation or unrelated tools.",
+      },
+    });
+  });
+
+  it("blocks execute_with_agent for trivial parent-safe introspection turns", () => {
+    const block = resolveToolContractExecutionBlock({
+      phase: "initial",
+      messageText: "ls",
+      toolCalls: [],
+      allowedToolNames: ["system.bash", "execute_with_agent"],
+      candidateToolName: "execute_with_agent",
+    });
+
+    expect(block).toBe(
+      "This trivial read-only workspace introspection request should stay on the parent session tool path. " +
+      "Run `ls` directly instead of using child delegation or unrelated tools. " +
+      "Allowed now: `system.bash`. " +
+      "Do not use `execute_with_agent` yet.",
+    );
+  });
+
+  it("does not override explicit child delegation requests for trivial shell commands", () => {
+    const guidance = resolveToolContractGuidance({
+      phase: "initial",
+      messageText:
+        "Use execute_with_agent to run ls in a child agent and tell me what it prints.",
+      toolCalls: [],
+      allowedToolNames: ["system.bash", "execute_with_agent"],
+    });
+
+    expect(guidance).toEqual({
+      source: "explicit-tool-invocation",
+      runtimeInstruction:
+        "The user explicitly instructed this turn to call `execute_with_agent`. " +
+        "Execute that tool before answering.",
+      routedToolNames: ["execute_with_agent"],
+      toolChoice: "required",
+    });
+  });
+
   it("blocks desktop/bash detours before the Doom launch contract is satisfied", () => {
     const block = resolveToolContractExecutionBlock({
       phase: "initial",

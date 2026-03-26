@@ -23,6 +23,10 @@ import { derivePromptBudgetPlan } from "../llm/prompt-budget.js";
 import { selectRelevantArtifactRefs } from "../llm/context-pruning.js";
 import { sanitizeDelegationContextRequirements } from "../utils/delegation-execution-context.js";
 import {
+  isConcreteExecutableEnvelopeRoot,
+  normalizeWorkspaceRoot,
+} from "../workflow/path-normalization.js";
+import {
   type CuratedSection,
   type DependencyArtifactCandidate,
   type DependencyContextEntry,
@@ -40,6 +44,7 @@ import {
   REDACTED_BEARER_TOKEN,
   REDACTED_API_KEY,
   REDACTED_ABSOLUTE_PATH,
+  OMITTED_EXECUTION_ABSOLUTE_PATH,
   PRIVATE_KEY_BLOCK_RE,
   IMAGE_DATA_URL_RE,
   BEARER_TOKEN_RE,
@@ -64,7 +69,39 @@ import {
 /*  Sensitive-data redaction                                            */
 /* ------------------------------------------------------------------ */
 
-export function redactSensitiveData(value: string): string {
+export interface SensitiveTextSanitizationOptions {
+  readonly preserveAbsolutePathsWithin?: readonly string[];
+  readonly absolutePathReplacement?: string;
+}
+
+function normalizeTrustedExecutionRoot(root: string): string | undefined {
+  if (!isConcreteExecutableEnvelopeRoot(root)) {
+    return undefined;
+  }
+  const normalizedRoot = normalizeWorkspaceRoot(root);
+  return normalizedRoot ? normalizedRoot.replace(/\/+$/g, "") : undefined;
+}
+
+function shouldPreserveExecutionAbsolutePath(
+  candidatePath: string,
+  preserveAbsolutePathsWithin: readonly string[] | undefined,
+): boolean {
+  if (!preserveAbsolutePathsWithin || preserveAbsolutePathsWithin.length === 0) {
+    return false;
+  }
+  const normalizedCandidate = resolvePath(candidatePath);
+  return preserveAbsolutePathsWithin.some((root) => {
+    const normalizedRoot = normalizeTrustedExecutionRoot(root);
+    if (!normalizedRoot) return false;
+    return normalizedCandidate === normalizedRoot ||
+      normalizedCandidate.startsWith(`${normalizedRoot}/`);
+  });
+}
+
+export function sanitizeSensitiveText(
+  value: string,
+  options: SensitiveTextSanitizationOptions = {},
+): string {
   if (value.length === 0) return value;
   let redacted = value;
   redacted = redacted.replace(PRIVATE_KEY_BLOCK_RE, REDACTED_PRIVATE_KEY_BLOCK);
@@ -79,9 +116,29 @@ export function redactSensitiveData(value: string): string {
   redacted = redacted.replace(FILE_URL_RE, REDACTED_FILE_URL);
   redacted = redacted.replace(
     ABSOLUTE_PATH_RE,
-    (_match, prefix: string) => `${prefix}${REDACTED_ABSOLUTE_PATH}`,
+    (_match, prefix: string, candidatePath: string) =>
+      shouldPreserveExecutionAbsolutePath(
+        candidatePath,
+        options.preserveAbsolutePathsWithin,
+      )
+        ? `${prefix}${candidatePath}`
+        : `${prefix}${options.absolutePathReplacement ?? REDACTED_ABSOLUTE_PATH}`,
   );
   return redacted;
+}
+
+export function redactSensitiveData(value: string): string {
+  return sanitizeSensitiveText(value);
+}
+
+export function sanitizeExecutionPromptText(
+  value: string,
+  options: Pick<SensitiveTextSanitizationOptions, "preserveAbsolutePathsWithin"> = {},
+): string {
+  return sanitizeSensitiveText(value, {
+    preserveAbsolutePathsWithin: options.preserveAbsolutePathsWithin,
+    absolutePathReplacement: OMITTED_EXECUTION_ABSOLUTE_PATH,
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -231,9 +288,10 @@ export function truncateText(value: string, maxChars: number): string {
 export function applySectionCaps(
   lines: readonly string[],
   maxChars: number,
+  sanitizeLine: (value: string) => string = redactSensitiveData,
 ): CuratedSection {
   const cleaned = lines
-    .map((line) => redactSensitiveData(line.trim()))
+    .map((line) => sanitizeLine(line.trim()))
     .filter((line) => line.length > 0);
   if (cleaned.length === 0) {
     return {
@@ -332,6 +390,7 @@ export function curateHistorySection(
   history: readonly PipelinePlannerContextHistoryEntry[],
   relevanceTerms: ReadonlySet<string>,
   maxChars: number,
+  trustedWorkspaceRoots: readonly string[] = [],
 ): CuratedSection {
   if (history.length === 0) {
     return {
@@ -382,9 +441,20 @@ export function curateHistorySection(
       const prefix = entry.toolName
         ? `[${entry.role}:${entry.toolName}]`
         : `[${entry.role}]`;
-      return `${prefix} ${redactSensitiveData(entry.content)}`;
+      return `${prefix} ${
+        sanitizeExecutionPromptText(entry.content, {
+          preserveAbsolutePathsWithin: trustedWorkspaceRoots,
+        })
+      }`;
     });
-  const section = applySectionCaps(orderedLines, maxChars);
+  const section = applySectionCaps(
+    orderedLines,
+    maxChars,
+    (value) =>
+      sanitizeExecutionPromptText(value, {
+        preserveAbsolutePathsWithin: trustedWorkspaceRoots,
+      }),
+  );
   return {
     ...section,
     available: history.length,
@@ -397,6 +467,7 @@ export function curateMemorySection(
   contextRequirements: readonly string[],
   relevanceTerms: ReadonlySet<string>,
   maxChars: number,
+  trustedWorkspaceRoots: readonly string[] = [],
 ): CuratedSection {
   if (memory.length === 0) {
     return {
@@ -463,9 +534,20 @@ export function curateMemorySection(
   }
   const lines = candidates.map(
     ({ entry }) =>
-      `[${entry.source}] ${redactSensitiveData(entry.content)}`,
+      `[${entry.source}] ${
+        sanitizeExecutionPromptText(entry.content, {
+          preserveAbsolutePathsWithin: trustedWorkspaceRoots,
+        })
+      }`,
   );
-  const section = applySectionCaps(lines, maxChars);
+  const section = applySectionCaps(
+    lines,
+    maxChars,
+    (value) =>
+      sanitizeExecutionPromptText(value, {
+        preserveAbsolutePathsWithin: trustedWorkspaceRoots,
+      }),
+  );
   return {
     ...section,
     available: memory.length,
@@ -481,6 +563,7 @@ export function curateToolOutputSection(
   requirementTerms: readonly string[],
   maxChars: number,
   summarizeDependencyResult: (result: string | null) => string,
+  trustedWorkspaceRoots: readonly string[] = [],
 ): CuratedSection {
   const requiredCapabilities = new Set(
     step.requiredToolCapabilities.map((tool) => tool.toLowerCase()),
@@ -490,9 +573,11 @@ export function curateToolOutputSection(
   );
   const dependencyLines = dependencies.map(
     ({ dependencyName, result }) =>
-      `[dependency:${dependencyName}] ${redactSensitiveData(
-        summarizeDependencyResult(result),
-      )}`,
+      `[dependency:${dependencyName}] ${
+        sanitizeExecutionPromptText(summarizeDependencyResult(result), {
+          preserveAbsolutePathsWithin: trustedWorkspaceRoots,
+        })
+      }`,
   );
   const historicalLines = toolOutputs
     .map((entry) => {
@@ -510,12 +595,23 @@ export function curateToolOutputSection(
       const prefix = entry.toolName
         ? `[tool:${entry.toolName}]`
         : "[tool]";
-      return `${prefix} ${redactSensitiveData(entry.content)}`;
+      return `${prefix} ${
+        sanitizeExecutionPromptText(entry.content, {
+          preserveAbsolutePathsWithin: trustedWorkspaceRoots,
+        })
+      }`;
     })
     .filter((line): line is string => line !== null);
 
   const combined = [...dependencyLines, ...historicalLines];
-  const section = applySectionCaps(combined, maxChars);
+  const section = applySectionCaps(
+    combined,
+    maxChars,
+    (value) =>
+      sanitizeExecutionPromptText(value, {
+        preserveAbsolutePathsWithin: trustedWorkspaceRoots,
+      }),
+  );
   return {
     ...section,
     available: dependencies.length + toolOutputs.length,
@@ -529,6 +625,7 @@ export function curateToolOutputSection(
 export function curateDependencyArtifactSection(
   artifacts: readonly DependencyArtifactCandidate[],
   maxChars: number,
+  trustedWorkspaceRoots: readonly string[] = [],
 ): CuratedSection {
   if (artifacts.length === 0 || maxChars <= 0) {
     return {
@@ -577,7 +674,14 @@ export function curateDependencyArtifactSection(
       truncateText(normalizedContent, previewChars)
     }`;
   });
-  const section = applySectionCaps(lines, maxChars);
+  const section = applySectionCaps(
+    lines,
+    maxChars,
+    (value) =>
+      sanitizeExecutionPromptText(value, {
+        preserveAbsolutePathsWithin: trustedWorkspaceRoots,
+      }),
+  );
   return {
     ...section,
     available: artifacts.length,
@@ -589,6 +693,7 @@ export function curateArtifactReferenceSection(
   artifacts: readonly ContextArtifactRef[],
   query: string,
   maxChars: number,
+  trustedWorkspaceRoots: readonly string[] = [],
 ): CuratedSection {
   if (artifacts.length === 0 || maxChars <= 0) {
     return {
@@ -603,7 +708,11 @@ export function curateArtifactReferenceSection(
     artifacts,
     query,
     maxChars,
-  });
+  }).map((line) =>
+    sanitizeExecutionPromptText(line, {
+      preserveAbsolutePathsWithin: trustedWorkspaceRoots,
+    })
+  );
   const truncated = lines.length < artifacts.length;
   return {
     lines,
@@ -635,10 +744,14 @@ export function normalizeDependencyArtifactPath(
     return normalizedPath;
   }
 
-  const normalizedWorkspaceRoot =
-    typeof workspaceRoot === "string" && workspaceRoot.trim().length > 0
-      ? normalize(workspaceRoot)
-      : "";
+  const trustedWorkspaceRoot =
+    typeof workspaceRoot === "string" &&
+      isConcreteExecutableEnvelopeRoot(workspaceRoot)
+      ? normalizeWorkspaceRoot(workspaceRoot)
+      : undefined;
+  const normalizedWorkspaceRoot = trustedWorkspaceRoot
+    ? normalize(trustedWorkspaceRoot)
+    : "";
   if (
     normalizedWorkspaceRoot.length > 0 &&
     (
@@ -911,6 +1024,9 @@ export function collectWorkspaceArtifactCandidates(
   queryTerms: ReadonlySet<string>,
   maxChars: number,
 ): readonly DependencyArtifactCandidate[] {
+  if (!isConcreteExecutableEnvelopeRoot(workspaceRoot)) {
+    return [];
+  }
   const normalizedWorkspaceRoot = resolvePath(workspaceRoot);
   if (
     maxChars <= 0 ||

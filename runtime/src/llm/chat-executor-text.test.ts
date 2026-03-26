@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildToolExecutionGroundingMessage,
   generateFallbackContent,
+  normalizeHistory,
+  prepareToolResultForPrompt,
   reconcileDirectShellObservationContent,
   reconcileExactResponseContract,
   reconcileTerminalCompletionStateContent,
@@ -125,6 +127,21 @@ describe("chat-executor-text", () => {
         "Implemented. The shell is fully functional and matches the spec.",
       completionState: "needs_verification",
       stopReason: "completed",
+      completionProgress: {
+        completionState: "needs_verification",
+        stopReason: "completed",
+        requiredRequirements: ["workflow_verifier_pass"],
+        satisfiedRequirements: [],
+        remainingRequirements: ["workflow_verifier_pass"],
+        reusableEvidence: [
+          {
+            requirement: "build_verification",
+            summary: "make test",
+            observedAt: 7,
+          },
+        ],
+        updatedAt: 7,
+      },
       toolCalls: [
         {
           name: "system.writeFile",
@@ -137,6 +154,8 @@ describe("chat-executor-text", () => {
     });
 
     expect(content).toContain("needs verification");
+    expect(content).toContain("Still required before completion: workflow_verifier_pass");
+    expect(content).toContain("Reusable grounded evidence: make test");
     expect(content).not.toContain("fully functional");
   });
 
@@ -147,6 +166,16 @@ describe("chat-executor-text", () => {
       completionState: "partial",
       stopReason: "validation_error",
       stopReasonDetail: "Behavior checks still missing",
+      completionProgress: {
+        completionState: "partial",
+        stopReason: "validation_error",
+        stopReasonDetail: "Behavior checks still missing",
+        requiredRequirements: ["behavior_verification"],
+        satisfiedRequirements: [],
+        remainingRequirements: ["behavior_verification"],
+        reusableEvidence: [],
+        updatedAt: 9,
+      },
       toolCalls: [
         {
           name: "system.writeFile",
@@ -160,6 +189,50 @@ describe("chat-executor-text", () => {
 
     expect(content).toContain("Partial implementation");
     expect(content).toContain("Behavior checks still missing");
+    expect(content).toContain(
+      "Do not present the work as finished; continue from the grounded evidence and close the remaining requirements.",
+    );
+  });
+
+  it("does not render blocked implementation work as effectively complete", () => {
+    const content = reconcileTerminalCompletionStateContent({
+      content: "Implemented the core changes and everything should be done now.",
+      completionState: "blocked",
+      stopReason: "validation_error",
+      stopReasonDetail: "Verification artifacts are still missing",
+      completionProgress: {
+        completionState: "blocked",
+        stopReason: "validation_error",
+        stopReasonDetail: "Verification artifacts are still missing",
+        requiredRequirements: ["workflow_verifier_pass"],
+        satisfiedRequirements: [],
+        remainingRequirements: ["workflow_verifier_pass"],
+        reusableEvidence: [
+          {
+            requirement: "build_verification",
+            summary: "npm test",
+            observedAt: 12,
+          },
+        ],
+        updatedAt: 12,
+      },
+      toolCalls: [
+        {
+          name: "system.writeFile",
+          args: { path: "/workspace/src/main.c" },
+          result: JSON.stringify({ ok: true }),
+          isError: false,
+          durationMs: 7,
+        },
+      ],
+    });
+
+    expect(content).toContain("Verification artifacts are still missing");
+    expect(content).toContain("Workflow state: blocked");
+    expect(content).toContain("Still required before completion: workflow_verifier_pass");
+    expect(content).toContain(
+      "Do not present the work as complete; address the blocking condition or report it explicitly.",
+    );
   });
 
   it("reconciles verified file workflow output when final synthesis mangles the absolute path", () => {
@@ -495,6 +568,28 @@ describe("chat-executor-text", () => {
     expect(content).toBe("TOKEN=IVORY-CIRCUIT-92");
   });
 
+  it("does not replay delegated cwd claims as authoritative fallback summaries", () => {
+    const content = summarizeToolCalls([
+      {
+        name: "execute_with_agent",
+        args: {
+          task: "What is the current working directory in the child agent?",
+        },
+        result: JSON.stringify({
+          status: "completed",
+          success: true,
+          output: "Subagent cwd: /",
+          subagentSessionId: "subagent:cwd",
+          toolCalls: [],
+        }),
+        isError: false,
+        durationMs: 12,
+      },
+    ]);
+
+    expect(content).toBe("Completed execute_with_agent");
+  });
+
   it("propagates delegated child output from generateFallbackContent", () => {
     const content = generateFallbackContent([
       {
@@ -515,6 +610,63 @@ describe("chat-executor-text", () => {
     ]);
 
     expect(content).toBe("TOKEN=IVORY-CIRCUIT-92");
+  });
+
+  it("suppresses delegated cwd echoes from the authoritative runtime tool ledger preview", () => {
+    const message = buildToolExecutionGroundingMessage({
+      toolCalls: [
+        {
+          name: "execute_with_agent",
+          args: {
+            task: "Run pwd in the child agent and report it.",
+          },
+          result: JSON.stringify({
+            status: "completed",
+            success: true,
+            output: "Subagent cwd: /",
+            subagentSessionId: "subagent:cwd",
+            toolCalls: [],
+          }),
+          isError: false,
+          durationMs: 17,
+        },
+      ],
+    });
+
+    expect(String(message?.content)).toContain(
+      "[delegated output suppressed: untrusted cwd/workspace-root claim]",
+    );
+    expect(String(message?.content)).not.toContain("Subagent cwd: /");
+  });
+
+  it("rewrites rejected delegated scope failures before replaying them to the model", () => {
+    const prepared = prepareToolResultForPrompt(
+      JSON.stringify({
+        success: false,
+        error:
+          'Requested delegated workspace root "/" is outside the trusted parent workspace root "/tmp/project".',
+        issues: [{ code: "workspace_root_outside_parent_workspace" }],
+        delegatedScopeTrust: "rejected_invalid_scope",
+      }),
+    );
+
+    expect(prepared.text).toContain("Delegated scope was rejected by the runtime");
+    expect(prepared.text).not.toContain('workspace root "/"');
+    expect(prepared.text).not.toContain('"issues"');
+  });
+
+  it("omits assistant delegated cwd summaries from replay history", () => {
+    const normalized = normalizeHistory([
+      {
+        role: "assistant",
+        content: "Subagent cwd: /",
+      },
+    ]);
+
+    expect(String(normalized[0]?.content)).toContain(
+      "[assistant summary omitted: delegated cwd/workspace-root claim not replayed]",
+    );
+    expect(String(normalized[0]?.content)).not.toContain("Subagent cwd: /");
   });
 
   it("replaces low-information partial timeout completions with a failure fallback", () => {

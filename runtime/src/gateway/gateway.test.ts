@@ -1496,9 +1496,10 @@ describe("config loading", () => {
         llm: {
           provider: "grok",
           apiKey: "test",
+          maxToolRounds: 2_048,
           plannerEnabled: true,
-          plannerMaxTokens: 512,
-          toolBudgetPerRequest: 32,
+          plannerMaxTokens: 4_096,
+          toolBudgetPerRequest: 2_048,
           maxModelRecallsPerRequest: 12,
           maxFailureBudgetPerRequest: 6,
           toolCallTimeoutMs: 120_000,
@@ -1532,6 +1533,7 @@ describe("config loading", () => {
         llm: {
           provider: "grok",
           apiKey: "test",
+          maxToolRounds: 2_049,
           plannerEnabled: "yes" as unknown as boolean,
           plannerMaxTokens: 8,
           toolBudgetPerRequest: 0,
@@ -1560,12 +1562,15 @@ describe("config loading", () => {
     );
 
     expect(result.valid).toBe(false);
+    expect(result.errors).toContain(
+      "llm.maxToolRounds must be an integer between 1 and 2048",
+    );
     expect(result.errors).toContain("llm.plannerEnabled must be a boolean");
     expect(result.errors).toContain(
-      "llm.plannerMaxTokens must be an integer between 16 and 8192",
+      "llm.plannerMaxTokens must be an integer between 16 and 65536",
     );
     expect(result.errors).toContain(
-      "llm.toolBudgetPerRequest must be an integer between 1 and 256",
+      "llm.toolBudgetPerRequest must be an integer between 1 and 8192",
     );
     expect(result.errors).toContain(
       "llm.maxModelRecallsPerRequest must be an integer between 0 and 128",

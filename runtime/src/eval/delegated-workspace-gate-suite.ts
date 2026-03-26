@@ -394,8 +394,6 @@ async function runDegradedProviderRetryBrokenScopeScenario(): Promise<PipelineDe
   const completionState = resolveWorkflowCompletionState({
     stopReason: "completed",
     toolCalls: [],
-    plannerUsed: true,
-    deterministicStepsExecuted: 1,
     verificationContract,
     verifier: {
       performed: false,

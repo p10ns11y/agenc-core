@@ -51,13 +51,17 @@ import {
   buildExplicitSubagentOrchestrationFailureMessage,
   extractRecoverablePlannerParseDiagnostics,
   isHighRiskSubagentPlan,
+  plannerRequestNeedsPlanArtifactExecution,
 } from "./chat-executor-planner.js";
 import { normalizePlannerResponse } from "./chat-executor-planner-normalization.js";
 import {
   executePlannerPipelineWithVerifierLoop,
   runSubagentVerifierRound,
 } from "./chat-executor-planner-verifier-loop.js";
-import { buildPlannerVerifierAdmission } from "./chat-executor-verifier.js";
+import {
+  buildPlannerVerifierAdmission,
+  buildPlannerWorkflowAdmission,
+} from "./chat-executor-verifier.js";
 import {
   deriveDelegationContextClusterId,
   type DelegationBanditPolicyTuner,
@@ -162,8 +166,11 @@ function resolvePlannerWorkspaceRoot(
   ctx: ExecutionContext,
   config: PlannerExecutionConfig,
 ): string | undefined {
-  if (typeof ctx.message.metadata?.workspaceRoot === "string") {
-    return ctx.message.metadata.workspaceRoot;
+  if (
+    typeof ctx.runtimeWorkspaceRoot === "string" &&
+    ctx.runtimeWorkspaceRoot.trim().length > 0
+  ) {
+    return ctx.runtimeWorkspaceRoot.trim();
   }
   const hostWorkspaceRoot = config.resolveHostWorkspaceRoot?.();
   return typeof hostWorkspaceRoot === "string" &&
@@ -174,8 +181,9 @@ function resolvePlannerWorkspaceRoot(
 
 function shouldBlockPlannerImplementationFallback(
   subagentSteps: readonly PlannerSubAgentTaskStepIntent[],
+  deterministicSteps: readonly PlannerDeterministicToolStepIntent[],
 ): boolean {
-  return subagentSteps.some((step) => {
+  const subagentImplementationStepDetected = subagentSteps.some((step) => {
     const executionContext = step.executionContext;
     const artifactPaths = [
       ...(executionContext?.targetArtifacts ?? []),
@@ -231,6 +239,74 @@ function shouldBlockPlannerImplementationFallback(
       Boolean(executionContext?.completionContract)
     );
   });
+  if (subagentImplementationStepDetected) {
+    return true;
+  }
+
+  return deterministicSteps.some((step) => {
+    if (step.tool !== "system.bash" && step.tool !== "desktop.bash") {
+      return false;
+    }
+    const command =
+      typeof step.args.command === "string"
+        ? step.args.command
+        : "";
+    const argv = Array.isArray(step.args.args)
+      ? step.args.args.filter((value): value is string => typeof value === "string")
+      : [];
+    const joined = [command, ...argv].join(" ").trim();
+    return /\b(?:build|compile|typecheck|lint|test|install|implement|scaffold|write|edit|create|fix|refactor|migrate)\b/i.test(
+      joined,
+    );
+  });
+}
+
+function buildPlannerImplementationFallbackBlockedDetail(
+  reason: string,
+): string {
+  return (
+    "Planner produced an implementation-scoped delegated plan, " +
+    `but runtime delegation admission rejected it (${reason}). ` +
+    "Inline legacy fallback is disabled for this task class; re-plan the work with a single-owner execution contract or provide an explicit workflow verification contract."
+  );
+}
+
+function canRefinePlannerDelegationVeto(reason: string): boolean {
+  switch (reason) {
+    case "shared_artifact_writer_inline":
+    case "fanout_exceeded":
+    case "depth_exceeded":
+    case "missing_execution_envelope":
+    case "parallel_gain_insufficient":
+    case "dependency_coupling_high":
+    case "tool_overlap_high":
+    case "retry_cost_high":
+    case "negative_economics":
+    case "no_safe_delegation_shape":
+    case "score_below_threshold":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function buildPlannerDelegationVetoRefinementHint(reason: string): string {
+  if (reason === "shared_artifact_writer_inline") {
+    return (
+      "The previous plan gave multiple delegated steps mutable or verification authority over the same workspace root. " +
+      "Re-emit a single-owner execution contract: one mutable implementation owner for the repo root, optional bounded read-only grounding before it, and deterministic verification/build/test steps after it unless a later delegated step owns disjoint artifacts."
+    );
+  }
+  if (reason === "score_below_threshold") {
+    return (
+      "The previous delegated plan was not strong enough to justify multiple child owners. " +
+      "Re-emit a smaller plan with one implementation owner and deterministic verification around it."
+    );
+  }
+  return (
+    `Runtime delegation admission rejected the previous implementation plan (${reason}). ` +
+    "Re-emit a valid single-owner execution contract with explicit artifact ownership and deterministic verification around the implementation owner."
+  );
 }
 
 // ============================================================================
@@ -1075,15 +1151,57 @@ export async function executePlannerPath(
       ctx.messages,
       ctx.messageSections,
       ctx.stateful?.artifactContext?.artifactRefs,
-      typeof ctx.message.metadata?.workspaceRoot === "string"
-        ? ctx.message.metadata.workspaceRoot
-        : undefined,
+      plannerWorkspaceRoot,
       ctx.expandedRoutedToolNames.length > 0
         ? ctx.expandedRoutedToolNames
         : ctx.activeRoutedToolNames.length > 0
         ? ctx.activeRoutedToolNames
         : (config.allowedTools ? [...config.allowedTools] : undefined),
     );
+    const plannerImplementationFallbackBlocked =
+      subagentSteps.length > 0 &&
+      shouldBlockPlannerImplementationFallback(
+        subagentSteps,
+        deterministicSteps,
+      );
+    ctx.plannerImplementationFallbackBlocked =
+      plannerImplementationFallbackBlocked;
+    const planArtifactExecutionRequest = plannerRequestNeedsPlanArtifactExecution(
+      ctx.messageText,
+    );
+    const delegationVetoReason = delegationDecision?.reason;
+    const shouldRefineDelegationVeto =
+      planArtifactExecutionRequest &&
+      subagentSteps.length > 0 &&
+      plannerImplementationFallbackBlocked &&
+      delegationDecision?.shouldDelegate === false &&
+      plannerAttempt < maxPlannerAttempts &&
+      typeof delegationVetoReason === "string" &&
+      canRefinePlannerDelegationVeto(delegationVetoReason);
+    if (shouldRefineDelegationVeto && delegationVetoReason) {
+      refinementHint = buildPlannerDelegationVetoRefinementHint(
+        delegationVetoReason,
+      );
+      ctx.plannerSummaryState.diagnostics.push({
+        category: "policy",
+        code: "planner_delegation_veto_retry",
+        message:
+          "Runtime delegation admission rejected the previous implementation plan; requesting a refined single-owner plan",
+        details: {
+          attempt: plannerAttempt,
+          nextAttempt: plannerAttempt + 1,
+          reason: delegationVetoReason,
+        },
+      });
+      callbacks.emitPlannerTrace(ctx, "planner_refinement_requested", {
+        attempt: plannerAttempt,
+        nextAttempt: plannerAttempt + 1,
+        reason: "planner_delegation_veto_retry",
+        delegationDecision,
+        plannerImplementationFallbackBlocked: true,
+      });
+      continue;
+    }
     const hasExecutablePlannerSteps =
       (
         deterministicSteps.length > 0 &&
@@ -1154,11 +1272,50 @@ export async function executePlannerPath(
         delegatedSteps: subagentSteps.map((step) => step.name),
       });
 
+      const plannerWorkflowAdmission = buildPlannerWorkflowAdmission({
+        subagentSteps,
+        deterministicSteps,
+        workspaceRoot: plannerExecutionContext.workspaceRoot,
+        verificationContract: ctx.requiredToolEvidence?.verificationContract,
+        completionContract: ctx.requiredToolEvidence?.completionContract,
+        includeSubagentOutputVerification:
+          config.subagentVerifierConfig.enabled ||
+          config.subagentVerifierConfig.force,
+      });
+      ctx.plannerWorkflowTaskClassification =
+        plannerWorkflowAdmission.taskClassification;
+      ctx.plannerVerificationContract =
+        plannerWorkflowAdmission.verificationContract;
+      ctx.plannerCompletionContract =
+        plannerWorkflowAdmission.completionContract;
+      if (plannerWorkflowAdmission.taskClassification === "invalid") {
+        callbacks.setStopReason(
+          ctx,
+          "validation_error",
+          plannerWorkflowAdmission.invalidReason ??
+            "Planner could not materialize a runtime-owned workflow contract for implementation-class work.",
+        );
+        ctx.finalContent =
+          plannerWorkflowAdmission.invalidReason ??
+          "Planner could not materialize a runtime-owned workflow contract for implementation-class work.";
+        callbacks.emitPlannerTrace(ctx, "planner_path_finished", {
+          plannerCalls: plannerAttempt,
+          routeReason: ctx.plannerSummaryState.routeReason,
+          stopReason: ctx.stopReason,
+          stopReasonDetail: ctx.stopReasonDetail,
+          diagnostics: ctx.plannerSummaryState.diagnostics,
+          handled: true,
+          taskClassification: plannerWorkflowAdmission.taskClassification,
+        });
+        ctx.plannerHandled = true;
+        return;
+      }
       const plannerVerifierAdmission = buildPlannerVerifierAdmission({
         subagentSteps,
         deterministicSteps,
-        verificationContract: ctx.requiredToolEvidence?.verificationContract,
-        completionContract: ctx.requiredToolEvidence?.completionContract,
+        workspaceRoot: plannerExecutionContext.workspaceRoot,
+        verificationContract: plannerWorkflowAdmission.verificationContract,
+        completionContract: plannerWorkflowAdmission.completionContract,
         includeSubagentOutputVerification:
           config.subagentVerifierConfig.enabled ||
           config.subagentVerifierConfig.force,
@@ -1664,17 +1821,16 @@ export async function executePlannerPath(
     if (
       subagentSteps.length > 0 &&
       delegationDecision?.shouldDelegate === false &&
-      shouldBlockPlannerImplementationFallback(subagentSteps)
+      plannerImplementationFallbackBlocked
     ) {
       callbacks.setStopReason(
         ctx,
         "validation_error",
         "Planner produced an implementation-scoped delegated plan, but runtime delegation admission rejected it. Inline legacy fallback is disabled for this task class.",
       );
-      ctx.finalContent =
-        `Planner produced an implementation-scoped delegated plan, ` +
-        `but runtime delegation admission rejected it (${delegationDecision.reason}). ` +
-        `Inline legacy fallback is disabled for this task class; re-plan the work with a single-owner execution contract or provide an explicit workflow verification contract.`;
+      ctx.finalContent = buildPlannerImplementationFallbackBlockedDetail(
+        delegationDecision.reason,
+      );
       callbacks.emitPlannerTrace(ctx, "planner_path_finished", {
         plannerCalls: plannerAttempt,
         routeReason: ctx.plannerSummaryState.routeReason,
@@ -1686,13 +1842,24 @@ export async function executePlannerPath(
       ctx.plannerHandled = true;
       return;
     }
+    if (plannerImplementationFallbackBlocked) {
+      callbacks.setStopReason(
+        ctx,
+        "validation_error",
+        "Planner produced an implementation-scoped delegated plan, but runtime delegation admission rejected it. Inline legacy fallback is disabled for this task class.",
+      );
+      ctx.finalContent = buildPlannerImplementationFallbackBlockedDetail(
+        delegationDecision?.reason ?? "delegation_veto",
+      );
+      ctx.plannerHandled = true;
+    }
     callbacks.emitPlannerTrace(ctx, "planner_path_finished", {
       plannerCalls: plannerAttempt,
       routeReason: ctx.plannerSummaryState.routeReason,
       stopReason: ctx.stopReason,
       stopReasonDetail: ctx.stopReasonDetail,
       diagnostics: ctx.plannerSummaryState.diagnostics,
-      handled: false,
+      handled: plannerImplementationFallbackBlocked ? true : false,
     });
     return;
   }

@@ -12,6 +12,14 @@ import {
 import type { ImplementationCompletionContract } from "../workflow/completion-contract.js";
 import { migrateExecutionEnvelope } from "../workflow/migrations.js";
 import { buildCanonicalDelegatedFilesystemScope } from "../workflow/delegated-filesystem-scope.js";
+import {
+  isConcreteExecutableEnvelopeRoot,
+  isPathWithinAnyRoot,
+  isPathWithinRoot,
+  normalizeArtifactPaths,
+  normalizeEnvelopeRoots,
+  normalizeWorkspaceRoot,
+} from "../workflow/path-normalization.js";
 
 export type DelegationExecutionContext = ExecutionEnvelope;
 
@@ -143,10 +151,12 @@ export function buildDelegationExecutionContext(params: {
 }
 
 /**
- * Temporary ingestion-only compatibility adapter for legacy planner/tool
- * payloads that still express the workspace root through `context_requirements`.
- * Once converted, downstream runtime code must consume only the structured
- * execution envelope.
+ * Reader-only compatibility adapter for historical planner/eval payloads that
+ * still express the workspace root through `context_requirements`.
+ *
+ * This helper is intentionally off the live direct adapter path. It exists only
+ * for bounded migration/eval readers and must be removed once those readers no
+ * longer need legacy fixture coverage.
  */
 export function buildLegacyDelegationExecutionContext(params: {
   readonly contextRequirements?: readonly (string | undefined | null)[];
@@ -236,4 +246,314 @@ export function canonicalizeDelegationExecutionContext(
     resumePolicy: context.resumePolicy,
     approvalProfile: context.approvalProfile,
   });
+}
+
+export type DelegatedExecutionEnvelopeDerivationSource =
+  | "direct_live_path"
+  | "internal_planner_path";
+
+export type DelegatedExecutionEnvelopeDerivationIssueCode =
+  | "missing_parent_workspace_authority"
+  | "workspace_root_outside_parent_workspace"
+  | "read_root_outside_parent_workspace"
+  | "write_root_outside_parent_workspace"
+  | "input_artifact_outside_parent_workspace"
+  | "required_source_outside_parent_workspace"
+  | "target_outside_parent_workspace";
+
+export interface DelegatedExecutionEnvelopeDerivationIssue {
+  readonly code: DelegatedExecutionEnvelopeDerivationIssueCode;
+  readonly message: string;
+  readonly path?: string;
+}
+
+export type DelegatedExecutionEnvelopeDerivationResult =
+  | {
+      readonly ok: true;
+      readonly executionContext?: DelegationExecutionContext;
+      readonly workingDirectory?: string;
+    }
+  | {
+      readonly ok: false;
+      readonly error: string;
+      readonly issues: readonly DelegatedExecutionEnvelopeDerivationIssue[];
+    };
+
+function buildDerivationFailure(
+  issue: DelegatedExecutionEnvelopeDerivationIssue,
+): DelegatedExecutionEnvelopeDerivationResult {
+  return {
+    ok: false,
+    error: issue.message,
+    issues: [issue],
+  };
+}
+
+function buildMissingParentWorkspaceAuthorityFailure(
+  source: DelegatedExecutionEnvelopeDerivationSource,
+): DelegatedExecutionEnvelopeDerivationResult {
+  return buildDerivationFailure({
+    code: "missing_parent_workspace_authority",
+    message:
+      source === "internal_planner_path"
+        ? "Delegated local-file work must have a canonical workspace root before child execution."
+        : "Direct execute_with_agent local-file work requires a trusted parent workspace root before child execution.",
+  });
+}
+
+function normalizeParentRoots(
+  roots: readonly (string | undefined | null)[] | undefined,
+  parentWorkspaceRoot: string,
+): readonly string[] {
+  const normalized = normalizeEnvelopeRoots(roots ?? [], parentWorkspaceRoot);
+  const filtered = normalized.filter((path) =>
+    isPathWithinRoot(path, parentWorkspaceRoot)
+  );
+  return filtered.length > 0 ? filtered : [parentWorkspaceRoot];
+}
+
+function normalizeRequestedReadRoots(
+  roots: readonly string[] | undefined,
+  childWorkspaceRoot: string,
+): readonly string[] | undefined {
+  if (!roots || roots.length === 0) return undefined;
+  return normalizeEnvelopeRoots(roots, childWorkspaceRoot);
+}
+
+function normalizeRequestedArtifacts(
+  paths: readonly string[] | undefined,
+  childWorkspaceRoot: string,
+): readonly string[] | undefined {
+  if (!paths || paths.length === 0) return undefined;
+  return normalizeArtifactPaths(paths, childWorkspaceRoot);
+}
+
+export function deriveDelegatedExecutionEnvelopeFromParent(params: {
+  readonly parentWorkspaceRoot?: string | null;
+  readonly parentAllowedReadRoots?: readonly (string | undefined | null)[];
+  readonly parentAllowedWriteRoots?: readonly (string | undefined | null)[];
+  readonly requestedExecutionContext?: DelegationExecutionContext;
+  readonly requiresStructuredExecutionContext: boolean;
+  readonly source: DelegatedExecutionEnvelopeDerivationSource;
+}): DelegatedExecutionEnvelopeDerivationResult {
+  if (!params.requiresStructuredExecutionContext) {
+    return { ok: true };
+  }
+
+  const rawRequestedWorkspaceRoot =
+    params.requestedExecutionContext?.workspaceRoot;
+  if (
+    typeof rawRequestedWorkspaceRoot === "string" &&
+    rawRequestedWorkspaceRoot.trim().length > 0 &&
+    !isConcreteExecutableEnvelopeRoot(rawRequestedWorkspaceRoot)
+  ) {
+    return buildMissingParentWorkspaceAuthorityFailure(params.source);
+  }
+
+  const runtimeOwnedPlannerWorkspaceRoot =
+    params.source === "internal_planner_path" &&
+      params.requestedExecutionContext
+      ? normalizeWorkspaceRoot(rawRequestedWorkspaceRoot)
+      : undefined;
+  const parentWorkspaceRoot = normalizeWorkspaceRoot(
+    params.parentWorkspaceRoot ??
+      (runtimeOwnedPlannerWorkspaceRoot &&
+          isConcreteExecutableEnvelopeRoot(runtimeOwnedPlannerWorkspaceRoot)
+        ? runtimeOwnedPlannerWorkspaceRoot
+        : undefined),
+  );
+  if (!parentWorkspaceRoot) {
+    return buildMissingParentWorkspaceAuthorityFailure(params.source);
+  }
+
+  const parentAllowedReadRoots = normalizeParentRoots(
+    params.parentAllowedReadRoots,
+    parentWorkspaceRoot,
+  );
+  const parentAllowedWriteRoots = normalizeParentRoots(
+    params.parentAllowedWriteRoots,
+    parentWorkspaceRoot,
+  );
+
+  const requestedContext = params.requestedExecutionContext
+    ? canonicalizeDelegationExecutionContext(params.requestedExecutionContext, {
+        inheritedWorkspaceRoot: parentWorkspaceRoot,
+        hostWorkspaceRoot: parentWorkspaceRoot,
+      })
+    : undefined;
+
+  const requestedWorkspaceRoot = normalizeWorkspaceRoot(
+    requestedContext?.workspaceRoot,
+  );
+  if (
+    requestedWorkspaceRoot &&
+    !isPathWithinRoot(requestedWorkspaceRoot, parentWorkspaceRoot)
+  ) {
+    return buildDerivationFailure({
+      code: "workspace_root_outside_parent_workspace",
+      message:
+        `Requested delegated workspace root "${requestedWorkspaceRoot}" is outside the trusted parent workspace root "${parentWorkspaceRoot}".`,
+      path: requestedWorkspaceRoot,
+    });
+  }
+
+  const childWorkspaceRoot = requestedWorkspaceRoot ?? parentWorkspaceRoot;
+
+  const requestedReadRoots = normalizeRequestedReadRoots(
+    requestedContext?.allowedReadRoots,
+    childWorkspaceRoot,
+  );
+  if (
+    requestedReadRoots?.some(
+      (path) =>
+        !isPathWithinRoot(path, childWorkspaceRoot) ||
+        !isPathWithinAnyRoot(path, parentAllowedReadRoots),
+    )
+  ) {
+    const offendingPath = requestedReadRoots.find(
+      (path) =>
+        !isPathWithinRoot(path, childWorkspaceRoot) ||
+        !isPathWithinAnyRoot(path, parentAllowedReadRoots),
+    );
+    return buildDerivationFailure({
+      code: "read_root_outside_parent_workspace",
+      message:
+        `Requested delegated read root "${offendingPath}" is outside the trusted parent workspace authority.`,
+      path: offendingPath,
+    });
+  }
+
+  const requestedWriteRoots = normalizeRequestedReadRoots(
+    requestedContext?.allowedWriteRoots,
+    childWorkspaceRoot,
+  );
+  if (
+    requestedWriteRoots?.some(
+      (path) =>
+        !isPathWithinRoot(path, childWorkspaceRoot) ||
+        !isPathWithinAnyRoot(path, parentAllowedWriteRoots),
+    )
+  ) {
+    const offendingPath = requestedWriteRoots.find(
+      (path) =>
+        !isPathWithinRoot(path, childWorkspaceRoot) ||
+        !isPathWithinAnyRoot(path, parentAllowedWriteRoots),
+    );
+    return buildDerivationFailure({
+      code: "write_root_outside_parent_workspace",
+      message:
+        `Requested delegated write root "${offendingPath}" is outside the trusted parent workspace authority.`,
+      path: offendingPath,
+    });
+  }
+
+  const inputArtifacts = normalizeRequestedArtifacts(
+    requestedContext?.inputArtifacts,
+    childWorkspaceRoot,
+  );
+  if (
+    inputArtifacts?.some(
+      (path) =>
+        !isPathWithinRoot(path, childWorkspaceRoot) ||
+        !isPathWithinAnyRoot(path, parentAllowedReadRoots),
+    )
+  ) {
+    const offendingPath = inputArtifacts.find(
+      (path) =>
+        !isPathWithinRoot(path, childWorkspaceRoot) ||
+        !isPathWithinAnyRoot(path, parentAllowedReadRoots),
+    );
+    return buildDerivationFailure({
+      code: "input_artifact_outside_parent_workspace",
+      message:
+        `Requested delegated input artifact "${offendingPath}" is outside the trusted parent workspace authority.`,
+      path: offendingPath,
+    });
+  }
+
+  const requiredSourceArtifacts = normalizeRequestedArtifacts(
+    requestedContext?.requiredSourceArtifacts ?? requestedContext?.inputArtifacts,
+    childWorkspaceRoot,
+  );
+  if (
+    requiredSourceArtifacts?.some(
+      (path) =>
+        !isPathWithinRoot(path, childWorkspaceRoot) ||
+        !isPathWithinAnyRoot(path, parentAllowedReadRoots),
+    )
+  ) {
+    const offendingPath = requiredSourceArtifacts.find(
+      (path) =>
+        !isPathWithinRoot(path, childWorkspaceRoot) ||
+        !isPathWithinAnyRoot(path, parentAllowedReadRoots),
+    );
+    return buildDerivationFailure({
+      code: "required_source_outside_parent_workspace",
+      message:
+        `Requested delegated required source artifact "${offendingPath}" is outside the trusted parent workspace authority.`,
+      path: offendingPath,
+    });
+  }
+
+  const targetArtifacts = normalizeRequestedArtifacts(
+    requestedContext?.targetArtifacts,
+    childWorkspaceRoot,
+  );
+  if (
+    targetArtifacts?.some(
+      (path) =>
+        !isPathWithinRoot(path, childWorkspaceRoot) ||
+        !isPathWithinAnyRoot(path, parentAllowedWriteRoots),
+    )
+  ) {
+    const offendingPath = targetArtifacts.find(
+      (path) =>
+        !isPathWithinRoot(path, childWorkspaceRoot) ||
+        !isPathWithinAnyRoot(path, parentAllowedWriteRoots),
+    );
+    return buildDerivationFailure({
+      code: "target_outside_parent_workspace",
+      message:
+        `Requested delegated target artifact "${offendingPath}" is outside the trusted parent workspace authority.`,
+      path: offendingPath,
+    });
+  }
+
+  const defaultAllowedReadRoots = parentAllowedReadRoots.filter((path) =>
+    isPathWithinRoot(path, childWorkspaceRoot)
+  );
+  const defaultAllowedWriteRoots = parentAllowedWriteRoots.filter((path) =>
+    isPathWithinRoot(path, childWorkspaceRoot)
+  );
+
+  const executionContext = buildDelegationExecutionContext({
+    workspaceRoot: childWorkspaceRoot,
+    allowedReadRoots:
+      requestedReadRoots ??
+      (defaultAllowedReadRoots.length > 0
+        ? defaultAllowedReadRoots
+        : [childWorkspaceRoot]),
+    allowedWriteRoots:
+      requestedWriteRoots ??
+      (defaultAllowedWriteRoots.length > 0
+        ? defaultAllowedWriteRoots
+        : [childWorkspaceRoot]),
+    allowedTools: requestedContext?.allowedTools,
+    inputArtifacts,
+    requiredSourceArtifacts,
+    targetArtifacts,
+    effectClass: requestedContext?.effectClass,
+    verificationMode: requestedContext?.verificationMode,
+    stepKind: requestedContext?.stepKind,
+    completionContract: requestedContext?.completionContract,
+    fallbackPolicy: requestedContext?.fallbackPolicy,
+    resumePolicy: requestedContext?.resumePolicy,
+    approvalProfile: requestedContext?.approvalProfile,
+  });
+
+  return {
+    ok: true,
+    executionContext,
+    workingDirectory: executionContext?.workspaceRoot?.trim() || undefined,
+  };
 }

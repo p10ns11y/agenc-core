@@ -2719,16 +2719,19 @@ export function createSessionToolHandler(config: SessionToolHandlerConfig): Tool
       }
       executionArgs = injectionResult.args;
     }
-    executionArgs = applySessionAllowedRoots(toolName, executionArgs,
-      deriveSessionAllowedPaths({
-        explicitAdditionalAllowedPaths: [
-          ...(workspaceContext.additionalAllowedPaths ?? []),
-          ...(subAgentExecutionContext?.allowedReadRoots ?? []),
-          ...(subAgentExecutionContext?.allowedWriteRoots ?? []),
-        ],
-        scopedFilesystemRoot: effectiveScopedFilesystemRoot,
-        defaultWorkingDirectory: effectiveDefaultWorkingDirectory,
-      }),
+    const delegatedParentAllowedRoots = deriveSessionAllowedPaths({
+      explicitAdditionalAllowedPaths: [
+        ...(workspaceContext.additionalAllowedPaths ?? []),
+        ...(subAgentExecutionContext?.allowedReadRoots ?? []),
+        ...(subAgentExecutionContext?.allowedWriteRoots ?? []),
+      ],
+      scopedFilesystemRoot: effectiveScopedFilesystemRoot,
+      defaultWorkingDirectory: effectiveDefaultWorkingDirectory,
+    });
+    executionArgs = applySessionAllowedRoots(
+      toolName,
+      executionArgs,
+      delegatedParentAllowedRoots,
     );
 
     const subAgentEnvelopeError = isSubAgentSession
@@ -2762,6 +2765,8 @@ export function createSessionToolHandler(config: SessionToolHandlerConfig): Tool
           verifier,
           availableToolNames,
           defaultWorkingDirectory: effectiveDefaultWorkingDirectory,
+          parentAllowedReadRoots: delegatedParentAllowedRoots,
+          parentAllowedWriteRoots: delegatedParentAllowedRoots,
           delegationThreshold: policyEngine?.snapshot().spawnDecisionThreshold,
           unsafeBenchmarkMode,
         })

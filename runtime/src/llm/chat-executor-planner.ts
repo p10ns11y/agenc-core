@@ -341,6 +341,17 @@ export function assessPlannerDecision(
     };
   }
 
+  if (plannerRequestNeedsPlanArtifactExecution(messageText)) {
+    return {
+      score: Math.max(score, 4),
+      shouldPlan: true,
+      reason:
+        reasons.length > 0
+          ? `${reasons.join("+")}+plan_artifact_execution_request`
+          : "plan_artifact_execution_request",
+    };
+  }
+
   const directFastPath =
     score < 3 ||
     signals.normalized.trim().length < 20 ||
@@ -589,6 +600,8 @@ export function buildPlannerMessages(
     extractPlannerVerificationRequirements(messageText);
   const verificationCommandRequirements =
     extractPlannerVerificationCommandRequirements(messageText);
+  const planArtifactExecutionRequest =
+    plannerRequestNeedsPlanArtifactExecution(messageText);
   const hostToolingHint = buildPlannerHostToolingHint(
     messageText,
     history,
@@ -757,6 +770,18 @@ export function buildPlannerMessages(
     });
   }
 
+  if (planArtifactExecutionRequest) {
+    messages.push({
+      role: "system",
+      content:
+        "This is a plan-artifact execution request over a real workspace. " +
+        "Use exactly one mutable implementation owner for the repo root. " +
+        "If you need prior grounding, keep it read-only and bounded to explicit source or analysis artifacts. " +
+        "Do not emit multiple mutable, validation, or QA subagent_task steps that all re-own the same workspace root. " +
+        "Build, test, and verification around the implementation owner should be deterministic_tool steps unless a later delegated step owns disjoint artifacts.",
+    });
+  }
+
   if (typeof hostToolingHint === "string" && hostToolingHint.length > 0) {
     messages.push({
       role: "system",
@@ -830,6 +855,12 @@ const PLANNER_PLAN_ARTIFACT_REQUEST_RE =
   /\b(?:write|create|draft|generate|produce|make)\b[\s\S]{0,120}\b(?:todo(?:\.md)?|implementation plan|project plan|plan doc(?:ument)?|roadmap|checklist|spec(?:ification)?)\b/i;
 const PLANNER_PLAN_ARTIFACT_FILE_RE =
   /\b(?:todo(?:\.md)?|plan\.(?:md|txt|rst)|implementation[-_ ]plan(?:\.md)?|project[-_ ]plan(?:\.md)?|roadmap(?:\.md)?|checklist(?:\.md)?|spec(?:ification)?(?:\.md)?)\b/i;
+const PLANNER_PLAN_ARTIFACT_SOURCE_CUE_RE =
+  /\b(?:read|review|inspect|use|follow|based on|source of truth|go through)\b/i;
+const PLANNER_PLAN_ARTIFACT_EXECUTION_CUE_RE =
+  /\b(?:implement|execute|complete|finish|carry\s+out|apply|fix|repair|refactor|ship)\b/i;
+const PLANNER_PLAN_ARTIFACT_PHASE_CUE_RE =
+  /\b(?:phase|step|task|item)s?\b/i;
 const REQUEST_VERIFICATION_DIRECTIVE_RE =
   /\b(?:verify|verification|validated?|before\s+finish(?:ing)?|before\s+returning|before\s+completion|browser-grounded checks?)\b/i;
 const REQUEST_INSTALL_VERIFICATION_RE =
@@ -3085,6 +3116,9 @@ export function validatePlannerStepContracts(
   if (typeof messageText === "string" && plannerRequestNeedsGroundedPlanArtifact(messageText)) {
     diagnostics.push(...validatePlannerPlanArtifactSteps(plannerPlan));
   }
+  if (typeof messageText === "string" && plannerRequestNeedsPlanArtifactExecution(messageText)) {
+    diagnostics.push(...validatePlannerPlanArtifactExecutionOwnership(plannerPlan));
+  }
 
   for (const step of plannerPlan.steps) {
     if (step.stepType === "deterministic_tool") {
@@ -3251,6 +3285,27 @@ function plannerRequestNeedsGroundedPlanArtifact(messageText: string): boolean {
   );
 }
 
+export function plannerRequestNeedsPlanArtifactExecution(messageText: string): boolean {
+  const normalized = messageText.trim();
+  if (normalized.length === 0) {
+    return false;
+  }
+  if (!PLANNER_PLAN_ARTIFACT_FILE_RE.test(normalized)) {
+    return false;
+  }
+  if (!PLANNER_PLAN_ARTIFACT_EXECUTION_CUE_RE.test(normalized)) {
+    return false;
+  }
+  const signals = collectPlannerRequestSignals(normalized, []);
+  return (
+    PLANNER_PLAN_ARTIFACT_SOURCE_CUE_RE.test(normalized) ||
+    PLANNER_PLAN_ARTIFACT_PHASE_CUE_RE.test(normalized) ||
+    signals.hasImplementationScopeCue ||
+    signals.hasMultiStepCue ||
+    signals.longTask
+  );
+}
+
 function isPlannerFileWriteStep(step: PlannerStepIntent): boolean {
   return (
     step.stepType === "deterministic_tool" &&
@@ -3258,22 +3313,125 @@ function isPlannerFileWriteStep(step: PlannerStepIntent): boolean {
   );
 }
 
+function plannerStepHasMutableImplementationAuthority(
+  step: PlannerSubAgentTaskStepIntent,
+): boolean {
+  const executionContext = step.executionContext;
+  const isBoundedGroundingStep =
+    executionContext?.effectClass === "read_only" &&
+    executionContext?.verificationMode === "grounded_read" &&
+    (
+      executionContext?.stepKind === "delegated_research" ||
+      executionContext?.stepKind === "delegated_review"
+    );
+  if (isBoundedGroundingStep) {
+    return false;
+  }
+  const requiredCapabilities = step.requiredToolCapabilities.map((capability) =>
+    capability.trim().toLowerCase(),
+  );
+  if (
+    requiredCapabilities.some((capability) =>
+      capability.includes("write") ||
+      capability.includes("append") ||
+      capability.includes("delete") ||
+      capability.includes("move") ||
+      capability.includes("mkdir") ||
+      capability.includes("text_editor")
+    )
+  ) {
+    return true;
+  }
+  if (
+    requiredCapabilities.some((capability) => capability.includes("bash")) &&
+    /\b(?:build|compile|typecheck|lint|test|install|implement|scaffold|write|edit|create|fix|refactor|migrate)\b/i.test(
+      [
+        step.objective,
+        step.inputContract,
+        ...step.acceptanceCriteria,
+      ].join(" "),
+    )
+  ) {
+    return true;
+  }
+  return (
+    executionContext?.verificationMode === "mutation_required" ||
+    executionContext?.verificationMode === "deterministic_followup" ||
+    executionContext?.stepKind === "delegated_write" ||
+    executionContext?.stepKind === "delegated_scaffold" ||
+    executionContext?.stepKind === "delegated_validation" ||
+    executionContext?.stepKind === "delegated_review" ||
+    executionContext?.effectClass === "filesystem_write" ||
+    executionContext?.effectClass === "filesystem_scaffold" ||
+    executionContext?.effectClass === "shell" ||
+    executionContext?.effectClass === "mixed" ||
+    Boolean(executionContext?.completionContract)
+  );
+}
+
+function validatePlannerPlanArtifactExecutionOwnership(
+  plannerPlan: PlannerPlan,
+): readonly PlannerDiagnostic[] {
+  const diagnostics: PlannerDiagnostic[] = [];
+  const subagentSteps = plannerPlan.steps.filter(
+    (step): step is PlannerSubAgentTaskStepIntent =>
+      step.stepType === "subagent_task",
+  );
+  if (subagentSteps.length === 0) {
+    return diagnostics;
+  }
+
+  const mutableWorkspaceOwners = new Map<string, string[]>();
+  for (const step of subagentSteps) {
+    if (!plannerStepHasMutableImplementationAuthority(step)) {
+      continue;
+    }
+    const workspaceRoot = normalizeWorkspaceRoot(step.executionContext?.workspaceRoot);
+    if (!workspaceRoot) {
+      continue;
+    }
+    const owners = mutableWorkspaceOwners.get(workspaceRoot) ?? [];
+    owners.push(step.name);
+    mutableWorkspaceOwners.set(workspaceRoot, owners);
+  }
+
+  for (const [workspaceRoot, stepNames] of mutableWorkspaceOwners.entries()) {
+    if (stepNames.length <= 1) {
+      continue;
+    }
+    diagnostics.push(
+      createPlannerDiagnostic(
+        "validation",
+        "planner_plan_artifact_single_owner_required",
+        `Planner emitted multiple mutable delegated owners for plan-artifact execution workspace "${workspaceRoot}"`,
+        {
+          workspaceRoot,
+          stepNames: stepNames.join(","),
+        },
+      ),
+    );
+  }
+
+  return diagnostics;
+}
+
 function validatePlannerPlanArtifactSteps(
   plannerPlan: PlannerPlan,
 ): readonly PlannerDiagnostic[] {
+  const diagnostics: PlannerDiagnostic[] = [];
   const writeSteps = plannerPlan.steps.filter(isPlannerFileWriteStep);
   if (writeSteps.length === 0) {
-    return [
+    diagnostics.push(
       createPlannerDiagnostic(
         "validation",
         "planner_plan_artifact_missing_write_step",
         "Planner did not include a final file-write step for the requested planning artifact",
       ),
-    ];
+    );
   }
 
   if (plannerPlan.steps.length === 1 && isPlannerFileWriteStep(plannerPlan.steps[0]!)) {
-    return [
+    diagnostics.push(
       createPlannerDiagnostic(
         "validation",
         "planner_plan_artifact_single_write_collapse",
@@ -3283,7 +3441,7 @@ function validatePlannerPlanArtifactSteps(
           tool: (plannerPlan.steps[0] as PlannerDeterministicToolStepIntent).tool,
         },
       ),
-    ];
+    );
   }
 
   const lastWriteIndex = plannerPlan.steps.reduce((index, step, currentIndex) =>
@@ -3292,7 +3450,7 @@ function validatePlannerPlanArtifactSteps(
     (step, index) => index < lastWriteIndex && !isPlannerFileWriteStep(step),
   );
   if (lastWriteIndex >= 0 && !hasGroundingBeforeWrite) {
-    return [
+    diagnostics.push(
       createPlannerDiagnostic(
         "validation",
         "planner_plan_artifact_needs_grounding_step",
@@ -3301,10 +3459,9 @@ function validatePlannerPlanArtifactSteps(
           finalWriteStep: plannerPlan.steps[lastWriteIndex]!.name,
         },
       ),
-    ];
+    );
   }
-
-  return [];
+  return diagnostics;
 }
 
 export function buildPlannerStepContractRefinementHint(
@@ -3340,6 +3497,18 @@ export function buildPlannerStepContractRefinementHint(
         diagnostic.code === "planner_plan_artifact_needs_grounding_step"
       ) {
         return "for substantial software plan/TODO requests, do not jump straight to writeFile; add at least one grounding or decomposition step before the final artifact write";
+      }
+      if (diagnostic.code === "planner_plan_artifact_single_owner_required") {
+        const workspaceRoot =
+          readDiagnosticDetail(diagnostic, "workspaceRoot") ??
+          "the workspace root";
+        const stepNames =
+          readDiagnosticDetail(diagnostic, "stepNames") ??
+          "the delegated implementation steps";
+        return (
+          `for PLAN.md/TODO execution over ${workspaceRoot}, use exactly one mutable implementation owner; ` +
+          `do not let ${stepNames} all re-own the same workspace. Keep plan analysis bounded, and move build/test/QA into deterministic verification steps unless a later step owns disjoint artifacts`
+        );
       }
       if (diagnostic.code === "planner_plan_artifact_missing_write_step") {
         return "include a final file-write step for the requested planning artifact";

@@ -107,7 +107,7 @@ describe("delegation-tool", () => {
     expect(parsed.value.spawnDecisionScore).toBe(0.42);
   });
 
-  it("parses structured execution envelopes from planner-shaped payloads", () => {
+  it("rejects planner-shaped execution_context payloads on the public path", () => {
     const parsed = parseExecuteWithAgentInput({
       task: "write_agenc_md",
       execution_context: {
@@ -123,13 +123,28 @@ describe("delegation-tool", () => {
       },
     });
 
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.error).toContain('"execution_context"');
+  });
+
+  it("preserves only bounded artifact and verification hints on the public path", () => {
+    const parsed = parseExecuteWithAgentInput({
+      task: "write_agenc_md",
+      executionContext: {
+        requiredSourceArtifacts: ["/tmp/agenc-shell/PLAN.md"],
+        targetArtifacts: ["/tmp/agenc-shell/AGENC.md"],
+        allowedTools: ["system.readFile", "system.writeFile"],
+        effectClass: "filesystem_write",
+        verificationMode: "mutation_required",
+        stepKind: "delegated_write",
+      },
+    });
+
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
     expect(parsed.value.executionContext).toEqual(
       expect.objectContaining({
-        workspaceRoot: "/tmp/agenc-shell",
-        allowedReadRoots: ["/tmp/agenc-shell"],
-        allowedWriteRoots: ["/tmp/agenc-shell"],
         requiredSourceArtifacts: ["/tmp/agenc-shell/PLAN.md"],
         targetArtifacts: ["/tmp/agenc-shell/AGENC.md"],
         allowedTools: ["system.readFile", "system.writeFile"],
@@ -138,6 +153,22 @@ describe("delegation-tool", () => {
         stepKind: "delegated_write",
       }),
     );
+  });
+
+  it("rejects model-authored delegated root authority on the public path", () => {
+    const parsed = parseExecuteWithAgentInput({
+      task: "inspect doc",
+      executionContext: {
+        workspaceRoot: "/tmp/canonical-root",
+        allowedReadRoots: ["/tmp/canonical-root"],
+        allowedWriteRoots: ["/tmp/canonical-root"],
+      },
+    });
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.error).toContain("executionContext.workspaceRoot");
+    expect(parsed.error).toContain("first trusted child root");
   });
 
   it("does not infer a delegated working directory from objective text", () => {
@@ -175,13 +206,10 @@ describe("delegation-tool", () => {
     });
   });
 
-  it("uses only executionContext as runtime working-directory truth", () => {
+  it("uses only runtime-owned executionContext as delegated working-directory truth", () => {
     const parsed = parseExecuteWithAgentInput({
       task: "inspect doc",
       contextRequirements: ["cwd=/tmp/legacy-only"],
-      executionContext: {
-        workspaceRoot: "/tmp/canonical-root",
-      },
     });
 
     expect(parsed.ok).toBe(true);
@@ -189,7 +217,9 @@ describe("delegation-tool", () => {
     expect(
       resolveDelegatedWorkingDirectory({
         task: parsed.value.task,
-        executionContext: parsed.value.executionContext,
+        executionContext: {
+          workspaceRoot: "/tmp/canonical-root",
+        },
       }),
     ).toEqual({
       path: "/tmp/canonical-root",
@@ -213,6 +243,12 @@ describe("delegation-tool", () => {
     expect(tool.inputSchema.properties).not.toHaveProperty(
       "contextRequirements",
     );
+    const executionContext = tool.inputSchema.properties.executionContext as {
+      properties?: Record<string, unknown>;
+    };
+    expect(executionContext.properties).not.toHaveProperty("workspaceRoot");
+    expect(executionContext.properties).not.toHaveProperty("allowedReadRoots");
+    expect(executionContext.properties).not.toHaveProperty("allowedWriteRoots");
     const direct = await tool.execute({ task: "do work" });
     expect(direct.isError).toBe(true);
     expect(direct.content).toContain("session-scoped tool handler");

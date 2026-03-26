@@ -170,8 +170,6 @@ function resolveVerifiedCompletionState(params: {
       result: typeof toolCall.result === "string" ? toolCall.result : "",
       isError: toolCall.isError === true,
     })),
-    plannerUsed: true,
-    deterministicStepsExecuted: 1,
     verificationContract: params.verificationContract,
     verifier: {
       performed: params.verifierPerformed,

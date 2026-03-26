@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildEffectiveContextRequirements,
+  classifyDelegatedScopeTrustSignal,
   resolvePlannerStepWorkingDirectory,
   stepRequiresStructuredDelegatedFilesystemScope,
 } from "./subagent-failure-classification.js";
@@ -117,5 +118,27 @@ describe("subagent-failure-classification", () => {
         canRunParallel: true,
       }),
     ).toEqual(["repo_context"]);
+  });
+
+  it("distinguishes trusted runtime envelope mismatches from invalid root attempts and informational cwd mentions", () => {
+    expect(
+      classifyDelegatedScopeTrustSignal({
+        message:
+          'Delegated workspace root "/repo" does not match the child working directory "/tmp".',
+      }),
+    ).toBe("trusted_runtime_envelope_mismatch");
+
+    expect(
+      classifyDelegatedScopeTrustSignal({
+        message:
+          'Requested delegated workspace root "/" is outside the trusted parent workspace root "/home/tetsuo/git/AgenC".',
+      }),
+    ).toBe("model_authored_invalid_root_attempt");
+
+    expect(
+      classifyDelegatedScopeTrustSignal({
+        contextRequirements: ["cwd=/workspace/demo", "repo_context"],
+      }),
+    ).toBe("informational_untrusted_cwd_mention");
   });
 });

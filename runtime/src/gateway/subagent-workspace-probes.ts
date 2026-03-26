@@ -20,7 +20,7 @@ import type {
 import type { SubAgentResult } from "./sub-agent.js";
 import { tokenizeShellCommand } from "../tools/system/command-line.js";
 import { sanitizeDelegationContextRequirements } from "../utils/delegation-execution-context.js";
-import { redactSensitiveData, normalizeDependencyArtifactPath } from "./subagent-context-curation.js";
+import { normalizeDependencyArtifactPath, sanitizeExecutionPromptText } from "./subagent-context-curation.js";
 import type {
   PipelinePlannerDeterministicStep as DeterministicStep,
 } from "../workflow/pipeline.js";
@@ -429,7 +429,7 @@ export function renderDeterministicCommandSummary(
   const rendered = [command, ...commandArgs].filter((value) => value.length > 0)
     .join(" ");
   return rendered.length > 0
-    ? `\`${redactSensitiveData(rendered)}\``
+    ? `\`${sanitizeExecutionPromptText(rendered)}\``
     : `deterministic probe "${step.name}"`;
 }
 
@@ -695,20 +695,43 @@ export function collectPromptArtifactPackageDirectories(
   return directories;
 }
 
+function resolveTrustedWorkspaceRootForGuidance(
+  step: PipelinePlannerSubagentStep,
+  pipeline: Pipeline,
+  delegatedWorkingDirectory?: string,
+): string | undefined {
+  const trustedResolution = resolvePlannerStepWorkingDirectory(step, pipeline);
+  if (!trustedResolution?.path) {
+    return undefined;
+  }
+
+  const trustedWorkspaceRoot = resolvePath(trustedResolution.path);
+  if (
+    typeof delegatedWorkingDirectory === "string" &&
+    delegatedWorkingDirectory.trim().length > 0 &&
+    resolvePath(delegatedWorkingDirectory) !== trustedWorkspaceRoot
+  ) {
+    return undefined;
+  }
+
+  return trustedWorkspaceRoot;
+}
+
 export function buildWorkspaceStateGuidanceLines(
   step: PipelinePlannerSubagentStep,
   pipeline: Pipeline,
   promptArtifactCandidates: readonly { path: string }[],
   delegatedWorkingDirectory?: string,
 ): readonly string[] {
-  if (
-    typeof delegatedWorkingDirectory !== "string" ||
-    delegatedWorkingDirectory.trim().length === 0
-  ) {
+  const workspaceRoot = resolveTrustedWorkspaceRootForGuidance(
+    step,
+    pipeline,
+    delegatedWorkingDirectory,
+  );
+  if (!workspaceRoot) {
     return [];
   }
 
-  const workspaceRoot = resolvePath(delegatedWorkingDirectory);
   if (!existsSync(workspaceRoot)) {
     return [
       "The delegated workspace root does not exist yet. Create it before listing directories or writing phase files.",

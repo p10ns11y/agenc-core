@@ -721,6 +721,72 @@ describe("ToolRouter", () => {
     expect(decision.routedToolNames).not.toContain("agenc.getProtocolConfig");
   });
 
+  it("keeps trivial cwd introspection on the parent shell path even after coding history", () => {
+    const router = new ToolRouter(TOOLS, {
+      maxToolsPerTurn: 18,
+      minToolsPerTurn: 6,
+      maxExpandedToolsPerTurn: 24,
+    });
+
+    const decision = router.route({
+      sessionId: "s-parent-safe-pwd-after-codegen",
+      messageText: "what is the current working directory?",
+      history: [
+        {
+          role: "user",
+          content:
+            "Build a complete self-contained TypeScript codebase in /tmp/codegen-bench-parent-safe-pwd with tests and benchmarks.",
+        } as any,
+      ],
+    });
+
+    expect(decision.routedToolNames).toContain("system.bash");
+    expect(decision.routedToolNames).not.toContain("execute_with_agent");
+    expect(decision.routedToolNames).not.toContain("system.writeFile");
+    expect(decision.expandedToolNames).not.toContain("execute_with_agent");
+  });
+
+  it("keeps trivial ls introspection on the parent tool path even after coding history", () => {
+    const router = new ToolRouter(TOOLS, {
+      maxToolsPerTurn: 18,
+      minToolsPerTurn: 6,
+      maxExpandedToolsPerTurn: 24,
+    });
+
+    const decision = router.route({
+      sessionId: "s-parent-safe-ls-after-codegen",
+      messageText: "ls",
+      history: [
+        {
+          role: "user",
+          content:
+            "Create a complete self-contained Node.js project in /tmp/codegen-bench-parent-safe-ls and keep iterating until it builds cleanly.",
+        } as any,
+      ],
+    });
+
+    expect(decision.routedToolNames).toContain("system.bash");
+    expect(decision.routedToolNames).not.toContain("execute_with_agent");
+    expect(decision.expandedToolNames).not.toContain("execute_with_agent");
+  });
+
+  it("preserves execute_with_agent for explicit child ls delegation requests", () => {
+    const router = new ToolRouter(TOOLS, {
+      maxToolsPerTurn: 18,
+      minToolsPerTurn: 6,
+      maxExpandedToolsPerTurn: 24,
+    });
+
+    const decision = router.route({
+      sessionId: "s-explicit-child-ls",
+      messageText:
+        "Use execute_with_agent to run ls in a child agent and tell me what it prints.",
+      history: [],
+    });
+
+    expect(decision.routedToolNames).toContain("execute_with_agent");
+  });
+
   it("routes protocol and Solana audit tools only for explicit protocol prompts", () => {
     const router = new ToolRouter(TOOLS, {
       maxToolsPerTurn: 18,

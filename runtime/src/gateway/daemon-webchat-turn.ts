@@ -45,6 +45,7 @@ import type { GatewayMessage } from "./message.js";
 import type { Session, SessionManager } from "./session.js";
 import type { ToolRoutingDecision } from "./tool-routing.js";
 import { resolveTurnMaxToolRounds } from "./tool-round-budget.js";
+import { buildAssistantDelegatedScopeMetadata } from "../utils/delegated-scope-trust.js";
 
 export interface WebChatTurnSignals {
   signalThinking: (sessionId: string) => void;
@@ -132,6 +133,30 @@ function maybeBroadcastExecutionTraceEventToWebChat(params: {
     default:
       return;
   }
+}
+
+async function resolveWebChatTurnWorkspaceRoot(params: {
+  readonly webChat: WebChatChannel;
+  readonly sessionId: string;
+  readonly messageWorkspaceRoot: unknown;
+}): Promise<string | undefined> {
+  const sessionWorkspaceRoot =
+    typeof params.webChat.loadSessionWorkspaceRoot === "function"
+      ? await params.webChat.loadSessionWorkspaceRoot(params.sessionId)
+      : undefined;
+  if (
+    typeof sessionWorkspaceRoot === "string" &&
+    sessionWorkspaceRoot.trim().length > 0
+  ) {
+    return sessionWorkspaceRoot.trim();
+  }
+  if (
+    typeof params.messageWorkspaceRoot === "string" &&
+    params.messageWorkspaceRoot.trim().length > 0
+  ) {
+    return params.messageWorkspaceRoot.trim();
+  }
+  return undefined;
 }
 
 export async function executeWebChatConversationTurn(
@@ -247,12 +272,31 @@ export async function executeWebChatConversationTurn(
       defaultMaxToolRounds,
       toolRoutingDecision,
     );
+    const runtimeWorkspaceRoot = await resolveWebChatTurnWorkspaceRoot({
+      webChat,
+      sessionId: msg.sessionId,
+      messageWorkspaceRoot: msg.metadata?.workspaceRoot,
+    });
+    const effectiveMessage =
+      typeof runtimeWorkspaceRoot === "string"
+        ? {
+            ...msg,
+            metadata: {
+              ...(msg.metadata ?? {}),
+              workspaceRoot: runtimeWorkspaceRoot,
+            },
+          }
+        : msg;
 
     const result = await chatExecutor.execute({
-      message: msg,
+      message: effectiveMessage,
       history: session.history,
       systemPrompt: effectiveSystemPrompt,
       sessionId: msg.sessionId,
+      runtimeContext:
+        typeof runtimeWorkspaceRoot === "string"
+          ? { workspaceRoot: runtimeWorkspaceRoot }
+          : undefined,
       toolHandler: sessionToolHandler,
       onStreamChunk: sessionStreamCallback,
       signal: abortController.signal,
@@ -443,12 +487,20 @@ export async function executeWebChatConversationTurn(
       stopReasonDetail: result.stopReasonDetail,
     });
 
+    const assistantMemoryMetadata = buildAssistantDelegatedScopeMetadata({
+      content: result.content,
+      toolCalls: result.toolCalls,
+    });
+
     await hooks.dispatch("message:outbound", {
       sessionId: msg.sessionId,
       content: result.content,
       provider: result.provider,
       userMessage: msg.content,
       agentResponse: result.content,
+      ...(assistantMemoryMetadata
+        ? { agentResponseMetadata: assistantMemoryMetadata }
+        : {}),
     });
 
     try {
@@ -461,6 +513,9 @@ export async function executeWebChatConversationTurn(
         sessionId: msg.sessionId,
         role: "assistant",
         content: result.content,
+        ...(assistantMemoryMetadata
+          ? { metadata: assistantMemoryMetadata }
+          : {}),
       });
     } catch (error) {
       logger.warn?.("Failed to persist messages to memory:", error);
