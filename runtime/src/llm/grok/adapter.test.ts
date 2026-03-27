@@ -406,6 +406,244 @@ describe("GrokProvider", () => {
     expect((events[1].payload as { output_text?: string }).output_text).toBe("Hello!");
   });
 
+  it("captures provider request IDs and response headers in non-stream traces when exposed by the SDK", async () => {
+    mockCreate.mockReturnValueOnce({
+      withResponse: vi.fn().mockResolvedValue({
+        data: makeCompletion({ id: "resp_nonstream" }),
+        response: new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "x-request-id": "req_nonstream_123",
+          },
+        }),
+        request_id: "req_nonstream_123",
+      }),
+    });
+
+    const events: Array<Record<string, unknown>> = [];
+    const provider = new GrokProvider({ apiKey: "test-key" });
+
+    await provider.chat(
+      [{ role: "user", content: "inspect the repo" }],
+      {
+        trace: {
+          includeProviderPayloads: true,
+          onProviderTraceEvent: (event) => {
+            events.push(event as unknown as Record<string, unknown>);
+          },
+        },
+      },
+    );
+
+    expect(events[1]).toMatchObject({
+      kind: "response",
+      context: {
+        providerRequestId: "req_nonstream_123",
+        providerResponseId: "resp_nonstream",
+        responseStatus: 200,
+        responseHeaders: {
+          "content-type": "application/json",
+          "x-request-id": "req_nonstream_123",
+        },
+      },
+    });
+  });
+
+  it("records provider-default timeout provenance in request traces", async () => {
+    mockCreate.mockResolvedValueOnce(makeCompletion());
+
+    const events: Array<Record<string, unknown>> = [];
+    const provider = new GrokProvider({
+      apiKey: "test-key",
+    });
+
+    await provider.chat(
+      [{ role: "user", content: "inspect the repo" }],
+      {
+        trace: {
+          includeProviderPayloads: true,
+          onProviderTraceEvent: (event) => {
+            events.push(event as unknown as Record<string, unknown>);
+          },
+        },
+      },
+    );
+
+    expect(events[0]).toMatchObject({
+      kind: "request",
+      context: {
+        configuredProviderTimeoutMs: null,
+        callOverrideTimeoutMs: null,
+        effectiveTimeoutMs: 60_000,
+        timeoutSource: "provider_default",
+        timeoutMs: 60_000,
+      },
+    });
+  });
+
+  it("preserves unlimited timeout provenance for streamed requests", async () => {
+    mockCreate.mockResolvedValueOnce(
+      (async function* () {
+        yield {
+          type: "response.completed",
+          response: makeCompletion({
+            output_text: "done",
+          }),
+        };
+      })(),
+    );
+
+    const events: Array<Record<string, unknown>> = [];
+    const provider = new GrokProvider({
+      apiKey: "test-key",
+      timeoutMs: 0,
+    });
+
+    await provider.chatStream(
+      [{ role: "user", content: "inspect the repo" }],
+      () => undefined,
+      {
+        trace: {
+          includeProviderPayloads: true,
+          onProviderTraceEvent: (event) => {
+            events.push(event as unknown as Record<string, unknown>);
+          },
+        },
+      },
+    );
+
+    expect(events[0]).toMatchObject({
+      kind: "request",
+      transport: "chat_stream",
+      context: {
+        configuredProviderTimeoutMs: 0,
+        callOverrideTimeoutMs: null,
+        effectiveTimeoutMs: null,
+        timeoutSource: "provider_config",
+        timeoutMs: null,
+      },
+    });
+  });
+
+  it("emits a stream-open trace and raw stream events with provider request metadata", async () => {
+    mockCreate.mockReturnValueOnce({
+      withResponse: vi.fn().mockResolvedValue({
+        data: (async function* () {
+          yield {
+            type: "response.output_text.delta",
+            delta: "Hello",
+          };
+          yield {
+            type: "response.completed",
+            response: makeCompletion({
+              id: "resp_stream",
+              output_text: "Hello",
+            }),
+          };
+        })(),
+        response: new Response(null, {
+          status: 200,
+          headers: {
+            "x-request-id": "req_stream_123",
+          },
+        }),
+        request_id: "req_stream_123",
+      }),
+    });
+
+    const events: Array<Record<string, unknown>> = [];
+    const provider = new GrokProvider({ apiKey: "test-key" });
+
+    await provider.chatStream(
+      [{ role: "user", content: "inspect the repo" }],
+      () => undefined,
+      {
+        trace: {
+          includeProviderPayloads: true,
+          onProviderTraceEvent: (event) => {
+            events.push(event as unknown as Record<string, unknown>);
+          },
+        },
+      },
+    );
+
+    expect(events[1]).toMatchObject({
+      kind: "stream_event",
+      payload: { type: "stream.open" },
+      context: {
+        eventIndex: 0,
+        eventType: "stream.open",
+        providerRequestId: "req_stream_123",
+        responseStatus: 200,
+      },
+    });
+    expect(events[2]).toMatchObject({
+      kind: "stream_event",
+      payload: {
+        type: "response.output_text.delta",
+        delta: "Hello",
+      },
+      context: {
+        eventIndex: 1,
+        eventType: "response.output_text.delta",
+        providerRequestId: "req_stream_123",
+      },
+    });
+    expect(events[3]).toMatchObject({
+      kind: "stream_event",
+      payload: {
+        type: "response.completed",
+      },
+      context: {
+        eventIndex: 2,
+        eventType: "response.completed",
+        providerRequestId: "req_stream_123",
+      },
+    });
+    expect(events[4]).toMatchObject({
+      kind: "response",
+      context: {
+        providerRequestId: "req_stream_123",
+        providerResponseId: "resp_stream",
+      },
+    });
+  });
+
+  it("records per-call timeout overrides in request traces", async () => {
+    mockCreate.mockResolvedValueOnce(makeCompletion());
+
+    const events: Array<Record<string, unknown>> = [];
+    const provider = new GrokProvider({
+      apiKey: "test-key",
+      timeoutMs: 60_000,
+    });
+
+    await provider.chat(
+      [{ role: "user", content: "inspect the repo" }],
+      {
+        timeoutMs: 5,
+        trace: {
+          includeProviderPayloads: true,
+          onProviderTraceEvent: (event) => {
+            events.push(event as unknown as Record<string, unknown>);
+          },
+        },
+      },
+    );
+
+    expect(events[0]).toMatchObject({
+      kind: "request",
+      context: {
+        configuredProviderTimeoutMs: 60_000,
+        callOverrideTimeoutMs: 5,
+        effectiveTimeoutMs: 5,
+        timeoutSource: "call_override",
+        timeoutMs: 5,
+      },
+    });
+  });
+
   it("records provider tool-resolution fallback when routed tools cannot be resolved", async () => {
     mockCreate.mockResolvedValueOnce(makeCompletion());
 
@@ -585,6 +823,83 @@ describe("GrokProvider", () => {
     expect(response.toolCalls).toHaveLength(1);
     expect(response.toolCalls[0].name).toBe("search");
     expect(response.finishReason).toBe("tool_calls");
+  });
+
+  it("preserves provider function calls whose JSON arguments contain HTML entities inside string values", async () => {
+    const completion = makeCompletion({
+      output_text: "",
+      output: [
+        {
+          type: "function_call",
+          call_id: "call_1",
+          name: "system.writeFile",
+          arguments:
+            '{"path":"src/parser.c","content":"strcmp(token, \\"&quot;&gt;&quot;\\") == 0 && strcmp(token, \\"&amp;\\") == 0;"}',
+        },
+      ],
+    });
+    mockCreate.mockResolvedValueOnce(completion);
+
+    const provider = new GrokProvider({ apiKey: "test-key" });
+    const response = await provider.chat([
+      { role: "user", content: "write parser.c" },
+    ]);
+
+    expect(response.finishReason).toBe("tool_calls");
+    expect(response.toolCalls).toEqual([
+      {
+        id: "call_1",
+        name: "system.writeFile",
+        arguments:
+          '{"path":"src/parser.c","content":"strcmp(token, \\"\\">\\"\\") == 0 && strcmp(token, \\"&\\") == 0;"}',
+      },
+    ]);
+  });
+
+  it("emits a trace when a provider function call is rejected during normalization", async () => {
+    mockCreate.mockResolvedValueOnce(
+      makeCompletion({
+        output_text: "",
+        output: [
+          {
+            type: "function_call",
+            call_id: "call_bad",
+            name: "system.writeFile",
+            arguments: '["bad"]',
+          },
+        ],
+      }),
+    );
+
+    const events: Array<Record<string, unknown>> = [];
+    const provider = new GrokProvider({ apiKey: "test-key" });
+    const response = await provider.chat(
+      [{ role: "user", content: "write parser.c" }],
+      {
+        trace: {
+          includeProviderPayloads: true,
+          onProviderTraceEvent: (event) => {
+            events.push(event as unknown as Record<string, unknown>);
+          },
+        },
+      },
+    );
+
+    expect(response.toolCalls).toHaveLength(0);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "stream_event",
+          transport: "chat",
+          payload: expect.objectContaining({
+            eventType: "tool_call_validation_failed",
+            failureCode: "non_object_arguments",
+            toolCallId: "call_bad",
+            toolName: "system.writeFile",
+          }),
+        }),
+      ]),
+    );
   });
 
   it("surfaces provider citations as provider evidence", async () => {

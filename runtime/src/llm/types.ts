@@ -68,6 +68,22 @@ export interface LLMToolCall {
   arguments: string;
 }
 
+export interface ToolCallValidationFailure {
+  readonly code:
+    | "invalid_shape"
+    | "missing_id"
+    | "missing_name"
+    | "non_string_arguments"
+    | "invalid_json"
+    | "non_object_arguments";
+  readonly message: string;
+}
+
+export interface ToolCallValidationResult {
+  readonly toolCall: LLMToolCall | null;
+  readonly failure?: ToolCallValidationFailure;
+}
+
 /**
  * Token usage statistics
  */
@@ -357,7 +373,7 @@ export interface LLMChatToolRoutingOptions {
 }
 
 export interface LLMProviderTraceEvent {
-  readonly kind: "request" | "response" | "error";
+  readonly kind: "request" | "response" | "error" | "stream_event";
   readonly transport: "chat" | "chat_stream";
   readonly provider: string;
   readonly model?: string;
@@ -376,9 +392,9 @@ export interface LLMProviderTraceEvent {
 }
 
 export interface LLMChatTraceOptions {
-  /** Emit raw provider request/response/error payloads through the trace callback. */
+  /** Emit raw provider request/response/error/stream-event payloads through the trace callback. */
   readonly includeProviderPayloads?: boolean;
-  /** Callback invoked with provider-native request/response/error payloads. */
+  /** Callback invoked with provider-native request/response/error/stream-event payloads. */
   readonly onProviderTraceEvent?: (event: LLMProviderTraceEvent) => void;
 }
 
@@ -517,15 +533,61 @@ function decodeHtmlEntities(s: string): string {
     .replace(/&#39;/g, "'");
 }
 
+function decodeHtmlEntitiesDeep(value: unknown): unknown {
+  if (typeof value === "string") {
+    return decodeHtmlEntities(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => decodeHtmlEntitiesDeep(entry));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+      key,
+      decodeHtmlEntitiesDeep(entry),
+    ]),
+  );
+}
+
+function parseToolArguments(
+  argumentsRaw: string,
+): { value: unknown } | null {
+  try {
+    return {
+      value: JSON.parse(argumentsRaw) as unknown,
+    };
+  } catch {
+    try {
+      return {
+        value: JSON.parse(decodeHtmlEntities(argumentsRaw)) as unknown,
+      };
+    } catch {
+      return null;
+    }
+  }
+}
+
 /**
  * Validate/sanitize a raw tool call payload.
  *
  * Ensures `id` and `name` are non-empty strings, and `arguments` is a JSON string.
- * Decodes HTML entities both in the JSON string and in parsed string values.
+ * Preserves valid JSON structure first, then decodes HTML entities inside
+ * parsed string values. Falls back to decoding the raw JSON text only when the
+ * original argument string is not valid JSON.
  */
-export function validateToolCall(raw: unknown): LLMToolCall | null {
+export function validateToolCallDetailed(
+  raw: unknown,
+): ToolCallValidationResult {
   if (typeof raw !== "object" || raw === null) {
-    return null;
+    return {
+      toolCall: null,
+      failure: {
+        code: "invalid_shape",
+        message: "Tool call payload must be an object.",
+      },
+    };
   }
 
   const candidate = raw as Record<string, unknown>;
@@ -533,30 +595,69 @@ export function validateToolCall(raw: unknown): LLMToolCall | null {
   const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
   const argumentsRaw = candidate.arguments;
 
-  if (!id || !name || typeof argumentsRaw !== "string") {
-    return null;
+  if (!id) {
+    return {
+      toolCall: null,
+      failure: {
+        code: "missing_id",
+        message: "Tool call payload is missing a non-empty id.",
+      },
+    };
+  }
+  if (!name) {
+    return {
+      toolCall: null,
+      failure: {
+        code: "missing_name",
+        message: "Tool call payload is missing a non-empty name.",
+      },
+    };
+  }
+  if (typeof argumentsRaw !== "string") {
+    return {
+      toolCall: null,
+      failure: {
+        code: "non_string_arguments",
+        message: "Tool call arguments must be a JSON string.",
+      },
+    };
   }
 
-  // Decode the JSON string itself (entities in JSON syntax)
-  const decoded = decodeHtmlEntities(argumentsRaw);
-
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(decoded) as Record<string, unknown>;
-  } catch {
-    return null;
+  const parsedResult = parseToolArguments(argumentsRaw);
+  if (!parsedResult) {
+    return {
+      toolCall: null,
+      failure: {
+        code: "invalid_json",
+        message: "Tool call arguments are not valid JSON.",
+      },
+    };
   }
 
-  // Also decode entities inside parsed string values (entities within JSON values)
-  for (const key of Object.keys(parsed)) {
-    if (typeof parsed[key] === "string") {
-      parsed[key] = decodeHtmlEntities(parsed[key] as string);
-    }
+  const parsed = parsedResult.value;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {
+      toolCall: null,
+      failure: {
+        code: "non_object_arguments",
+        message: "Tool call arguments must decode to a JSON object.",
+      },
+    };
   }
+
+  const normalizedArguments = JSON.stringify(
+    decodeHtmlEntitiesDeep(parsed) as Record<string, unknown>,
+  );
 
   return {
-    id,
-    name,
-    arguments: JSON.stringify(parsed),
+    toolCall: {
+      id,
+      name,
+      arguments: normalizedArguments,
+    },
   };
+}
+
+export function validateToolCall(raw: unknown): LLMToolCall | null {
+  return validateToolCallDetailed(raw).toolCall;
 }

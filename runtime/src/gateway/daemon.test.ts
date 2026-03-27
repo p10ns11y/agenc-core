@@ -245,7 +245,7 @@ describe("isCommandUnavailableError", () => {
 });
 
 describe("resolveSessionTokenBudget", () => {
-  it("uses 60% of huge context windows as the session budget", () => {
+  it("defaults to unlimited when no explicit session token budget is configured", () => {
     expect(
       resolveSessionTokenBudget(
         {
@@ -254,10 +254,10 @@ describe("resolveSessionTokenBudget", () => {
         } as any,
         2_000_000,
       ),
-    ).toBe(1_200_000);
+    ).toBe(0);
   });
 
-  it("floors small context windows at the default budget minimum", () => {
+  it("keeps smaller context windows unlimited by default as well", () => {
     expect(
       resolveSessionTokenBudget(
         {
@@ -266,20 +266,20 @@ describe("resolveSessionTokenBudget", () => {
         } as any,
         64_000,
       ),
-    ).toBe(120_000);
+    ).toBe(0);
   });
 });
 
 describe("resolveBashToolTimeoutConfig", () => {
-  it("caps desktop bash timeout to the chat tool timeout budget", () => {
+  it("uses the desktop bash defaults when no llm tool timeout is configured", () => {
     expect(
       resolveBashToolTimeoutConfig({
         desktop: { enabled: true },
         llm: {},
       } as any),
     ).toEqual({
-      timeoutMs: 180_000,
-      maxTimeoutMs: 180_000,
+      timeoutMs: 300_000,
+      maxTimeoutMs: 600_000,
     });
   });
 
@@ -378,7 +378,7 @@ describe("resolveProviderExecutionBudget", () => {
         hardMaxPromptChars: 64_000,
       }),
     );
-    expect(resolved.sessionTokenBudget).toBe(153_600);
+    expect(resolved.sessionTokenBudget).toBe(0);
   });
 });
 

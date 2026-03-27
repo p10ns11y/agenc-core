@@ -1404,11 +1404,11 @@ describe("config loading", () => {
             enabled: "yes" as unknown as boolean,
             mode: "invalid-mode",
             delegationAggressiveness: "extreme",
-            maxConcurrent: 0,
-            maxDepth: 0,
+            maxConcurrent: -1,
+            maxDepth: -1,
             maxFanoutPerTurn: 100,
-            maxTotalSubagentsPerRequest: 0,
-            maxCumulativeToolCallsPerRequestTree: 0,
+            maxTotalSubagentsPerRequest: 64,
+            maxCumulativeToolCallsPerRequestTree: -1,
             maxCumulativeTokensPerRequestTree: -1,
             defaultTimeoutMs: 500,
             spawnDecisionThreshold: 2,
@@ -1435,25 +1435,22 @@ describe("config loading", () => {
       "llm.subagents.delegationAggressiveness must be one of: conservative, balanced, aggressive, adaptive",
     );
     expect(result.errors).toContain(
-      "llm.subagents.maxConcurrent must be an integer between 1 and 64",
+      "llm.subagents.maxConcurrent must be 0 or an integer between 1 and 64",
     );
     expect(result.errors).toContain(
-      "llm.subagents.maxDepth must be an integer between 1 and 16",
+      "llm.subagents.maxDepth must be 0 or an integer between 1 and 16",
     );
     expect(result.errors).toContain(
-      "llm.subagents.maxFanoutPerTurn must be an integer between 1 and 64",
+      "llm.subagents.maxFanoutPerTurn must be 0 or an integer between 1 and 64",
     );
     expect(result.errors).toContain(
-      "llm.subagents.maxTotalSubagentsPerRequest must be an integer between 1 and 1024",
-    );
-    expect(result.errors).toContain(
-      "llm.subagents.maxCumulativeToolCallsPerRequestTree must be an integer between 1 and 4096",
+      "llm.subagents.maxCumulativeToolCallsPerRequestTree must be 0 or an integer between 1 and 4096",
     );
     expect(result.errors).toContain(
       "llm.subagents.maxCumulativeTokensPerRequestTree must be an integer between 0 and 10000000",
     );
     expect(result.errors).toContain(
-      "llm.subagents.defaultTimeoutMs must be an integer between 1000 and 3600000",
+      "llm.subagents.defaultTimeoutMs must be 0 or an integer between 1000 and 3600000",
     );
     expect(result.errors).toContain(
       "llm.subagents.spawnDecisionThreshold must be a number between 0 and 1",
@@ -1536,9 +1533,9 @@ describe("config loading", () => {
           maxToolRounds: 2_049,
           plannerEnabled: "yes" as unknown as boolean,
           plannerMaxTokens: 8,
-          toolBudgetPerRequest: 0,
+          toolBudgetPerRequest: -1,
           maxModelRecallsPerRequest: -1,
-          maxFailureBudgetPerRequest: 0,
+          maxFailureBudgetPerRequest: -1,
           toolCallTimeoutMs: 100,
           requestTimeoutMs: 1_000,
           toolFailureCircuitBreaker: {
@@ -1563,23 +1560,23 @@ describe("config loading", () => {
 
     expect(result.valid).toBe(false);
     expect(result.errors).toContain(
-      "llm.maxToolRounds must be an integer between 1 and 2048",
+      "llm.maxToolRounds must be 0 or an integer between 1 and 2048",
     );
     expect(result.errors).toContain("llm.plannerEnabled must be a boolean");
     expect(result.errors).toContain(
-      "llm.plannerMaxTokens must be an integer between 16 and 65536",
+      "llm.plannerMaxTokens must be 0 or an integer between 16 and 65536",
     );
     expect(result.errors).toContain(
-      "llm.toolBudgetPerRequest must be an integer between 1 and 8192",
+      "llm.toolBudgetPerRequest must be 0 or an integer between 1 and 8192",
     );
     expect(result.errors).toContain(
       "llm.maxModelRecallsPerRequest must be an integer between 0 and 128",
     );
     expect(result.errors).toContain(
-      "llm.maxFailureBudgetPerRequest must be an integer between 1 and 256",
+      "llm.maxFailureBudgetPerRequest must be 0 or an integer between 1 and 256",
     );
     expect(result.errors).toContain(
-      "llm.toolCallTimeoutMs must be an integer between 1000 and 3600000",
+      "llm.toolCallTimeoutMs must be 0 or an integer between 1000 and 3600000",
     );
     expect(result.errors).toContain(
       "llm.requestTimeoutMs must be 0 or an integer between 5000 and 7200000",
