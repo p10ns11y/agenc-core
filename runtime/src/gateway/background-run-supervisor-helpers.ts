@@ -461,8 +461,8 @@ export function extractProviderCompactionArtifacts(
     artifacts.push({
       kind: "opaque_provider_state",
       locator: `provider:${entry.provider}:compaction:${latestItem.id ?? latestItem.digest}`,
-      label: `${entry.provider} compaction item`,
-      source: `${entry.provider}:context_management`,
+      label: `${entry.provider} provider state item`,
+      source: `${entry.provider}:provider_state`,
       observedAt,
       digest: latestItem.digest,
     });

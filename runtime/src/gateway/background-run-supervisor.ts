@@ -3878,7 +3878,7 @@ export class BackgroundRunSupervisor {
       .reverse()
       .find((artifact) =>
         artifact.kind === "opaque_provider_state" &&
-        artifact.source.endsWith(":context_management")
+        artifact.source.endsWith(":provider_state")
       );
     await this.runStore.appendEvent(toPersistedRun(run), {
       type: "memory_compacted",

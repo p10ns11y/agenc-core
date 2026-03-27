@@ -6,7 +6,6 @@
 
 import { createHash } from "node:crypto";
 import type {
-  LLMCompactionItemRef,
   LLMMessage,
   LLMResponse,
   LLMTool,
@@ -400,69 +399,6 @@ export function isContinuationRetrievalFailure(error: unknown): boolean {
     message.includes("expired") ||
     message.includes("retriev")
   );
-}
-
-function toProviderErrorMessage(error: unknown): string {
-  if (typeof error === "string") return error.toLowerCase();
-  if (!error || typeof error !== "object") return "";
-  return String((error as { message?: unknown }).message ?? "").toLowerCase();
-}
-
-function isUnsupportedFieldError(message: string): boolean {
-  return (
-    message.includes("unknown") ||
-    message.includes("unsupported") ||
-    message.includes("invalid") ||
-    message.includes("unexpected") ||
-    message.includes("additional properties") ||
-    message.includes("not allowed")
-  );
-}
-
-export function isAssistantPhaseRejection(error: unknown): boolean {
-  const message = toProviderErrorMessage(error);
-  return message.includes("phase") && isUnsupportedFieldError(message);
-}
-
-export function isServerCompactionRejection(error: unknown): boolean {
-  const message = toProviderErrorMessage(error);
-  if (
-    !message.includes("context_management") &&
-    !message.includes("compact_threshold") &&
-    !message.includes("compaction")
-  ) {
-    return false;
-  }
-  return isUnsupportedFieldError(message);
-}
-
-function hashOpaqueCompactionItem(value: unknown): string {
-  return createHash("sha256").update(stableStringify(value)).digest("hex").slice(0, 16);
-}
-
-export function extractCompactionItemRefs(
-  response: Record<string, unknown>,
-): LLMCompactionItemRef[] {
-  const output = Array.isArray(response.output)
-    ? (response.output as Array<Record<string, unknown>>)
-    : [];
-  const items: LLMCompactionItemRef[] = [];
-  for (const item of output) {
-    const type = typeof item.type === "string" ? item.type.trim() : "";
-    if (type.length === 0 || !/compact/i.test(type)) {
-      continue;
-    }
-    const id =
-      typeof item.id === "string" && item.id.trim().length > 0
-        ? item.id.trim()
-        : undefined;
-    items.push({
-      type,
-      id,
-      digest: hashOpaqueCompactionItem(item),
-    });
-  }
-  return items;
 }
 
 function sanitizeSchema(value: unknown): unknown {

@@ -11,20 +11,17 @@ import type { GatewayAuthConfig } from "./remote-types.js";
 import type { BackgroundRunOperatorAvailabilityCode } from "./background-run-operator.js";
 import type { DesktopSandboxConfig } from "../desktop/types.js";
 import type { SocialPeerDirectoryEntry } from "../social/types.js";
+import type { LLMXaiCapabilitySurface } from "../llm/types.js";
 
 // ============================================================================
 // Gateway Configuration
 // ============================================================================
 
-export interface GatewayLLMConfig {
+export interface GatewayLLMConfig extends LLMXaiCapabilitySurface {
   provider: "grok" | "ollama";
   apiKey?: string;
   model?: string;
   baseUrl?: string;
-  /** Enable provider-native web search when the primary LLM supports it. */
-  webSearch?: boolean;
-  /** Routing preference for provider-native web search. */
-  searchMode?: "auto" | "on" | "off";
   /** Maximum output tokens per completion (provider request parameter). 0 or undefined = provider default/unset. */
   maxTokens?: number;
   /** Model context window in tokens for adaptive prompt budgeting. 0 or undefined = infer from provider/model metadata. */
@@ -96,13 +93,13 @@ export interface GatewayLLMConfig {
     store?: boolean;
     /** Retry once statelessly when continuation anchors are missing/mismatched/stale. */
     fallbackToStateless?: boolean;
-    /** Optional server-side Responses API compaction controls. */
+    /** Optional local/runtime compaction controls layered on stateful responses. */
     compaction?: {
-      /** Enable provider-native server-side compaction. */
+      /** Enable compaction-aware runtime behavior. */
       enabled?: boolean;
-      /** Rendered-token threshold for provider compaction. */
+      /** Rendered-token threshold for local compaction. */
       compactThreshold?: number;
-      /** Retry once without compaction if the provider rejects the field. */
+      /** Retry once without provider hints if a provider rejects them. */
       fallbackOnUnsupported?: boolean;
     };
   };

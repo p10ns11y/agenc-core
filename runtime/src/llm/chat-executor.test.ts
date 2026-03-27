@@ -7042,6 +7042,90 @@ describe("ChatExecutor", () => {
       expect(result.compacted).toBe(false);
     });
 
+    it("uses a soft compaction threshold even when the hard session budget is unlimited", async () => {
+      const provider = createMockProvider("primary", {
+        chat: vi
+          .fn()
+          .mockResolvedValueOnce(
+            mockResponse({
+              usage: { promptTokens: 500, completionTokens: 500, totalTokens: 1000 },
+            }),
+          )
+          .mockResolvedValueOnce(
+            mockResponse({
+              usage: { promptTokens: 500, completionTokens: 500, totalTokens: 1000 },
+            }),
+          )
+          .mockResolvedValueOnce(
+            mockResponse({ content: "Soft-threshold summary" }),
+          )
+          .mockResolvedValueOnce(
+            mockResponse({
+              content: "response after soft-threshold compaction",
+              usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 },
+            }),
+          ),
+      });
+      const executor = new ChatExecutor({
+        providers: [provider],
+        sessionTokenBudget: 0,
+        sessionCompactionThreshold: 1500,
+      });
+
+      await executor.execute(createParams({ history: buildLongHistory(10) }));
+      await executor.execute(createParams({ history: buildLongHistory(10) }));
+
+      const result = await executor.execute(
+        createParams({ history: buildLongHistory(10) }),
+      );
+
+      expect(result.compacted).toBe(true);
+      expect(result.content).toBe("response after soft-threshold compaction");
+    });
+
+    it("treats soft-threshold compaction failures as best-effort when the hard budget is unlimited", async () => {
+      let calls = 0;
+      const provider = createMockProvider("primary", {
+        chat: vi.fn(async () => {
+          calls += 1;
+          if (calls <= 2) {
+            return mockResponse({
+              usage: { promptTokens: 500, completionTokens: 500, totalTokens: 1000 },
+            });
+          }
+          if (calls === 3) {
+            throw new Error("summary unavailable");
+          }
+          return mockResponse({
+            content: "response after skipped compaction",
+            usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 },
+          });
+        }),
+      });
+      const onCompaction = vi.fn();
+      const executor = new ChatExecutor({
+        providers: [provider],
+        sessionTokenBudget: 0,
+        sessionCompactionThreshold: 1500,
+        onCompaction,
+        retryPolicyMatrix: {
+          provider_error: { maxRetries: 0 },
+          unknown: { maxRetries: 0 },
+        },
+      });
+
+      await executor.execute(createParams({ history: buildLongHistory(10) }));
+      await executor.execute(createParams({ history: buildLongHistory(10) }));
+
+      const result = await executor.execute(
+        createParams({ history: buildLongHistory(10) }),
+      );
+
+      expect(result.compacted).toBe(false);
+      expect(result.content).toBe("response after skipped compaction");
+      expect(onCompaction).not.toHaveBeenCalled();
+    });
+
     it("second budget hit re-triggers compaction", async () => {
       const onCompaction = vi.fn();
       const provider = createMockProvider("primary", {

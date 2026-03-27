@@ -39,6 +39,7 @@ import {
 // ResolvedTraceLoggingConfig used indirectly via resolveTraceLoggingConfig
 import {
   resolveSessionTokenBudget,
+  resolveLocalCompactionThreshold,
   DEFAULT_GROK_MODEL,
 } from "./llm-provider-manager.js";
 import { hasRuntimeLimit } from "../llm/runtime-limit-policy.js";
@@ -608,8 +609,20 @@ export function createDaemonCommandRegistry(
         ctx.gateway?.config.llm,
         contextWindowTokens,
       );
+      const localCompactionThreshold = resolveLocalCompactionThreshold(
+        ctx.gateway?.config.llm,
+        contextWindowTokens,
+      );
+      const displayThreshold =
+        hasRuntimeLimit(localCompactionThreshold)
+          ? Number(localCompactionThreshold)
+          : hasRuntimeLimit(sessionTokenBudget)
+            ? Number(sessionTokenBudget)
+            : undefined;
       const ratio =
-        hasRuntimeLimit(sessionTokenBudget) ? totalTokens / sessionTokenBudget : 0;
+        typeof displayThreshold === "number" && displayThreshold > 0
+          ? totalTokens / displayThreshold
+          : 0;
       const percent = Math.min(100, Math.max(0, ratio * 100));
 
       // Build breakdown
@@ -623,8 +636,8 @@ export function createDaemonCommandRegistry(
       const model = normalizeGrokModel(ctx.gateway?.config.llm?.model) ?? "unknown";
       const provider = ctx.gateway?.config.llm?.provider ?? "unknown";
 
-      const overBudget =
-        hasRuntimeLimit(sessionTokenBudget) && totalTokens > sessionTokenBudget;
+      const compactionPending =
+        typeof displayThreshold === "number" && totalTokens > displayThreshold;
       const lines = [
         `Context Window: ${(contextWindowTokens ?? 0).toLocaleString()} tokens (${model} via ${provider})`,
         `Session Budget: ${
@@ -633,12 +646,19 @@ export function createDaemonCommandRegistry(
             : "unlimited"
         }`,
         `Used: ${totalTokens.toLocaleString()} tokens (${percent.toFixed(percent >= 10 ? 0 : 1)}%)` +
-          (overBudget ? " — COMPACTION PENDING (next message will compact)" : ""),
+          (compactionPending
+            ? " — COMPACTION PENDING (next message will compact)"
+            : ""),
         `Free: ${
-          hasRuntimeLimit(sessionTokenBudget)
-            ? `${overBudget ? "0" : Math.max(0, sessionTokenBudget - totalTokens).toLocaleString()} tokens`
-            : "unlimited"
+          typeof displayThreshold === "number"
+            ? `${compactionPending ? "0" : Math.max(0, displayThreshold - totalTokens).toLocaleString()} tokens`
+            : "unknown"
         }`,
+        `Compaction: local ${
+          typeof displayThreshold === "number"
+            ? `enabled @ ${displayThreshold.toLocaleString()} tokens`
+            : "enabled (threshold unavailable)"
+        }; provider disabled`,
         "",
         "Breakdown:",
         `  System prompt: ~${systemPromptTokens.toLocaleString()} tokens`,

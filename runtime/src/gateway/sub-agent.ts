@@ -217,6 +217,7 @@ export interface SubAgentManagerConfig {
   readonly traceProviderPayloads?: boolean;
   readonly promptBudget?: PromptBudgetConfig;
   readonly sessionTokenBudget?: number;
+  readonly sessionCompactionThreshold?: number;
   readonly economicsMode?: RuntimeBudgetMode;
   readonly onCompaction?: (sessionId: string, summary: string) => void;
 }
@@ -224,6 +225,7 @@ export interface SubAgentManagerConfig {
 export interface ResolvedSubAgentExecutionBudget {
   readonly promptBudget?: PromptBudgetConfig;
   readonly sessionTokenBudget?: number;
+  readonly sessionCompactionThreshold?: number;
   readonly providerProfile?: LLMProviderExecutionProfile;
 }
 
@@ -649,6 +651,9 @@ export class SubAgentManager {
       const resolvedSessionTokenBudget =
         resolvedExecutionBudget?.sessionTokenBudget ??
         this.config.sessionTokenBudget;
+      const resolvedSessionCompactionThreshold =
+        resolvedExecutionBudget?.sessionCompactionThreshold ??
+        this.config.sessionCompactionThreshold;
       const resolvedProviderProfile =
         resolvedExecutionBudget?.providerProfile;
       const defaultMaxToolRounds = this.config.resolveDefaultMaxToolRounds?.();
@@ -684,6 +689,7 @@ export class SubAgentManager {
           : undefined,
         promptBudget: resolvedPromptBudget,
         sessionTokenBudget: resolvedSessionTokenBudget,
+        sessionCompactionThreshold: resolvedSessionCompactionThreshold,
         onCompaction: this.config.onCompaction,
         delegationNestingDepth: handle.depth,
         defaultRunClass: "child",

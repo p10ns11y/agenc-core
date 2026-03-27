@@ -194,8 +194,41 @@ function mergeProviderEvidence(
     ...(current.citations ?? []),
     ...(incoming.citations ?? []),
   ]));
-  if (citations.length === 0) return undefined;
-  return { citations };
+  const serverSideToolCalls = [
+    ...(current.serverSideToolCalls ?? []),
+    ...(incoming.serverSideToolCalls ?? []),
+  ];
+  const serverSideToolUsageByCategory = new Map<string, number>();
+  for (const entry of [
+    ...(current.serverSideToolUsage ?? []),
+    ...(incoming.serverSideToolUsage ?? []),
+  ]) {
+    serverSideToolUsageByCategory.set(
+      entry.category,
+      (serverSideToolUsageByCategory.get(entry.category) ?? 0) + entry.count,
+    );
+  }
+  const serverSideToolUsage = [...serverSideToolUsageByCategory.entries()].map(
+    ([category, count]) => ({
+      category,
+      toolType:
+        [...(current.serverSideToolUsage ?? []), ...(incoming.serverSideToolUsage ?? [])]
+          .find((entry) => entry.category === category)?.toolType,
+      count,
+    }),
+  );
+  if (
+    citations.length === 0 &&
+    serverSideToolCalls.length === 0 &&
+    serverSideToolUsage.length === 0
+  ) {
+    return undefined;
+  }
+  return {
+    ...(citations.length > 0 ? { citations } : {}),
+    ...(serverSideToolCalls.length > 0 ? { serverSideToolCalls } : {}),
+    ...(serverSideToolUsage.length > 0 ? { serverSideToolUsage } : {}),
+  };
 }
 
 function mergeExplicitRequirementToolNames(
@@ -347,6 +380,7 @@ export class ChatExecutor {
   private readonly onStreamChunk?: StreamProgressCallback;
   private readonly allowedTools: Set<string> | null;
   private readonly sessionTokenBudget?: number;
+  private readonly sessionCompactionThreshold?: number;
   private readonly cooldownMs: number;
   private readonly maxCooldownMs: number;
   private readonly maxTrackedSessions: number;
@@ -403,6 +437,7 @@ export class ChatExecutor {
       ? new Set(config.allowedTools)
       : null;
     this.sessionTokenBudget = config.sessionTokenBudget;
+    this.sessionCompactionThreshold = config.sessionCompactionThreshold;
     this.cooldownMs = Math.max(0, config.providerCooldownMs ?? 60_000);
     this.maxCooldownMs = Math.max(0, config.maxCooldownMs ?? 300_000);
     this.maxTrackedSessions = Math.max(1, config.maxTrackedSessions ?? 10_000);
@@ -1904,26 +1939,37 @@ export class ChatExecutor {
     // Pre-check token budget — attempt compaction instead of hard fail
     let compacted = false;
     let compactedArtifactContext = params.stateful?.artifactContext;
-    if (hasRuntimeLimit(this.sessionTokenBudget)) {
-      const used = this.sessionTokens.get(sessionId) ?? 0;
-      if (isRuntimeLimitReached(used, this.sessionTokenBudget)) {
-        try {
-          const compactedResult = await this.compactHistory(
-            history,
-            sessionId,
-            params.trace,
-            params.stateful?.artifactContext,
-          );
-          history = compactedResult.history;
-          compactedArtifactContext = compactedResult.artifactContext;
-          this.resetSessionTokens(sessionId);
-          compacted = true;
-        } catch {
+    const compactionState = this.getSessionCompactionState(sessionId);
+    if (
+      compactionState.hardBudgetReached || compactionState.softThresholdReached
+    ) {
+      const cooldownSnapshot = compactionState.hardBudgetReached
+        ? undefined
+        : new Map(this.cooldowns);
+      try {
+        const compactedResult = await this.compactHistory(
+          history,
+          sessionId,
+          params.trace,
+          params.stateful?.artifactContext,
+        );
+        history = compactedResult.history;
+        compactedArtifactContext = compactedResult.artifactContext;
+        this.resetSessionTokens(sessionId);
+        compacted = true;
+      } catch {
+        if (compactionState.hardBudgetReached) {
           throw new ChatBudgetExceededError(
             sessionId,
-            used,
+            compactionState.used,
             this.sessionTokenBudget!,
           );
+        }
+        if (cooldownSnapshot) {
+          this.cooldowns.clear();
+          for (const [providerName, cooldown] of cooldownSnapshot.entries()) {
+            this.cooldowns.set(providerName, cooldown);
+          }
         }
       }
     }
@@ -2166,6 +2212,21 @@ export class ChatExecutor {
     );
 
     return { plannerSummary, durationMs };
+  }
+
+  private getSessionCompactionState(sessionId: string): {
+    readonly used: number;
+    readonly hardBudgetReached: boolean;
+    readonly softThresholdReached: boolean;
+  } {
+    const used = this.sessionTokens.get(sessionId) ?? 0;
+    return {
+      used,
+      hardBudgetReached: isRuntimeLimitReached(used, this.sessionTokenBudget),
+      softThresholdReached:
+        hasRuntimeLimit(this.sessionCompactionThreshold) &&
+        isRuntimeLimitReached(used, this.sessionCompactionThreshold),
+    };
   }
 
   private async evaluateAndRetryResponse(ctx: ExecutionContext): Promise<void> {

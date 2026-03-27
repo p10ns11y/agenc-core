@@ -2255,7 +2255,7 @@ describe("background-run-supervisor", () => {
                   enabled: true,
                   requested: true,
                   active: true,
-                  mode: "server_side_context_management",
+                  mode: "provider_managed_state",
                   threshold: 12_000,
                   observedItemCount: 1,
                   latestItem: {
@@ -3864,7 +3864,7 @@ describe("background-run-supervisor", () => {
     expect(repaired?.carryForward?.summary).not.toBe(poisonedSummary);
   });
 
-  it("stores provider compaction artifacts out of band and traces them on memory refresh", async () => {
+  it("stores provider state artifacts out of band and traces them on memory refresh", async () => {
     const publishUpdate = vi.fn(async () => undefined);
     const execute = vi.fn().mockResolvedValue(
       makeResult({
@@ -3894,7 +3894,7 @@ describe("background-run-supervisor", () => {
               enabled: true,
               requested: true,
               active: true,
-              mode: "server_side_context_management",
+              mode: "provider_managed_state",
               threshold: 12_000,
               observedItemCount: 1,
               latestItem: {
@@ -3969,7 +3969,7 @@ describe("background-run-supervisor", () => {
           expect.objectContaining({
             kind: "opaque_provider_state",
             locator: "provider:grok:compaction:cmp_1",
-            source: "grok:context_management",
+            source: "grok:provider_state",
             digest: "deadbeefcafebabe",
           }),
         ],

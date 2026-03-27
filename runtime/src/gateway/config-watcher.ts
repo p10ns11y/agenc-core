@@ -85,6 +85,12 @@ const VALID_LLM_SEARCH_MODES: ReadonlySet<string> = new Set([
   "on",
   "off",
 ]);
+const VALID_LLM_REASONING_EFFORTS: ReadonlySet<string> = new Set([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+]);
 const VALID_SUBAGENT_MODES: ReadonlySet<string> = new Set([
   "manager_tools",
   "handoff",
@@ -1906,6 +1912,281 @@ function validateLlmStatefulResponsesSection(
   }
 }
 
+function validateLlmCollectionsSearchSection(
+  collectionsSearchValue: unknown,
+  errors: string[],
+): void {
+  if (collectionsSearchValue === undefined) return;
+  if (!isRecord(collectionsSearchValue)) {
+    errors.push("llm.collectionsSearch must be an object");
+    return;
+  }
+  if (
+    collectionsSearchValue.enabled !== undefined &&
+    typeof collectionsSearchValue.enabled !== "boolean"
+  ) {
+    errors.push("llm.collectionsSearch.enabled must be a boolean");
+  }
+  if (
+    collectionsSearchValue.vectorStoreIds !== undefined &&
+    !isStringArray(collectionsSearchValue.vectorStoreIds)
+  ) {
+    errors.push("llm.collectionsSearch.vectorStoreIds must be a string array");
+  }
+  if (collectionsSearchValue.maxNumResults !== undefined) {
+    const value = collectionsSearchValue.maxNumResults;
+    if (
+      typeof value !== "number" ||
+      !Number.isInteger(value) ||
+      value < 1
+    ) {
+      errors.push(
+        "llm.collectionsSearch.maxNumResults must be a positive integer",
+      );
+    }
+  }
+  if (
+    collectionsSearchValue.enabled === true &&
+    (!isStringArray(collectionsSearchValue.vectorStoreIds) ||
+      collectionsSearchValue.vectorStoreIds.length === 0)
+  ) {
+    errors.push(
+      "llm.collectionsSearch.vectorStoreIds is required when llm.collectionsSearch.enabled is true",
+    );
+  }
+}
+
+function validateLlmWebSearchOptionsSection(
+  webSearchOptionsValue: unknown,
+  errors: string[],
+): void {
+  if (webSearchOptionsValue === undefined) return;
+  if (!isRecord(webSearchOptionsValue)) {
+    errors.push("llm.webSearchOptions must be an object");
+    return;
+  }
+  if (
+    webSearchOptionsValue.allowedDomains !== undefined &&
+    !isStringArray(webSearchOptionsValue.allowedDomains)
+  ) {
+    errors.push("llm.webSearchOptions.allowedDomains must be a string array");
+  } else if (
+    Array.isArray(webSearchOptionsValue.allowedDomains) &&
+    webSearchOptionsValue.allowedDomains.length > 5
+  ) {
+    errors.push(
+      "llm.webSearchOptions.allowedDomains must contain at most 5 entries",
+    );
+  }
+  if (
+    webSearchOptionsValue.excludedDomains !== undefined &&
+    !isStringArray(webSearchOptionsValue.excludedDomains)
+  ) {
+    errors.push("llm.webSearchOptions.excludedDomains must be a string array");
+  } else if (
+    Array.isArray(webSearchOptionsValue.excludedDomains) &&
+    webSearchOptionsValue.excludedDomains.length > 5
+  ) {
+    errors.push(
+      "llm.webSearchOptions.excludedDomains must contain at most 5 entries",
+    );
+  }
+  if (
+    webSearchOptionsValue.enableImageUnderstanding !== undefined &&
+    typeof webSearchOptionsValue.enableImageUnderstanding !== "boolean"
+  ) {
+    errors.push(
+      "llm.webSearchOptions.enableImageUnderstanding must be a boolean",
+    );
+  }
+  if (
+    Array.isArray(webSearchOptionsValue.allowedDomains) &&
+    webSearchOptionsValue.allowedDomains.length > 0 &&
+    Array.isArray(webSearchOptionsValue.excludedDomains) &&
+    webSearchOptionsValue.excludedDomains.length > 0
+  ) {
+    errors.push(
+      "llm.webSearchOptions.allowedDomains and llm.webSearchOptions.excludedDomains cannot both be set",
+    );
+  }
+}
+
+function isIsoLikeDateString(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}(?:[Tt ][^ ]+)?$/.test(value);
+}
+
+function validateLlmXSearchOptionsSection(
+  xSearchOptionsValue: unknown,
+  errors: string[],
+): void {
+  if (xSearchOptionsValue === undefined) return;
+  if (!isRecord(xSearchOptionsValue)) {
+    errors.push("llm.xSearchOptions must be an object");
+    return;
+  }
+  if (
+    xSearchOptionsValue.allowedXHandles !== undefined &&
+    !isStringArray(xSearchOptionsValue.allowedXHandles)
+  ) {
+    errors.push("llm.xSearchOptions.allowedXHandles must be a string array");
+  } else if (
+    Array.isArray(xSearchOptionsValue.allowedXHandles) &&
+    xSearchOptionsValue.allowedXHandles.length > 10
+  ) {
+    errors.push(
+      "llm.xSearchOptions.allowedXHandles must contain at most 10 entries",
+    );
+  }
+  if (
+    xSearchOptionsValue.excludedXHandles !== undefined &&
+    !isStringArray(xSearchOptionsValue.excludedXHandles)
+  ) {
+    errors.push("llm.xSearchOptions.excludedXHandles must be a string array");
+  } else if (
+    Array.isArray(xSearchOptionsValue.excludedXHandles) &&
+    xSearchOptionsValue.excludedXHandles.length > 10
+  ) {
+    errors.push(
+      "llm.xSearchOptions.excludedXHandles must contain at most 10 entries",
+    );
+  }
+  if (
+    Array.isArray(xSearchOptionsValue.allowedXHandles) &&
+    xSearchOptionsValue.allowedXHandles.length > 0 &&
+    Array.isArray(xSearchOptionsValue.excludedXHandles) &&
+    xSearchOptionsValue.excludedXHandles.length > 0
+  ) {
+    errors.push(
+      "llm.xSearchOptions.allowedXHandles and llm.xSearchOptions.excludedXHandles cannot both be set",
+    );
+  }
+  if (
+    xSearchOptionsValue.fromDate !== undefined &&
+    (typeof xSearchOptionsValue.fromDate !== "string" ||
+      !isIsoLikeDateString(xSearchOptionsValue.fromDate))
+  ) {
+    errors.push("llm.xSearchOptions.fromDate must be an ISO8601 string");
+  }
+  if (
+    xSearchOptionsValue.toDate !== undefined &&
+    (typeof xSearchOptionsValue.toDate !== "string" ||
+      !isIsoLikeDateString(xSearchOptionsValue.toDate))
+  ) {
+    errors.push("llm.xSearchOptions.toDate must be an ISO8601 string");
+  }
+  if (
+    xSearchOptionsValue.enableImageUnderstanding !== undefined &&
+    typeof xSearchOptionsValue.enableImageUnderstanding !== "boolean"
+  ) {
+    errors.push(
+      "llm.xSearchOptions.enableImageUnderstanding must be a boolean",
+    );
+  }
+  if (
+    xSearchOptionsValue.enableVideoUnderstanding !== undefined &&
+    typeof xSearchOptionsValue.enableVideoUnderstanding !== "boolean"
+  ) {
+    errors.push(
+      "llm.xSearchOptions.enableVideoUnderstanding must be a boolean",
+    );
+  }
+}
+
+function validateLlmRemoteMcpSection(
+  remoteMcpValue: unknown,
+  errors: string[],
+): void {
+  if (remoteMcpValue === undefined) return;
+  if (!isRecord(remoteMcpValue)) {
+    errors.push("llm.remoteMcp must be an object");
+    return;
+  }
+  if (
+    remoteMcpValue.enabled !== undefined &&
+    typeof remoteMcpValue.enabled !== "boolean"
+  ) {
+    errors.push("llm.remoteMcp.enabled must be a boolean");
+  }
+  if (remoteMcpValue.servers !== undefined && !Array.isArray(remoteMcpValue.servers)) {
+    errors.push("llm.remoteMcp.servers must be an array");
+  } else if (Array.isArray(remoteMcpValue.servers)) {
+    remoteMcpValue.servers.forEach((server, index) => {
+      const path = `llm.remoteMcp.servers[${index}]`;
+      if (!isRecord(server)) {
+        errors.push(`${path} must be an object`);
+        return;
+      }
+      if (
+        typeof server.serverUrl !== "string" ||
+        server.serverUrl.trim().length === 0
+      ) {
+        errors.push(`${path}.serverUrl must be a non-empty string`);
+      }
+      if (
+        typeof server.serverLabel !== "string" ||
+        server.serverLabel.trim().length === 0
+      ) {
+        errors.push(`${path}.serverLabel must be a non-empty string`);
+      }
+      if (
+        server.serverDescription !== undefined &&
+        typeof server.serverDescription !== "string"
+      ) {
+        errors.push(`${path}.serverDescription must be a string`);
+      }
+      if (server.allowedTools !== undefined && !isStringArray(server.allowedTools)) {
+        errors.push(`${path}.allowedTools must be a string array`);
+      }
+      if (
+        server.authorization !== undefined &&
+        typeof server.authorization !== "string"
+      ) {
+        errors.push(`${path}.authorization must be a string`);
+      }
+      if (server.headers !== undefined && !isRecord(server.headers)) {
+        errors.push(`${path}.headers must be an object`);
+      } else if (isRecord(server.headers)) {
+        for (const [key, value] of Object.entries(server.headers)) {
+          if (typeof value !== "string") {
+            errors.push(`${path}.headers.${key} must be a string`);
+          }
+        }
+      }
+    });
+  }
+  if (
+    remoteMcpValue.enabled === true &&
+    (!Array.isArray(remoteMcpValue.servers) || remoteMcpValue.servers.length === 0)
+  ) {
+    errors.push(
+      "llm.remoteMcp.servers is required when llm.remoteMcp.enabled is true",
+    );
+  }
+}
+
+function validateLlmStructuredOutputsSection(
+  structuredOutputsValue: unknown,
+  errors: string[],
+): void {
+  if (structuredOutputsValue === undefined) return;
+  if (!isRecord(structuredOutputsValue)) {
+    errors.push("llm.structuredOutputs must be an object");
+    return;
+  }
+  if (
+    structuredOutputsValue.enabled !== undefined &&
+    typeof structuredOutputsValue.enabled !== "boolean"
+  ) {
+    errors.push("llm.structuredOutputs.enabled must be a boolean");
+  }
+  if (
+    structuredOutputsValue.strict !== undefined &&
+    typeof structuredOutputsValue.strict !== "boolean"
+  ) {
+    errors.push("llm.structuredOutputs.strict must be a boolean");
+  }
+}
+
 function validateLlmToolRoutingSection(
   toolRoutingValue: unknown,
   errors: string[],
@@ -2356,6 +2637,40 @@ function validateLlmSection(llm: unknown, errors: string[]): void {
       errors,
     );
   }
+  validateLlmWebSearchOptionsSection(llm.webSearchOptions, errors);
+  if (llm.xSearch !== undefined && typeof llm.xSearch !== "boolean") {
+    errors.push("llm.xSearch must be a boolean");
+  }
+  validateLlmXSearchOptionsSection(llm.xSearchOptions, errors);
+  if (
+    llm.codeExecution !== undefined &&
+    typeof llm.codeExecution !== "boolean"
+  ) {
+    errors.push("llm.codeExecution must be a boolean");
+  }
+  if (
+    llm.includeEncryptedReasoning !== undefined &&
+    typeof llm.includeEncryptedReasoning !== "boolean"
+  ) {
+    errors.push("llm.includeEncryptedReasoning must be a boolean");
+  }
+  if (llm.maxTurns !== undefined) {
+    if (
+      typeof llm.maxTurns !== "number" ||
+      !Number.isInteger(llm.maxTurns) ||
+      llm.maxTurns < 1
+    ) {
+      errors.push("llm.maxTurns must be a positive integer");
+    }
+  }
+  if (llm.reasoningEffort !== undefined) {
+    requireOneOf(
+      llm.reasoningEffort,
+      "llm.reasoningEffort",
+      VALID_LLM_REASONING_EFFORTS,
+      errors,
+    );
+  }
 
   if (llm.timeoutMs !== undefined) {
     requireUnlimitedOrIntRange(
@@ -2501,6 +2816,9 @@ function validateLlmSection(llm: unknown, errors: string[]): void {
     errors.push("llm.parallelToolCalls must be a boolean");
   }
 
+  validateLlmCollectionsSearchSection(llm.collectionsSearch, errors);
+  validateLlmRemoteMcpSection(llm.remoteMcp, errors);
+  validateLlmStructuredOutputsSection(llm.structuredOutputs, errors);
   validateLlmStatefulResponsesSection(llm.statefulResponses, errors);
   validateLlmToolRoutingSection(llm.toolRouting, errors);
   validateLlmSubagentsSection(llm.subagents, errors);

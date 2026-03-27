@@ -95,7 +95,7 @@ export function buildUnsupportedCompactionDiagnostics(input: {
     enabled: true,
     requested: true,
     active: false,
-    mode: "server_side_context_management",
+    mode: "provider_managed_state",
     threshold: compaction.compactThreshold,
     observedItemCount: 0,
     fallbackReason: "unsupported",

@@ -1263,6 +1263,61 @@ describe("config loading", () => {
     expect(result.errors).toEqual([]);
   });
 
+  it("validateGatewayConfig accepts explicit xAI capability surface fields", () => {
+    const result = validateGatewayConfig(
+      makeConfig({
+        llm: {
+          provider: "grok",
+          apiKey: "test",
+          webSearch: true,
+          searchMode: "auto",
+          webSearchOptions: {
+            allowedDomains: ["docs.x.ai"],
+            enableImageUnderstanding: true,
+          },
+          xSearch: true,
+          xSearchOptions: {
+            allowedXHandles: ["xai"],
+            fromDate: "2026-03-01",
+            toDate: "2026-03-27",
+            enableVideoUnderstanding: true,
+          },
+          codeExecution: true,
+          collectionsSearch: {
+            enabled: true,
+            vectorStoreIds: ["collection-1", "collection-2"],
+            maxNumResults: 10,
+          },
+          remoteMcp: {
+            enabled: true,
+            servers: [
+              {
+                serverUrl: "https://mcp.example.com/sse",
+                serverLabel: "docs",
+                serverDescription: "Documentation MCP",
+                allowedTools: ["search_docs"],
+                authorization: "Bearer token",
+                headers: {
+                  "x-tenant": "agenc",
+                },
+              },
+            ],
+          },
+          structuredOutputs: {
+            enabled: true,
+            strict: true,
+          },
+          includeEncryptedReasoning: true,
+          maxTurns: 4,
+          reasoningEffort: "high",
+        },
+      }),
+    );
+
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
   it("validateGatewayConfig rejects invalid llm.toolRouting fields", () => {
     const result = validateGatewayConfig(
       makeConfig({
@@ -1334,6 +1389,130 @@ describe("config loading", () => {
     expect(result.errors).toContain("llm.webSearch must be a boolean");
     expect(result.errors).toContain(
       "llm.searchMode must be one of: auto, on, off",
+    );
+  });
+
+  it("validateGatewayConfig rejects invalid explicit xAI capability surface fields", () => {
+    const result = validateGatewayConfig(
+      makeConfig({
+        llm: {
+          provider: "grok",
+          apiKey: "test",
+          xSearch: "yes" as unknown as boolean,
+          webSearchOptions: {
+            allowedDomains: ["a", "b", "c", "d", "e", "f"],
+            excludedDomains: ["docs.x.ai"],
+            enableImageUnderstanding: "yes" as unknown as boolean,
+          },
+          codeExecution: "yes" as unknown as boolean,
+          xSearchOptions: {
+            allowedXHandles: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"],
+            excludedXHandles: ["xai"],
+            fromDate: "later",
+            toDate: "soon",
+            enableImageUnderstanding: "yes" as unknown as boolean,
+            enableVideoUnderstanding: "yes" as unknown as boolean,
+          },
+          collectionsSearch: {
+            enabled: true,
+            vectorStoreIds: [1, 2] as unknown as string[],
+            maxNumResults: 0,
+          },
+          remoteMcp: {
+            enabled: true,
+            servers: [
+              {
+                serverUrl: "",
+                serverLabel: "",
+                serverDescription: 1,
+                allowedTools: [1] as unknown as string[],
+                authorization: 2,
+                headers: {
+                  a: 1,
+                },
+              },
+            ],
+          },
+          structuredOutputs: {
+            enabled: "yes" as unknown as boolean,
+            strict: "yes" as unknown as boolean,
+          },
+          includeEncryptedReasoning: "yes" as unknown as boolean,
+          maxTurns: 0,
+          reasoningEffort: "deeper" as unknown as "high",
+        },
+      }),
+    );
+
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("llm.xSearch must be a boolean");
+    expect(result.errors).toContain(
+      "llm.webSearchOptions.allowedDomains must contain at most 5 entries",
+    );
+    expect(result.errors).toContain(
+      "llm.webSearchOptions.allowedDomains and llm.webSearchOptions.excludedDomains cannot both be set",
+    );
+    expect(result.errors).toContain(
+      "llm.webSearchOptions.enableImageUnderstanding must be a boolean",
+    );
+    expect(result.errors).toContain("llm.codeExecution must be a boolean");
+    expect(result.errors).toContain(
+      "llm.xSearchOptions.allowedXHandles must contain at most 10 entries",
+    );
+    expect(result.errors).toContain(
+      "llm.xSearchOptions.allowedXHandles and llm.xSearchOptions.excludedXHandles cannot both be set",
+    );
+    expect(result.errors).toContain(
+      "llm.xSearchOptions.fromDate must be an ISO8601 string",
+    );
+    expect(result.errors).toContain(
+      "llm.xSearchOptions.toDate must be an ISO8601 string",
+    );
+    expect(result.errors).toContain(
+      "llm.xSearchOptions.enableImageUnderstanding must be a boolean",
+    );
+    expect(result.errors).toContain(
+      "llm.xSearchOptions.enableVideoUnderstanding must be a boolean",
+    );
+    expect(result.errors).toContain(
+      "llm.collectionsSearch.vectorStoreIds must be a string array",
+    );
+    expect(result.errors).toContain(
+      "llm.collectionsSearch.maxNumResults must be a positive integer",
+    );
+    expect(result.errors).toContain(
+      "llm.collectionsSearch.vectorStoreIds is required when llm.collectionsSearch.enabled is true",
+    );
+    expect(result.errors).toContain(
+      "llm.remoteMcp.servers[0].serverUrl must be a non-empty string",
+    );
+    expect(result.errors).toContain(
+      "llm.remoteMcp.servers[0].serverLabel must be a non-empty string",
+    );
+    expect(result.errors).toContain(
+      "llm.remoteMcp.servers[0].serverDescription must be a string",
+    );
+    expect(result.errors).toContain(
+      "llm.remoteMcp.servers[0].allowedTools must be a string array",
+    );
+    expect(result.errors).toContain(
+      "llm.remoteMcp.servers[0].authorization must be a string",
+    );
+    expect(result.errors).toContain(
+      "llm.remoteMcp.servers[0].headers.a must be a string",
+    );
+    expect(result.errors).toContain(
+      "llm.structuredOutputs.enabled must be a boolean",
+    );
+    expect(result.errors).toContain(
+      "llm.structuredOutputs.strict must be a boolean",
+    );
+    expect(result.errors).toContain(
+      "llm.includeEncryptedReasoning must be a boolean",
+    );
+    expect(result.errors).toContain("llm.maxTurns must be a positive integer");
+    expect(result.errors).toContain(
+      "llm.reasoningEffort must be one of: low, medium, high, xhigh",
     );
   });
 

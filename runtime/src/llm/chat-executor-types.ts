@@ -406,6 +406,12 @@ export interface ChatExecutorConfig {
    * `ChatBudgetExceededError`.
    */
   readonly sessionTokenBudget?: number;
+  /**
+   * Soft local compaction threshold per session. When cumulative usage meets
+   * or exceeds this value, the executor attempts best-effort local history
+   * compaction without treating the threshold as a hard failure ceiling.
+   */
+  readonly sessionCompactionThreshold?: number;
   /** Callback when context compaction occurs (budget recovery). */
   readonly onCompaction?: (sessionId: string, summary: string) => void;
   /** Optional response evaluator/critic configuration. */

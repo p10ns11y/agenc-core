@@ -13,10 +13,10 @@
 export type MessageRole = "system" | "user" | "assistant" | "tool";
 
 /**
- * Assistant message phase for long-running/tool-heavy flows.
+ * Local assistant message phase for long-running/tool-heavy flows.
  *
- * Preserved in local history so providers that support phase-aware replay can
- * distinguish working commentary from the completed answer.
+ * Preserved in AgenC history so the runtime can distinguish working
+ * commentary from the completed answer without assuming provider support.
  */
 export type LLMAssistantPhase = "commentary" | "final_answer";
 
@@ -37,7 +37,7 @@ export type LLMContentPart =
 export interface LLMMessage {
   role: MessageRole;
   content: string | LLMContentPart[];
-  /** Optional assistant phase metadata for phase-aware replay/continuation. */
+  /** Optional local phase metadata for runtime-side replay and completion logic. */
   phase?: LLMAssistantPhase;
   /** For assistant messages that request tool execution */
   toolCalls?: LLMToolCall[];
@@ -221,13 +221,13 @@ export type LLMCompactionFallbackReason =
   | "request_rejected";
 
 /**
- * Opaque provider compaction item metadata.
+ * Opaque provider-managed state item metadata.
  *
  * The runtime stores only identifiers/digests needed for tracing and replay;
  * the payload itself stays provider-owned and out-of-band.
  */
 export interface LLMCompactionItemRef {
-  /** Provider-emitted item type, e.g. `compaction` or equivalent. */
+  /** Provider-emitted state item type. */
   readonly type: string;
   /** Provider-emitted item identifier when available. */
   readonly id?: string;
@@ -235,25 +235,23 @@ export interface LLMCompactionItemRef {
   readonly digest: string;
 }
 
-/**
- * Per-call diagnostics for provider-native context compaction.
- */
+/** Per-call diagnostics for provider-managed continuation state. */
 export interface LLMCompactionDiagnostics {
-  /** True when provider-native compaction is enabled in config for this call. */
+  /** True when provider-managed continuation state is enabled in config for this call. */
   readonly enabled: boolean;
-  /** True when the initial request attempted provider-native compaction. */
+  /** True when the initial request attempted provider-managed continuation state. */
   readonly requested: boolean;
-  /** True when the final request sent to the provider still included compaction. */
+  /** True when the final request sent to the provider still included that state feature. */
   readonly active: boolean;
-  /** Provider-specific compaction mode used for the call. */
-  readonly mode: "server_side_context_management";
-  /** Configured compaction threshold sent to the provider. */
+  /** Provider-specific state mode used for the call. */
+  readonly mode: "provider_managed_state";
+  /** Configured threshold associated with the state feature. */
   readonly threshold: number;
-  /** Number of opaque compaction items observed in the provider response. */
+  /** Number of opaque state items observed in the provider response. */
   readonly observedItemCount: number;
-  /** Latest opaque compaction item returned by the provider, if any. */
+  /** Latest opaque provider state item returned by the provider, if any. */
   readonly latestItem?: LLMCompactionItemRef;
-  /** Fallback reason when compaction had to be disabled for the call. */
+  /** Fallback reason when the state feature had to be disabled for the call. */
   readonly fallbackReason?: LLMCompactionFallbackReason;
 }
 
@@ -262,7 +260,7 @@ export interface LLMCompactionDiagnostics {
  *
  * Providers may fully support these controls, ignore them with explicit
  * unsupported diagnostics, or selectively support subsets such as
- * `previous_response_id` without opaque compaction.
+ * `previous_response_id` without provider-managed state items.
  */
 export interface LLMStatefulResponsesConfig {
   /** Enable session-scoped continuation using provider-managed response IDs. */
@@ -273,13 +271,13 @@ export interface LLMStatefulResponsesConfig {
   readonly fallbackToStateless?: boolean;
   /** Number of recent normalized turns used for reconciliation hashing. */
   readonly reconciliationWindow?: number;
-  /** Optional provider-native opaque compaction controls. */
+  /** Optional runtime/provider continuation-state controls. */
   readonly compaction?: {
-    /** Enable provider-native server-side compaction. */
+    /** Enable continuation-state compaction behavior when supported. */
     readonly enabled?: boolean;
-    /** Rendered-token threshold for provider compaction. */
+    /** Rendered-token threshold for local/provider compaction policy. */
     readonly compactThreshold?: number;
-    /** Retry once without compaction if the provider rejects the field. */
+    /** Retry once without the compaction hint if the provider rejects it. */
     readonly fallbackOnUnsupported?: boolean;
   };
 }
@@ -372,6 +370,175 @@ export interface LLMChatToolRoutingOptions {
   readonly allowedToolNames?: readonly string[];
 }
 
+export type LLMReasoningEffort = "low" | "medium" | "high" | "xhigh";
+
+export type LLMProviderNativeServerToolType =
+  | "web_search"
+  | "x_search"
+  | "code_interpreter"
+  | "file_search"
+  | "mcp"
+  | "view_image"
+  | "view_x_video";
+
+export type LLMProviderNativeServerToolCallType =
+  | "web_search_call"
+  | "x_search_call"
+  | "code_interpreter_call"
+  | "file_search_call"
+  | "mcp_call";
+
+export interface LLMProviderNativeServerToolCall {
+  /** Provider-emitted output item type such as `web_search_call`. */
+  readonly type: LLMProviderNativeServerToolCallType;
+  /** Logical server-side tool family for routing, tracing, and billing. */
+  readonly toolType: LLMProviderNativeServerToolType;
+  /** Provider-emitted call identifier when present. */
+  readonly id?: string;
+  /** Provider-emitted function/tool name when present. */
+  readonly functionName?: string;
+  /** Provider-emitted arguments payload when present. */
+  readonly arguments?: string;
+  /** Provider-emitted status string when present. */
+  readonly status?: string;
+  /** Sanitized raw provider payload for future adapter-specific enrichment. */
+  readonly raw?: Record<string, unknown>;
+}
+
+export interface LLMProviderServerSideToolUsageEntry {
+  /** Provider usage category, e.g. `SERVER_SIDE_TOOL_WEB_SEARCH`. */
+  readonly category: string;
+  /** AgenC-normalized tool family when it can be inferred. */
+  readonly toolType?: LLMProviderNativeServerToolType;
+  /** Successful invocation count reported by the provider. */
+  readonly count: number;
+}
+
+export interface LLMStructuredOutputSchema {
+  /** Structured output mode documented by the provider surface. */
+  readonly type: "json_schema";
+  /** Stable schema name sent to the provider. */
+  readonly name: string;
+  /** JSON Schema payload. */
+  readonly schema: Record<string, unknown>;
+  /** Enforce strict schema adherence when supported. */
+  readonly strict?: boolean;
+}
+
+export interface LLMStructuredOutputRequest {
+  /** Provider/runtime enable switch for structured output mode. */
+  readonly enabled?: boolean;
+  /** Optional schema payload for request-scoped structured output. */
+  readonly schema?: LLMStructuredOutputSchema;
+}
+
+export interface LLMStructuredOutputResult {
+  /** Structured output mode returned by the provider/runtime. */
+  readonly type: "json_schema";
+  /** Schema name associated with the response when available. */
+  readonly name?: string;
+  /** Parsed structured payload when AgenC or the provider validated it. */
+  readonly parsed?: unknown;
+  /** Raw JSON string content when the provider returned structured text only. */
+  readonly rawText?: string;
+}
+
+export interface LLMEncryptedReasoningDiagnostics {
+  /** True when the request explicitly asked for encrypted reasoning content. */
+  readonly requested: boolean;
+  /** True when encrypted reasoning content was present in the provider response. */
+  readonly available: boolean;
+}
+
+export interface LLMCollectionsSearchConfig {
+  /** Enable the provider-native collections/file search tool. */
+  readonly enabled?: boolean;
+  /** xAI/OpenAI-compatible collection/vector store identifiers. */
+  readonly vectorStoreIds?: readonly string[];
+  /** Optional server-side retrieval limit. */
+  readonly maxNumResults?: number;
+}
+
+export interface LLMWebSearchConfig {
+  /** Restrict web search/browsing to these domains only. */
+  readonly allowedDomains?: readonly string[];
+  /** Exclude these domains from web search/browsing. */
+  readonly excludedDomains?: readonly string[];
+  /** Enable server-side image understanding during web search. */
+  readonly enableImageUnderstanding?: boolean;
+}
+
+export interface LLMXSearchConfig {
+  /** Restrict X search to posts from these handles only. */
+  readonly allowedXHandles?: readonly string[];
+  /** Exclude posts from these handles. */
+  readonly excludedXHandles?: readonly string[];
+  /** Inclusive ISO8601 start date for X search. */
+  readonly fromDate?: string;
+  /** Inclusive ISO8601 end date for X search. */
+  readonly toDate?: string;
+  /** Enable image understanding on discovered X posts. */
+  readonly enableImageUnderstanding?: boolean;
+  /** Enable video understanding on discovered X posts. */
+  readonly enableVideoUnderstanding?: boolean;
+}
+
+export interface LLMRemoteMcpServerConfig {
+  /** xAI/OpenAI-compatible remote MCP server URL. */
+  readonly serverUrl: string;
+  /** Stable label used for tool prefixing and trace readability. */
+  readonly serverLabel: string;
+  /** Optional provider-facing description of the MCP server. */
+  readonly serverDescription?: string;
+  /** Restrict server-exposed tool names when supported. */
+  readonly allowedTools?: readonly string[];
+  /** Authorization token forwarded to the MCP server when configured. */
+  readonly authorization?: string;
+  /** Additional static headers forwarded to the MCP server. */
+  readonly headers?: Readonly<Record<string, string>>;
+}
+
+export interface LLMRemoteMcpConfig {
+  /** Enable provider-managed remote MCP tool injection. */
+  readonly enabled?: boolean;
+  /** Configured remote MCP servers exposed to the provider. */
+  readonly servers?: readonly LLMRemoteMcpServerConfig[];
+}
+
+export interface LLMStructuredOutputsConfig {
+  /** Enable provider-level structured output support. */
+  readonly enabled?: boolean;
+  /** Default strictness applied when building provider schema requests. */
+  readonly strict?: boolean;
+}
+
+export interface LLMXaiCapabilitySurface {
+  /** Enable provider-native web search tool routing. */
+  readonly webSearch?: boolean;
+  /** Provider-native web search routing preference. */
+  readonly searchMode?: "auto" | "on" | "off";
+  /** Provider-native web search filters/capabilities. */
+  readonly webSearchOptions?: LLMWebSearchConfig;
+  /** Enable provider-native X search tools. */
+  readonly xSearch?: boolean;
+  /** Provider-native X search filters/capabilities. */
+  readonly xSearchOptions?: LLMXSearchConfig;
+  /** Enable provider-native code execution / code interpreter. */
+  readonly codeExecution?: boolean;
+  /** Collections / file search configuration. */
+  readonly collectionsSearch?: LLMCollectionsSearchConfig;
+  /** Remote MCP server configuration. */
+  readonly remoteMcp?: LLMRemoteMcpConfig;
+  /** Structured output capability defaults. */
+  readonly structuredOutputs?: LLMStructuredOutputsConfig;
+  /** Request encrypted reasoning content when supported. */
+  readonly includeEncryptedReasoning?: boolean;
+  /** Maximum assistant/tool turns allowed in one provider-managed loop. */
+  readonly maxTurns?: number;
+  /** Provider-native reasoning depth control. */
+  readonly reasoningEffort?: LLMReasoningEffort;
+}
+
 export interface LLMProviderTraceEvent {
   readonly kind: "request" | "response" | "error" | "stream_event";
   readonly transport: "chat" | "chat_stream";
@@ -417,6 +584,14 @@ export interface LLMChatOptions {
   readonly stateful?: LLMChatStatefulOptions;
   readonly toolRouting?: LLMChatToolRoutingOptions;
   readonly toolChoice?: LLMToolChoice;
+  /** Optional request-scoped structured output contract. */
+  readonly structuredOutput?: LLMStructuredOutputRequest;
+  /** Request encrypted reasoning content from providers that support it. */
+  readonly includeEncryptedReasoning?: boolean;
+  /** Provider-native max-turns cap for server-side tool loops. */
+  readonly maxTurns?: number;
+  /** Provider-native reasoning depth override. */
+  readonly reasoningEffort?: LLMReasoningEffort;
   readonly trace?: LLMChatTraceOptions;
   /** Upper bound for this individual provider call. */
   readonly timeoutMs?: number;
@@ -426,6 +601,10 @@ export interface LLMChatOptions {
 
 export interface LLMProviderEvidence {
   readonly citations?: readonly string[];
+  /** Server-side tool calls attempted by the provider during the request. */
+  readonly serverSideToolCalls?: readonly LLMProviderNativeServerToolCall[];
+  /** Successful/billable server-side tool usage summary from the provider. */
+  readonly serverSideToolUsage?: readonly LLMProviderServerSideToolUsageEntry[];
 }
 
 /**
@@ -444,6 +623,10 @@ export interface LLMResponse {
   compaction?: LLMCompactionDiagnostics;
   /** Provider-side evidence from built-in/server-side tools. */
   providerEvidence?: LLMProviderEvidence;
+  /** Structured-output schema result metadata when requested/returned. */
+  structuredOutput?: LLMStructuredOutputResult;
+  /** Encrypted reasoning availability for this provider response. */
+  encryptedReasoning?: LLMEncryptedReasoningDiagnostics;
   finishReason: "stop" | "tool_calls" | "length" | "content_filter" | "error";
   /** Underlying error when finishReason is "error". */
   error?: Error;

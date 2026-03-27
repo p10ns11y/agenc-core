@@ -10,7 +10,6 @@
 import type {
   LLMChatOptions,
   LLMCompactionDiagnostics,
-  LLMCompactionFallbackReason,
   LLMProviderTraceEvent,
   LLMToolChoice,
   LLMProvider,
@@ -22,6 +21,8 @@ import type {
   LLMToolCall,
   LLMUsage,
   LLMRequestMetrics,
+  LLMProviderNativeServerToolCall,
+  LLMProviderServerSideToolUsageEntry,
   LLMTool,
   StreamProgressCallback,
   ToolCallValidationFailure,
@@ -33,7 +34,10 @@ import {
   resolveLLMStatefulResponsesConfig,
   type ResolvedLLMStatefulResponsesConfig,
 } from "../provider-capabilities.js";
-import { supportsGrokServerSideTools } from "../provider-native-search.js";
+import {
+  getProviderNativeToolDefinitions,
+  type ProviderNativeToolDefinition,
+} from "../provider-native-search.js";
 import { withTimeout } from "../timeout.js";
 import { validateToolTurnSequence } from "../tool-turn-validator.js";
 import type { GrokProviderConfig } from "./types.js";
@@ -45,11 +49,8 @@ import {
   cloneProviderTracePayload,
   computePersistedResponseReconciliationHash,
   computeReconciliationChain,
-  extractCompactionItemRefs,
   extractTraceToolNames,
-  isAssistantPhaseRejection,
   isContinuationRetrievalFailure,
-  isServerCompactionRejection,
   slimTools,
   summarizeTraceToolChoice,
   toSlimTool,
@@ -65,6 +66,28 @@ const MAX_MESSAGES_PAYLOAD_CHARS = 80_000;
 const MAX_SYSTEM_MESSAGE_CHARS = 16_000;
 const MAX_MESSAGE_CHARS_PER_ENTRY = 4_000;
 const MAX_TOOL_SCHEMA_CHARS_FOLLOWUP = 20_000;
+const DOCUMENTED_XAI_RESPONSES_FIELDS = new Set([
+  "include",
+  "input",
+  "instructions",
+  "logprobs",
+  "max_output_tokens",
+  "max_turns",
+  "model",
+  "parallel_tool_calls",
+  "previous_response_id",
+  "prompt_cache_key",
+  "reasoning",
+  "store",
+  "stream",
+  "temperature",
+  "text",
+  "tool_choice",
+  "tools",
+  "top_logprobs",
+  "top_p",
+  "user",
+]);
 
 /** Vision models known to support function-calling alongside image understanding. */
 const VISION_MODELS_WITH_TOOLS = new Set([
@@ -115,6 +138,16 @@ function normalizeTimeoutMs(timeoutMs: number | undefined): number | undefined {
     return undefined;
   }
   return Math.max(1, Math.floor(timeoutMs));
+}
+
+function sanitizeToDocumentedXaiResponsesParams(
+  params: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(params).filter(([key]) =>
+      DOCUMENTED_XAI_RESPONSES_FIELDS.has(key)
+    ),
+  );
 }
 
 type RequestTimeoutSource =
@@ -346,7 +379,7 @@ function collectParamDiagnostics(
   const tools = Array.isArray(params.tools)
     ? (params.tools as unknown[])
     : [];
-  const toolNames = extractTraceToolNames(tools);
+  const toolNames = selection?.resolvedToolNames ?? extractTraceToolNames(tools);
 
   let totalContentChars = 0;
   let maxMessageChars = 0;
@@ -750,12 +783,14 @@ export class GrokProvider implements LLMProvider {
   private readonly responseTools: Record<string, unknown>[];
   private readonly responseToolsByName = new Map<string, Record<string, unknown>>();
   private readonly responseToolCharsByName = new Map<string, number>();
-  private readonly webSearchTool?: Record<string, unknown>;
+  private readonly providerNativeTools: readonly ProviderNativeToolDefinition[];
+  private readonly providerNativeToolsByName = new Map<
+    string,
+    ProviderNativeToolDefinition
+  >();
   private readonly toolChars: number;
   private readonly statefulConfig: ResolvedLLMStatefulResponsesConfig;
   private readonly statefulSessions = new Map<string, StatefulSessionAnchor>();
-  private assistantPhaseSupported: boolean | undefined;
-  private serverCompactionSupported: boolean | undefined;
   private readonly configuredTimeoutMs: number | undefined;
 
   constructor(config: GrokProviderConfig) {
@@ -771,14 +806,12 @@ export class GrokProvider implements LLMProvider {
       config.statefulResponses,
     );
 
-    // Build tools list — optionally inject web_search
+    // Build client-side function tools plus provider-native tool definitions.
     const rawTools = [...(config.tools ?? [])];
     for (const tool of rawTools) {
       this.rawToolsByName.set(tool.function.name, tool);
     }
     const slimmed = slimTools(rawTools);
-    const webSearchEnabled =
-      config.webSearch === true && supportsGrokServerSideTools(this.config.model);
     this.tools = slimmed.tools;
     this.responseTools = this.toResponseTools(this.tools);
     for (let i = 0; i < this.tools.length; i++) {
@@ -788,13 +821,27 @@ export class GrokProvider implements LLMProvider {
       this.responseToolsByName.set(name, responseTool);
       this.responseToolCharsByName.set(name, JSON.stringify(responseTool).length);
     }
-    if (webSearchEnabled) {
-      this.webSearchTool = { type: "web_search" };
-      this.responseTools.push(this.webSearchTool);
+    this.providerNativeTools = getProviderNativeToolDefinitions({
+      provider: "grok",
+      model: this.config.model,
+      webSearch: this.config.webSearch,
+      searchMode: this.config.searchMode,
+      webSearchOptions: this.config.webSearchOptions,
+      xSearch: this.config.xSearch,
+      xSearchOptions: this.config.xSearchOptions,
+      codeExecution: this.config.codeExecution,
+      collectionsSearch: this.config.collectionsSearch,
+      remoteMcp: this.config.remoteMcp,
+    });
+    for (const definition of this.providerNativeTools) {
+      this.providerNativeToolsByName.set(definition.name, definition);
     }
     this.toolChars =
       slimmed.chars +
-      (webSearchEnabled ? JSON.stringify({ type: "web_search" }).length : 0);
+      this.providerNativeTools.reduce(
+        (sum, definition) => sum + definition.schemaChars,
+        0,
+      );
   }
 
   async chat(
@@ -867,12 +914,6 @@ export class GrokProvider implements LLMProvider {
           "chat",
           parsed.model,
         );
-        if (activePlan.assistantPhaseEnabled) {
-          this.assistantPhaseSupported = true;
-        }
-        if (activePlan.compactionDiagnostics?.active) {
-          this.serverCompactionSupported = true;
-        }
         this.persistStatefulAnchor(activePlan, parsed);
         emitProviderTraceEvent(options, {
           kind: "response",
@@ -905,50 +946,11 @@ export class GrokProvider implements LLMProvider {
       try {
         return await run(plan);
       } catch (err: unknown) {
-        if (plan.assistantPhaseEnabled && isAssistantPhaseRejection(err)) {
-          this.assistantPhaseSupported = false;
-          plan = this.buildRequestPlan(messages, options, {
-            forceStateless: plan.statefulDiagnostics?.attempted === false
-              ? false
-              : undefined,
-            fallbackReason: plan.statefulDiagnostics?.fallbackReason,
-            inheritedEvents: plan.statefulDiagnostics?.events ?? [],
-            disableAssistantPhase: true,
-            disableServerCompaction:
-              plan.compactionDiagnostics?.active !== true
-                ? true
-                : undefined,
-            compactionFallbackReason: plan.compactionDiagnostics?.fallbackReason,
-          });
-          continue;
-        }
-        if (
-          plan.compactionDiagnostics?.active &&
-          this.statefulConfig.compaction.fallbackOnUnsupported &&
-          isServerCompactionRejection(err)
-        ) {
-          this.serverCompactionSupported = false;
-          plan = this.buildRequestPlan(messages, options, {
-            forceStateless: false,
-            fallbackReason: plan.statefulDiagnostics?.fallbackReason,
-            inheritedEvents: plan.statefulDiagnostics?.events ?? [],
-            disableAssistantPhase: !plan.assistantPhaseEnabled ? true : undefined,
-            disableServerCompaction: true,
-            compactionFallbackReason: "request_rejected",
-          });
-          continue;
-        }
         if (this.shouldRetryStatelessFromStateful(err, plan.statefulDiagnostics)) {
           plan = this.buildRequestPlan(messages, options, {
             forceStateless: true,
             fallbackReason: "provider_retrieval_failure",
             inheritedEvents: plan.statefulDiagnostics?.events ?? [],
-            disableAssistantPhase: !plan.assistantPhaseEnabled ? true : undefined,
-            disableServerCompaction:
-              plan.compactionDiagnostics?.active !== true
-                ? true
-                : undefined,
-            compactionFallbackReason: plan.compactionDiagnostics?.fallbackReason,
           });
           continue;
         }
@@ -979,6 +981,7 @@ export class GrokProvider implements LLMProvider {
     let responseError: Error | undefined;
     let usage: LLMUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
     let providerEvidence: LLMResponse["providerEvidence"];
+    let encryptedReasoning: LLMResponse["encryptedReasoning"];
     const toolCallAccum = new Map<string, LLMToolCall>();
     let streamIterator: AsyncIterator<any> | null = null;
     let responseTracePayload: Record<string, unknown> | undefined;
@@ -1052,64 +1055,13 @@ export class GrokProvider implements LLMProvider {
               ),
             },
           });
-          if (plan.assistantPhaseEnabled) {
-            this.assistantPhaseSupported = true;
-          }
-          if (plan.compactionDiagnostics?.active) {
-            this.serverCompactionSupported = true;
-          }
           break;
         } catch (err: unknown) {
-          if (plan.assistantPhaseEnabled && isAssistantPhaseRejection(err)) {
-            this.assistantPhaseSupported = false;
-            plan = this.buildRequestPlan(messages, options, {
-              fallbackReason: statefulDiagnostics?.fallbackReason,
-              inheritedEvents: statefulDiagnostics?.events ?? [],
-              disableAssistantPhase: true,
-              disableServerCompaction:
-                compactionDiagnostics?.active !== true ? true : undefined,
-              compactionFallbackReason: compactionDiagnostics?.fallbackReason,
-            });
-            params = { ...plan.params, stream: true };
-            requestMetrics = {
-              ...plan.requestMetrics,
-              stream: true,
-            };
-            statefulDiagnostics = plan.statefulDiagnostics;
-            compactionDiagnostics = plan.compactionDiagnostics;
-            continue;
-          }
-          if (
-            plan.compactionDiagnostics?.active &&
-            this.statefulConfig.compaction.fallbackOnUnsupported &&
-            isServerCompactionRejection(err)
-          ) {
-            this.serverCompactionSupported = false;
-            plan = this.buildRequestPlan(messages, options, {
-              fallbackReason: statefulDiagnostics?.fallbackReason,
-              inheritedEvents: statefulDiagnostics?.events ?? [],
-              disableAssistantPhase: !plan.assistantPhaseEnabled ? true : undefined,
-              disableServerCompaction: true,
-              compactionFallbackReason: "request_rejected",
-            });
-            params = { ...plan.params, stream: true };
-            requestMetrics = {
-              ...plan.requestMetrics,
-              stream: true,
-            };
-            statefulDiagnostics = plan.statefulDiagnostics;
-            compactionDiagnostics = plan.compactionDiagnostics;
-            continue;
-          }
           if (this.shouldRetryStatelessFromStateful(err, statefulDiagnostics)) {
             plan = this.buildRequestPlan(messages, options, {
               forceStateless: true,
               fallbackReason: "provider_retrieval_failure",
               inheritedEvents: statefulDiagnostics?.events ?? [],
-              disableAssistantPhase: !plan.assistantPhaseEnabled ? true : undefined,
-              disableServerCompaction:
-                compactionDiagnostics?.active !== true ? true : undefined,
-              compactionFallbackReason: compactionDiagnostics?.fallbackReason,
             });
             params = { ...plan.params, stream: true };
             requestMetrics = {
@@ -1212,6 +1164,9 @@ export class GrokProvider implements LLMProvider {
           providerEvidence = this.extractProviderEvidence(
             response as Record<string, unknown>,
           );
+          encryptedReasoning = this.extractEncryptedReasoningDiagnostics(
+            response as Record<string, unknown>,
+          );
           const {
             toolCalls: completedToolCalls,
             normalizationIssues,
@@ -1236,18 +1191,6 @@ export class GrokProvider implements LLMProvider {
               ...statefulDiagnostics,
               responseId:
                 typeof response.id === "string" ? String(response.id) : undefined,
-            };
-          }
-          if (compactionDiagnostics) {
-            const compactionItems = extractCompactionItemRefs(
-              response as Record<string, unknown>,
-            );
-            compactionDiagnostics = {
-              ...compactionDiagnostics,
-              observedItemCount: compactionItems.length,
-              ...(compactionItems.length > 0
-                ? { latestItem: compactionItems[compactionItems.length - 1] }
-                : {}),
             };
           }
           break;
@@ -1298,6 +1241,7 @@ export class GrokProvider implements LLMProvider {
         stateful: statefulDiagnostics,
         compaction: compactionDiagnostics,
         providerEvidence,
+        encryptedReasoning,
         finishReason,
         ...(responseError ? { error: responseError } : {}),
       };
@@ -1364,9 +1308,9 @@ export class GrokProvider implements LLMProvider {
     return {
       provider: this.name,
       stateful: {
-        assistantPhase: true,
+        assistantPhase: false,
         previousResponseId: true,
-        opaqueCompaction: true,
+        opaqueCompaction: false,
         deterministicFallback: true,
       },
     } as const;
@@ -1410,9 +1354,6 @@ export class GrokProvider implements LLMProvider {
       forceStateless?: boolean;
       fallbackReason?: LLMStatefulFallbackReason;
       inheritedEvents?: readonly LLMStatefulEvent[];
-      disableAssistantPhase?: boolean;
-      disableServerCompaction?: boolean;
-      compactionFallbackReason?: LLMCompactionFallbackReason;
     },
   ): {
     params: Record<string, unknown>;
@@ -1423,31 +1364,8 @@ export class GrokProvider implements LLMProvider {
     sessionId?: string;
     reconciliationHash?: string;
     requestMessages?: readonly LLMMessage[];
-    assistantPhaseEnabled: boolean;
   } {
-    const assistantPhaseEnabled =
-      overrides?.disableAssistantPhase !== true &&
-      this.assistantPhaseSupported !== false;
-    const compactionEnabled =
-      this.statefulConfig.compaction.enabled === true &&
-      this.statefulConfig.compaction.compactThreshold !== undefined;
-    const compactionActive =
-      compactionEnabled &&
-      overrides?.disableServerCompaction !== true &&
-      this.serverCompactionSupported !== false;
-    const compactionDiagnostics = compactionEnabled
-      ? {
-        enabled: true,
-        requested: true,
-        active: compactionActive,
-        mode: "server_side_context_management" as const,
-        threshold: this.statefulConfig.compaction.compactThreshold!,
-        observedItemCount: 0,
-        ...(overrides?.compactionFallbackReason
-          ? { fallbackReason: overrides.compactionFallbackReason }
-          : {}),
-      }
-      : undefined;
+    const compactionDiagnostics = undefined;
     const sessionId = options?.stateful?.sessionId?.trim();
     if (!this.statefulConfig.enabled || !sessionId) {
       const toolSelection = this.resolveResponseTools(
@@ -1457,9 +1375,10 @@ export class GrokProvider implements LLMProvider {
         store: false,
         allowedToolNames: options?.toolRouting?.allowedToolNames,
         toolChoice: options?.toolChoice,
-        assistantPhaseEnabled,
-        contextManagementCompactThreshold:
-          compactionActive ? this.statefulConfig.compaction.compactThreshold : undefined,
+        maxTurns: options?.maxTurns,
+        reasoningEffort: options?.reasoningEffort,
+        includeEncryptedReasoning: options?.includeEncryptedReasoning,
+        structuredOutput: options?.structuredOutput,
         toolSelection,
       });
       return {
@@ -1470,7 +1389,6 @@ export class GrokProvider implements LLMProvider {
         ),
         toolSelection: built.toolSelection,
         compactionDiagnostics,
-        assistantPhaseEnabled,
       };
     }
 
@@ -1598,9 +1516,10 @@ export class GrokProvider implements LLMProvider {
       previousResponseId: continued ? previousResponseId : undefined,
       allowedToolNames: options?.toolRouting?.allowedToolNames,
       toolChoice: options?.toolChoice,
-      assistantPhaseEnabled,
-      contextManagementCompactThreshold:
-        compactionActive ? this.statefulConfig.compaction.compactThreshold : undefined,
+      maxTurns: options?.maxTurns,
+      reasoningEffort: options?.reasoningEffort,
+      includeEncryptedReasoning: options?.includeEncryptedReasoning,
+      structuredOutput: options?.structuredOutput,
       toolSelection,
     });
 
@@ -1616,7 +1535,6 @@ export class GrokProvider implements LLMProvider {
       reconciliationHash: reconciliation.anchorHash,
       requestMessages: reconciliationMessages,
       compactionDiagnostics,
-      assistantPhaseEnabled,
       statefulDiagnostics: {
         enabled: true,
         attempted,
@@ -1717,8 +1635,10 @@ export class GrokProvider implements LLMProvider {
       previousResponseId?: string;
       allowedToolNames?: readonly string[];
       toolChoice?: LLMToolChoice;
-      assistantPhaseEnabled?: boolean;
-      contextManagementCompactThreshold?: number;
+      maxTurns?: number;
+      reasoningEffort?: LLMChatOptions["reasoningEffort"];
+      includeEncryptedReasoning?: boolean;
+      structuredOutput?: LLMChatOptions["structuredOutput"];
       toolSelection?: ToolSelectionDiagnostics;
     },
   ): {
@@ -1757,7 +1677,7 @@ export class GrokProvider implements LLMProvider {
         }
       }
 
-      mapped.push(this.toOpenAIMessage(m, options?.assistantPhaseEnabled !== false));
+      mapped.push(this.toOpenAIMessage(m));
 
       // Flush collected images as a user message after the last tool message
       // in a contiguous tool-result block
@@ -1808,9 +1728,39 @@ export class GrokProvider implements LLMProvider {
       this.config.maxTokens > 0
     )
       params.max_output_tokens = this.config.maxTokens;
-    if (options?.contextManagementCompactThreshold !== undefined) {
-      params.context_management = {
-        compact_threshold: options.contextManagementCompactThreshold,
+    const maxTurns = options?.maxTurns ?? this.config.maxTurns;
+    if (
+      typeof maxTurns === "number" &&
+      Number.isFinite(maxTurns) &&
+      maxTurns > 0
+    ) {
+      params.max_turns = Math.floor(maxTurns);
+    }
+    const reasoningEffort =
+      options?.reasoningEffort ?? this.config.reasoningEffort;
+    if (reasoningEffort) {
+      params.reasoning = { effort: reasoningEffort };
+    }
+    const includeEncryptedReasoning =
+      options?.includeEncryptedReasoning ?? this.config.includeEncryptedReasoning;
+    if (includeEncryptedReasoning) {
+      params.include = ["reasoning.encrypted_content"];
+    }
+    const structuredOutputSchema = options?.structuredOutput?.schema;
+    if (
+      options?.structuredOutput?.enabled !== false &&
+      structuredOutputSchema
+    ) {
+      params.text = {
+        format: {
+          type: structuredOutputSchema.type,
+          name: structuredOutputSchema.name,
+          schema: structuredOutputSchema.schema,
+          strict:
+            structuredOutputSchema.strict ??
+            this.config.structuredOutputs?.strict ??
+            true,
+        },
       };
     }
     const selectedTools = {
@@ -1840,17 +1790,29 @@ export class GrokProvider implements LLMProvider {
         selectedTools.toolSuppressionReason = "followup_tool_schema_limit";
       }
     }
-    return { params, toolSelection: selectedTools };
+    return {
+      params: sanitizeToDocumentedXaiResponsesParams(params),
+      toolSelection: selectedTools,
+    };
   }
 
   private resolveResponseTools(
     allowedToolNames?: readonly string[],
   ): ToolSelectionDiagnostics {
-    const providerCatalogToolCount = this.responseTools.length;
-    const providerCatalogToolNames = extractTraceToolNames(this.responseTools);
+    const providerNativeTools = this.providerNativeTools;
+    const providerCatalogToolCount =
+      this.responseTools.length + providerNativeTools.length;
+    const providerCatalogToolNames = [
+      ...extractTraceToolNames(this.responseTools),
+      ...providerNativeTools.map((definition) => definition.name),
+    ];
+    const fullCatalogTools = [
+      ...this.responseTools,
+      ...providerNativeTools.map((definition) => definition.payload),
+    ];
     if (allowedToolNames === undefined) {
       return {
-        tools: this.responseTools,
+        tools: fullCatalogTools,
         chars: this.toolChars,
         requestedToolNames: [],
         resolvedToolNames: providerCatalogToolNames,
@@ -1896,6 +1858,7 @@ export class GrokProvider implements LLMProvider {
 
     const requestedToolNames = [...allowed];
     const selected: Record<string, unknown>[] = [];
+    const resolvedToolNames: string[] = [];
     let chars = 0;
     for (const name of requestedToolNames) {
       let responseTool = this.responseToolsByName.get(name);
@@ -1908,24 +1871,25 @@ export class GrokProvider implements LLMProvider {
           responseToolChars = JSON.stringify(responseTool).length;
         }
       }
-      if (!responseTool) continue;
-      selected.push(responseTool);
-      chars += responseToolChars ?? JSON.stringify(responseTool).length;
+      if (responseTool) {
+        selected.push(responseTool);
+        resolvedToolNames.push(name);
+        chars += responseToolChars ?? JSON.stringify(responseTool).length;
+        continue;
+      }
+      const providerNativeTool = this.providerNativeToolsByName.get(name);
+      if (!providerNativeTool) continue;
+      selected.push(providerNativeTool.payload);
+      resolvedToolNames.push(name);
+      chars += providerNativeTool.schemaChars;
     }
-
-    if (this.webSearchTool && allowed.has("web_search")) {
-      selected.push(this.webSearchTool);
-      chars += JSON.stringify(this.webSearchTool).length;
-    }
-
-    const resolvedToolNames = extractTraceToolNames(selected);
     const missingRequestedToolNames = requestedToolNames.filter((name) =>
       !resolvedToolNames.includes(name)
     );
 
     if (selected.length === 0) {
       return {
-        tools: this.responseTools,
+        tools: fullCatalogTools,
         chars: this.toolChars,
         requestedToolNames,
         resolvedToolNames: providerCatalogToolNames,
@@ -1949,15 +1913,11 @@ export class GrokProvider implements LLMProvider {
     };
   }
 
-  private toOpenAIMessage(
-    msg: LLMMessage,
-    preserveAssistantPhase: boolean,
-  ): Record<string, unknown> {
+  private toOpenAIMessage(msg: LLMMessage): Record<string, unknown> {
     if (msg.role === "assistant" && msg.toolCalls && msg.toolCalls.length > 0) {
       return {
         role: "assistant",
         content: msg.content,
-        ...(preserveAssistantPhase && msg.phase ? { phase: msg.phase } : {}),
         tool_calls: msg.toolCalls.map((tc) => ({
           id: tc.id,
           type: "function",
@@ -1992,9 +1952,6 @@ export class GrokProvider implements LLMProvider {
     return {
       role: msg.role,
       content: msg.content,
-      ...(msg.role === "assistant" && preserveAssistantPhase && msg.phase
-        ? { phase: msg.phase }
-        : {}),
     };
   }
 
@@ -2039,16 +1996,12 @@ export class GrokProvider implements LLMProvider {
       const toolCalls = Array.isArray(message.tool_calls)
         ? (message.tool_calls as Array<Record<string, unknown>>)
         : [];
-      const phase = message.phase;
       const items: Record<string, unknown>[] = [];
       const normalizedContent = this.normalizeResponseMessageContent(content);
       if (normalizedContent !== undefined) {
         items.push({
           role,
           content: normalizedContent,
-          ...(phase === "commentary" || phase === "final_answer"
-            ? { phase }
-            : {}),
         });
       }
       for (const tc of toolCalls) {
@@ -2123,24 +2076,13 @@ export class GrokProvider implements LLMProvider {
     const finishReason = this.mapResponseFinishReason(response, toolCalls);
     const responseId =
       typeof response?.id === "string" ? String(response.id) : undefined;
-    const compactionItems = extractCompactionItemRefs(
-      response as Record<string, unknown>,
-    );
     const stateful = statefulDiagnostics
       ? {
         ...statefulDiagnostics,
         responseId,
       }
       : undefined;
-    const compaction = compactionDiagnostics
-      ? {
-        ...compactionDiagnostics,
-        observedItemCount: compactionItems.length,
-        ...(compactionItems.length > 0
-          ? { latestItem: compactionItems[compactionItems.length - 1] }
-          : {}),
-      }
-      : undefined;
+    const compaction = compactionDiagnostics;
     const parsedError = this.extractResponseError(response, finishReason);
 
     return {
@@ -2152,6 +2094,7 @@ export class GrokProvider implements LLMProvider {
       stateful,
       compaction,
       providerEvidence: this.extractProviderEvidence(response),
+      encryptedReasoning: this.extractEncryptedReasoningDiagnostics(response),
       finishReason,
       ...(normalizationIssues.length > 0 ? { normalizationIssues } : {}),
       ...(parsedError ? { error: parsedError } : {}),
@@ -2196,8 +2139,42 @@ export class GrokProvider implements LLMProvider {
     response: Record<string, unknown>,
   ): LLMResponse["providerEvidence"] {
     const citations = this.extractCitations(response);
-    if (citations.length === 0) return undefined;
-    return { citations };
+    const serverSideToolCalls = this.extractServerSideToolCalls(response);
+    const serverSideToolUsage = this.extractServerSideToolUsage(response);
+    if (
+      citations.length === 0 &&
+      serverSideToolCalls.length === 0 &&
+      serverSideToolUsage.length === 0
+    ) {
+      return undefined;
+    }
+    return {
+      ...(citations.length > 0 ? { citations } : {}),
+      ...(serverSideToolCalls.length > 0 ? { serverSideToolCalls } : {}),
+      ...(serverSideToolUsage.length > 0 ? { serverSideToolUsage } : {}),
+    };
+  }
+
+  private extractEncryptedReasoningDiagnostics(
+    response: Record<string, unknown>,
+  ): LLMResponse["encryptedReasoning"] {
+    const output = Array.isArray(response.output)
+      ? (response.output as Array<Record<string, unknown>>)
+      : [];
+    const available = output.some(
+      (item) =>
+        item.type === "reasoning" &&
+        typeof item.encrypted_content === "string" &&
+        item.encrypted_content.length > 0,
+    );
+    const requested = this.config.includeEncryptedReasoning === true;
+    if (!requested && !available) {
+      return undefined;
+    }
+    return {
+      requested,
+      available,
+    };
   }
 
   private extractCitations(response: Record<string, unknown>): string[] {
@@ -2245,6 +2222,116 @@ export class GrokProvider implements LLMProvider {
     }
 
     return [...citations];
+  }
+
+  private extractServerSideToolCalls(
+    response: Record<string, unknown>,
+  ): readonly LLMProviderNativeServerToolCall[] {
+    const output = Array.isArray(response.output)
+      ? (response.output as Array<Record<string, unknown>>)
+      : [];
+    const calls: LLMProviderNativeServerToolCall[] = [];
+    for (const item of output) {
+      if (
+        item.type !== "web_search_call" &&
+        item.type !== "x_search_call" &&
+        item.type !== "code_interpreter_call" &&
+        item.type !== "file_search_call" &&
+        item.type !== "mcp_call"
+      ) {
+        continue;
+      }
+      calls.push({
+        type: item.type,
+        toolType: this.mapServerSideOutputTypeToToolType(item.type),
+        id: typeof item.id === "string" ? item.id : undefined,
+        functionName:
+          typeof item.name === "string"
+            ? item.name
+            : typeof item.function_name === "string"
+              ? item.function_name
+              : undefined,
+        arguments:
+          typeof item.arguments === "string"
+            ? item.arguments
+            : undefined,
+        status: typeof item.status === "string" ? item.status : undefined,
+        raw: cloneProviderTracePayload(item),
+      });
+    }
+    return calls;
+  }
+
+  private extractServerSideToolUsage(
+    response: Record<string, unknown>,
+  ): readonly LLMProviderServerSideToolUsageEntry[] {
+    const usage =
+      response.server_side_tool_usage &&
+      typeof response.server_side_tool_usage === "object" &&
+      !Array.isArray(response.server_side_tool_usage)
+        ? (response.server_side_tool_usage as Record<string, unknown>)
+        : undefined;
+    if (!usage) return [];
+
+    const entries: LLMProviderServerSideToolUsageEntry[] = [];
+    for (const [category, count] of Object.entries(usage)) {
+      if (typeof count !== "number" || !Number.isFinite(count)) continue;
+      entries.push({
+        category,
+        toolType: this.mapServerSideUsageCategoryToToolType(category),
+        count,
+      });
+    }
+    return entries;
+  }
+
+  private mapServerSideOutputTypeToToolType(
+    type: string,
+  ): "web_search" | "x_search" | "code_interpreter" | "file_search" | "mcp" {
+    switch (type) {
+      case "web_search_call":
+        return "web_search";
+      case "x_search_call":
+        return "x_search";
+      case "code_interpreter_call":
+        return "code_interpreter";
+      case "file_search_call":
+        return "file_search";
+      case "mcp_call":
+      default:
+        return "mcp";
+    }
+  }
+
+  private mapServerSideUsageCategoryToToolType(
+    category: string,
+  ):
+    | "web_search"
+    | "x_search"
+    | "code_interpreter"
+    | "file_search"
+    | "mcp"
+    | "view_image"
+    | "view_x_video"
+    | undefined {
+    switch (category) {
+      case "SERVER_SIDE_TOOL_WEB_SEARCH":
+        return "web_search";
+      case "SERVER_SIDE_TOOL_X_SEARCH":
+        return "x_search";
+      case "SERVER_SIDE_TOOL_CODE_EXECUTION":
+        return "code_interpreter";
+      case "SERVER_SIDE_TOOL_COLLECTIONS_SEARCH":
+        return "file_search";
+      case "SERVER_SIDE_TOOL_MCP":
+        return "mcp";
+      case "SERVER_SIDE_TOOL_VIEW_IMAGE":
+        return "view_image";
+      case "SERVER_SIDE_TOOL_VIEW_X_VIDEO":
+        return "view_x_video";
+      default:
+        return undefined;
+    }
   }
 
   private toToolCall(item: unknown): {

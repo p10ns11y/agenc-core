@@ -30,6 +30,29 @@ vi.mock("openai", () => {
 // Import after mock setup
 import { GrokProvider } from "./adapter.js";
 
+const DOCUMENTED_XAI_RESPONSES_FIELDS = new Set([
+  "include",
+  "input",
+  "instructions",
+  "logprobs",
+  "max_output_tokens",
+  "max_turns",
+  "model",
+  "parallel_tool_calls",
+  "previous_response_id",
+  "prompt_cache_key",
+  "reasoning",
+  "store",
+  "stream",
+  "temperature",
+  "text",
+  "tool_choice",
+  "tools",
+  "top_logprobs",
+  "top_p",
+  "user",
+]);
+
 function makeCompletion(overrides: Record<string, any> = {}) {
   return {
     status: "completed",
@@ -75,6 +98,18 @@ describe("GrokProvider", () => {
       contextWindowTokens: 99_999,
       contextWindowSource: "explicit_config",
       maxOutputTokens: 4_096,
+    });
+  });
+
+  it("does not advertise undocumented provider-side compaction support", () => {
+    const provider = new GrokProvider({ apiKey: "test-key" });
+
+    expect(provider.getCapabilities()).toMatchObject({
+      stateful: {
+        assistantPhase: false,
+        previousResponseId: true,
+        opaqueCompaction: false,
+      },
     });
   });
 
@@ -938,6 +973,70 @@ describe("GrokProvider", () => {
     expect(params.tools.some((t: any) => t.type === "web_search")).toBe(true);
   });
 
+  it("injects documented xAI provider-native tools from the capability surface", async () => {
+    mockCreate.mockResolvedValueOnce(makeCompletion());
+
+    const provider = new GrokProvider({
+      apiKey: "test-key",
+      model: "grok-4-1-fast-reasoning",
+      webSearch: true,
+      webSearchOptions: {
+        allowedDomains: ["docs.x.ai"],
+        enableImageUnderstanding: true,
+      },
+      xSearch: true,
+      xSearchOptions: {
+        allowedXHandles: ["xai"],
+        enableVideoUnderstanding: true,
+      },
+      codeExecution: true,
+      collectionsSearch: {
+        enabled: true,
+        vectorStoreIds: ["collection-123"],
+        maxNumResults: 10,
+      },
+      remoteMcp: {
+        enabled: true,
+        servers: [
+          {
+            serverUrl: "https://mcp.example.com/sse",
+            serverLabel: "docs",
+            allowedTools: ["search_docs"],
+          },
+        ],
+      },
+    });
+    await provider.chat([{ role: "user", content: "test" }]);
+
+    const params = mockCreate.mock.calls[0][0];
+    expect(params.tools).toEqual(
+      expect.arrayContaining([
+        {
+          type: "web_search",
+          filters: { allowed_domains: ["docs.x.ai"] },
+          enable_image_understanding: true,
+        },
+        {
+          type: "x_search",
+          allowed_x_handles: ["xai"],
+          enable_video_understanding: true,
+        },
+        { type: "code_interpreter" },
+        {
+          type: "file_search",
+          vector_store_ids: ["collection-123"],
+          max_num_results: 10,
+        },
+        {
+          type: "mcp",
+          server_url: "https://mcp.example.com/sse",
+          server_label: "docs",
+          allowed_tools: ["search_docs"],
+        },
+      ]),
+    );
+  });
+
   it("does not inject web_search tool for unsupported Grok models", async () => {
     mockCreate.mockResolvedValueOnce(makeCompletion());
 
@@ -950,6 +1049,80 @@ describe("GrokProvider", () => {
 
     const params = mockCreate.mock.calls[0][0];
     expect(params.tools).toBeUndefined();
+  });
+
+  it("captures documented server-side tool calls and usage in provider evidence", async () => {
+    mockCreate.mockResolvedValueOnce(
+      makeCompletion({
+        server_side_tool_usage: {
+          SERVER_SIDE_TOOL_WEB_SEARCH: 2,
+          SERVER_SIDE_TOOL_VIEW_IMAGE: 1,
+        },
+        output: [
+          {
+            type: "web_search_call",
+            id: "ws_123",
+            name: "web_search",
+            arguments: "{\"query\":\"xai\"}",
+            status: "completed",
+          },
+          {
+            type: "message",
+            content: [{ type: "output_text", text: "Hello!" }],
+          },
+        ],
+      }),
+    );
+
+    const provider = new GrokProvider({
+      apiKey: "test-key",
+      webSearch: true,
+    });
+    const response = await provider.chat([{ role: "user", content: "test" }]);
+
+    expect(response.providerEvidence?.serverSideToolCalls).toEqual([
+      {
+        type: "web_search_call",
+        toolType: "web_search",
+        id: "ws_123",
+        functionName: "web_search",
+        arguments: "{\"query\":\"xai\"}",
+        status: "completed",
+        raw: expect.objectContaining({
+          type: "web_search_call",
+          id: "ws_123",
+        }),
+      },
+    ]);
+    expect(response.providerEvidence?.serverSideToolUsage).toEqual([
+      {
+        category: "SERVER_SIDE_TOOL_WEB_SEARCH",
+        toolType: "web_search",
+        count: 2,
+      },
+      {
+        category: "SERVER_SIDE_TOOL_VIEW_IMAGE",
+        toolType: "view_image",
+        count: 1,
+      },
+    ]);
+  });
+
+  it("wires max_turns, reasoning effort, and encrypted reasoning include from config", async () => {
+    mockCreate.mockResolvedValueOnce(makeCompletion());
+
+    const provider = new GrokProvider({
+      apiKey: "test-key",
+      maxTurns: 4,
+      reasoningEffort: "high",
+      includeEncryptedReasoning: true,
+    });
+    await provider.chat([{ role: "user", content: "test" }]);
+
+    const params = mockCreate.mock.calls[0][0];
+    expect(params.max_turns).toBe(4);
+    expect(params.reasoning).toEqual({ effort: "high" });
+    expect(params.include).toEqual(["reasoning.encrypted_content"]);
   });
 
   it("disables parallel tool calls by default when tools are present", async () => {
@@ -1525,7 +1698,7 @@ describe("GrokProvider", () => {
     });
   });
 
-  it("preserves assistant phase on Responses API assistant input items", async () => {
+  it("drops undocumented assistant phase metadata from Responses API assistant input items", async () => {
     mockCreate.mockResolvedValueOnce(makeCompletion());
 
     const provider = new GrokProvider({ apiKey: "test-key" });
@@ -1543,19 +1716,13 @@ describe("GrokProvider", () => {
       {
         role: "assistant",
         content: "Checking the environment first.",
-        phase: "commentary",
       },
       { role: "user", content: "Continue." },
     ]);
   });
 
-  it("retries without assistant phase when the provider rejects the field", async () => {
-    mockCreate
-      .mockRejectedValueOnce({
-        status: 400,
-        message: "Unknown field 'phase' on assistant input item",
-      })
-      .mockResolvedValueOnce(makeCompletion({ id: "resp_phase_retry" }));
+  it("never emits assistant phase metadata in xAI Responses requests", async () => {
+    mockCreate.mockResolvedValueOnce(makeCompletion({ id: "resp_phase_retry" }));
 
     const provider = new GrokProvider({ apiKey: "test-key" });
     const response = await provider.chat([
@@ -1564,12 +1731,8 @@ describe("GrokProvider", () => {
       { role: "user", content: "Continue." },
     ]);
 
-    expect(mockCreate).toHaveBeenCalledTimes(2);
-    expect(mockCreate.mock.calls[0][0].input[1]).toMatchObject({
-      role: "assistant",
-      phase: "commentary",
-    });
-    expect(mockCreate.mock.calls[1][0].input[1]).toEqual({
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+    expect(mockCreate.mock.calls[0][0].input[1]).toEqual({
       role: "assistant",
       content: "Working...",
     });
@@ -2182,7 +2345,7 @@ describe("GrokProvider", () => {
     expect(thirdInput).toContain("phase-2 complete");
   });
 
-  it("requests server-side compaction when configured", async () => {
+  it("does not emit undocumented server-side compaction fields when local compaction is configured", async () => {
     mockCreate.mockResolvedValueOnce(makeCompletion({ id: "resp_compact_req" }));
 
     const provider = new GrokProvider({
@@ -2203,104 +2366,78 @@ describe("GrokProvider", () => {
     );
 
     const params = mockCreate.mock.calls[0][0];
-    expect(params.context_management).toEqual({ compact_threshold: 12_000 });
-    expect(response.compaction).toMatchObject({
-      enabled: true,
-      requested: true,
-      active: true,
-      threshold: 12_000,
-      observedItemCount: 0,
-    });
+    expect(params.context_management).toBeUndefined();
+    expect(response.compaction).toBeUndefined();
   });
 
-  it("parses opaque provider compaction items into response diagnostics", async () => {
-    mockCreate.mockResolvedValueOnce(
-      makeCompletion({
-        id: "resp_compacted",
-        output: [
-          {
-            type: "compaction",
-            id: "cmp_1",
-            encrypted_content: "opaque",
-          },
-          {
-            type: "message",
-            content: [{ type: "output_text", text: "Hello after compaction!" }],
-          },
-        ],
-      }),
-    );
+  it("emits only xAI-documented top-level Responses fields", async () => {
+    mockCreate.mockResolvedValueOnce(makeCompletion({ id: "resp_documented_fields" }));
 
     const provider = new GrokProvider({
       apiKey: "test-key",
+      maxTokens: 128,
+      temperature: 0.2,
+      parallelToolCalls: true,
       statefulResponses: {
         enabled: true,
         store: true,
         compaction: {
           enabled: true,
-          compactThreshold: 8_000,
+          compactThreshold: 12_000,
         },
       },
-    });
-
-    const response = await provider.chat(
-      [{ role: "user", content: "compact if needed" }],
-      { stateful: { sessionId: "sess-compact-items" } },
-    );
-
-    expect(response.compaction).toMatchObject({
-      enabled: true,
-      requested: true,
-      active: true,
-      observedItemCount: 1,
-      latestItem: {
-        type: "compaction",
-        id: "cmp_1",
-      },
-    });
-    expect(response.compaction?.latestItem?.digest).toMatch(/^[0-9a-f]{16}$/);
-  });
-
-  it("retries without server-side compaction when the provider rejects context_management", async () => {
-    mockCreate
-      .mockRejectedValueOnce({
-        status: 400,
-        message: "Unknown field 'context_management.compact_threshold'",
-      })
-      .mockResolvedValueOnce(makeCompletion({ id: "resp_compact_retry" }));
-
-    const provider = new GrokProvider({
-      apiKey: "test-key",
-      statefulResponses: {
-        enabled: true,
-        store: true,
-        compaction: {
-          enabled: true,
-          compactThreshold: 20_000,
-          fallbackOnUnsupported: true,
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "system.readFile",
+            description: "Read a file",
+            parameters: {
+              type: "object",
+              properties: { path: { type: "string" } },
+              required: ["path"],
+            },
+          },
         },
-      },
+      ],
     });
 
-    const response = await provider.chat(
+    await provider.chat(
       [{ role: "user", content: "hello" }],
-      { stateful: { sessionId: "sess-compact-retry" } },
+      {
+        toolChoice: "required",
+        stateful: { sessionId: "sess-documented-fields" },
+      },
     );
 
-    expect(mockCreate).toHaveBeenCalledTimes(2);
-    expect(mockCreate.mock.calls[0][0].context_management).toEqual({
-      compact_threshold: 20_000,
-    });
-    expect(mockCreate.mock.calls[1][0].context_management).toBeUndefined();
-    expect(response.compaction).toMatchObject({
-      enabled: true,
-      requested: true,
-      active: false,
-      fallbackReason: "request_rejected",
-    });
+    const params = mockCreate.mock.calls[0][0];
+    expect(Object.keys(params).every((key) => DOCUMENTED_XAI_RESPONSES_FIELDS.has(key))).toBe(
+      true,
+    );
   });
 
-  it("keeps continuation behavior stable with and without provider compaction", async () => {
+  it("does not emit undocumented assistant phase metadata into xAI response input items", async () => {
+    mockCreate.mockResolvedValueOnce(makeCompletion({ id: "resp_no_phase" }));
+
+    const provider = new GrokProvider({
+      apiKey: "test-key",
+      statefulResponses: {
+        enabled: true,
+        store: true,
+      },
+    });
+
+    await provider.chat([
+      { role: "user", content: "first" },
+      { role: "assistant", content: "working", phase: "commentary" },
+      { role: "user", content: "continue" },
+    ]);
+
+    const params = mockCreate.mock.calls[0][0];
+    expect(JSON.stringify(params.input)).not.toContain("\"phase\"");
+  });
+
+  it("keeps continuation behavior stable with and without local compaction config", async () => {
     mockCreate
       .mockResolvedValueOnce(
         makeCompletion({
@@ -2318,13 +2455,6 @@ describe("GrokProvider", () => {
         makeCompletion({
           id: "resp_compact_1",
           output_text: "Compact first",
-          output: [
-            { type: "compaction", id: "cmp_ab_1", encrypted_content: "opaque" },
-            {
-              type: "message",
-              content: [{ type: "output_text", text: "Compact first" }],
-            },
-          ],
         }),
       )
       .mockResolvedValueOnce(
@@ -2386,13 +2516,8 @@ describe("GrokProvider", () => {
     expect(mockCreate.mock.calls[1][0].previous_response_id).toBe("resp_plain_1");
     expect(mockCreate.mock.calls[1][0].context_management).toBeUndefined();
     expect(mockCreate.mock.calls[3][0].previous_response_id).toBe("resp_compact_1");
-    expect(mockCreate.mock.calls[3][0].context_management).toEqual({
-      compact_threshold: 10_000,
-    });
-    expect(compactFollowUp.compaction).toMatchObject({
-      enabled: true,
-      active: true,
-    });
+    expect(mockCreate.mock.calls[3][0].context_management).toBeUndefined();
+    expect(compactFollowUp.compaction).toBeUndefined();
   });
 
   it("falls back stateless on reconciliation mismatch and emits mismatch diagnostics", async () => {

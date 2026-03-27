@@ -109,6 +109,7 @@ import {
   resolveLlmContextWindowTokens as resolveLlmContextWindowTokensStandalone,
   resolveProviderExecutionBudget as resolveProviderExecutionBudgetStandalone,
   buildPromptBudgetConfig,
+  resolveLocalCompactionThreshold,
   resolveSessionTokenBudget,
   DEFAULT_GROK_MODEL,
   type LLMProviderConfigCatalogEntry,
@@ -1429,6 +1430,10 @@ export class DaemonManager {
       config.llm,
       contextWindowTokens,
     );
+    const subAgentSessionCompactionThreshold = resolveLocalCompactionThreshold(
+      config.llm,
+      contextWindowTokens,
+    );
     const subAgentPromptBudget = buildPromptBudgetConfig(
       config.llm,
       contextWindowTokens,
@@ -1473,6 +1478,7 @@ export class DaemonManager {
       maxDepth: resolved.maxDepth,
       promptBudget: subAgentPromptBudget,
       sessionTokenBudget: subAgentSessionTokenBudget,
+      sessionCompactionThreshold: subAgentSessionCompactionThreshold,
       economicsMode: config.llm?.economicsMode ?? "enforce",
       onCompaction: this.handleCompaction,
       resolveExecutionBudget: async ({ selectedProvider }) =>
@@ -1996,6 +2002,10 @@ export class DaemonManager {
       config.llm,
       contextWindowTokens,
     );
+    const sessionCompactionThreshold = resolveLocalCompactionThreshold(
+      config.llm,
+      contextWindowTokens,
+    );
     const promptBudget = buildPromptBudgetConfig(
       config.llm,
       contextWindowTokens,
@@ -2027,6 +2037,7 @@ export class DaemonManager {
       promptBudget,
       maxToolRounds: defaultForegroundMaxToolRounds,
       sessionTokenBudget,
+      sessionCompactionThreshold,
       onCompaction: this.handleCompaction,
       llmConfig: config.llm,
       subagentConfig: resolvedSubAgentConfig,
@@ -3451,6 +3462,10 @@ export class DaemonManager {
         newConfig.llm,
         contextWindowTokens,
       );
+      const sessionCompactionThreshold = resolveLocalCompactionThreshold(
+        newConfig.llm,
+        contextWindowTokens,
+      );
       const promptBudget = buildPromptBudgetConfig(
         newConfig.llm,
         contextWindowTokens,
@@ -3489,6 +3504,7 @@ export class DaemonManager {
         promptBudget,
         maxToolRounds: defaultForegroundMaxToolRounds,
         sessionTokenBudget,
+        sessionCompactionThreshold,
         onCompaction: this.handleCompaction,
         llmConfig: newConfig.llm,
         subagentConfig: resolvedSubAgentConfig,
@@ -4044,7 +4060,6 @@ export class DaemonManager {
       desktopRouterFactory: this._desktopRouterFactory ?? undefined,
       systemPrompt: voicePrompt,
       voice: config.voice?.voice ?? "Ara",
-      model: config.voice?.model ?? DEFAULT_GROK_MODEL,
       mode: config.voice?.mode ?? "vad",
       vadThreshold: config.voice?.vadThreshold,
       vadSilenceDurationMs: config.voice?.vadSilenceDurationMs,

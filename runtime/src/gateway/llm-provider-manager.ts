@@ -11,6 +11,7 @@ import type {
   LLMProvider,
   LLMProviderExecutionProfile,
   LLMTool,
+  LLMXaiCapabilitySurface,
 } from "../llm/types.js";
 import type { GatewayLLMConfig } from "./types.js";
 import type { Logger } from "../utils/logger.js";
@@ -22,6 +23,7 @@ import {
 } from "./context-window.js";
 import { supportsProviderNativeWebSearch } from "../llm/provider-native-search.js";
 import { resolveGatewayStatefulResponses } from "./llm-stateful-defaults.js";
+import { hasRuntimeLimit } from "../llm/runtime-limit-policy.js";
 
 // ============================================================================
 // Constants
@@ -36,6 +38,26 @@ function normalizeOptionalPositiveInt(value: number | undefined): number | undef
   }
   const normalized = Math.floor(value);
   return normalized > 0 ? normalized : undefined;
+}
+
+function buildGrokCapabilitySurface(
+  llmConfig: GatewayLLMConfig,
+  nativeWebSearchEnabled: boolean,
+): LLMXaiCapabilitySurface {
+  return {
+    webSearch: nativeWebSearchEnabled,
+    searchMode: llmConfig.searchMode,
+    webSearchOptions: llmConfig.webSearchOptions,
+    xSearch: llmConfig.xSearch,
+    xSearchOptions: llmConfig.xSearchOptions,
+    codeExecution: llmConfig.codeExecution,
+    collectionsSearch: llmConfig.collectionsSearch,
+    remoteMcp: llmConfig.remoteMcp,
+    structuredOutputs: llmConfig.structuredOutputs,
+    includeEncryptedReasoning: llmConfig.includeEncryptedReasoning,
+    maxTurns: normalizeOptionalPositiveInt(llmConfig.maxTurns),
+    reasoningEffort: llmConfig.reasoningEffort,
+  };
 }
 
 // ============================================================================
@@ -67,6 +89,7 @@ export interface CreateLLMProvidersResult {
 export interface ResolvedProviderExecutionBudget {
   readonly promptBudget?: ReturnType<typeof buildPromptBudgetConfig>;
   readonly sessionTokenBudget?: number;
+  readonly sessionCompactionThreshold?: number;
   readonly providerProfile?: LLMProviderExecutionProfile;
 }
 
@@ -131,6 +154,41 @@ export function resolveSessionTokenBudget(
     return DEFAULT_SESSION_TOKEN_BUDGET;
   }
   return DEFAULT_SESSION_TOKEN_BUDGET;
+}
+
+export function resolveLocalCompactionThreshold(
+  llmConfig: GatewayLLMConfig | undefined,
+  contextWindowTokens?: number,
+): number | undefined {
+  const sessionTokenBudget = resolveSessionTokenBudget(
+    llmConfig,
+    contextWindowTokens,
+  );
+  if (hasRuntimeLimit(sessionTokenBudget)) {
+    return sessionTokenBudget;
+  }
+  const provider = llmConfig?.provider;
+  if (!provider) return undefined;
+  const resolvedStatefulResponses = resolveGatewayStatefulResponses(
+    provider,
+    llmConfig?.statefulResponses,
+  );
+  if (
+    resolvedStatefulResponses.config?.enabled === false ||
+    resolvedStatefulResponses.config?.compaction?.enabled !== true
+  ) {
+    return undefined;
+  }
+  const compactThreshold =
+    resolvedStatefulResponses.config.compaction.compactThreshold;
+  if (
+    typeof compactThreshold !== "number" ||
+    !Number.isFinite(compactThreshold) ||
+    compactThreshold <= 0
+  ) {
+    return undefined;
+  }
+  return Math.floor(compactThreshold);
 }
 
 // ============================================================================
@@ -283,6 +341,10 @@ export async function resolveProviderExecutionBudget(
       budgetConfig,
       providerProfile?.contextWindowTokens,
     ),
+    sessionCompactionThreshold: resolveLocalCompactionThreshold(
+      budgetConfig,
+      providerProfile?.contextWindowTokens,
+    ),
     providerProfile,
   };
 }
@@ -304,8 +366,6 @@ export async function createSingleLLMProvider(
     apiKey,
     model,
     baseUrl,
-    webSearch,
-    searchMode,
     timeoutMs,
     parallelToolCalls,
     maxTokens,
@@ -323,9 +383,13 @@ export async function createSingleLLMProvider(
       const nativeWebSearchEnabled = supportsProviderNativeWebSearch({
         provider,
         model: normalizedModel,
-        webSearch,
-        searchMode,
+        webSearch: llmConfig.webSearch,
+        searchMode: llmConfig.searchMode,
       });
+      const grokCapabilitySurface = buildGrokCapabilitySurface(
+        llmConfig,
+        nativeWebSearchEnabled,
+      );
       if (resolvedStatefulResponses.usedDefaults) {
         logger.info(
           "Enabled Grok stateful response defaults for provider continuity",
@@ -342,13 +406,12 @@ export async function createSingleLLMProvider(
         contextWindowTokens: normalizeOptionalPositiveInt(
           llmConfig.contextWindowTokens,
         ),
-        webSearch: nativeWebSearchEnabled,
-        searchMode,
         timeoutMs,
         maxTokens: normalizeOptionalPositiveInt(maxTokens),
         parallelToolCalls,
         statefulResponses: resolvedStatefulResponses.config,
         tools,
+        ...grokCapabilitySurface,
       });
     }
     case "ollama": {
