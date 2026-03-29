@@ -19,6 +19,7 @@ import {
 } from "./errors.js";
 import { inferExplicitFileWriteTarget } from "./chat-executor-planner-execution.js";
 import type { ArtifactCompactionState } from "../memory/artifact-store.js";
+import type { Pipeline } from "../workflow/pipeline.js";
 
 // ============================================================================
 // Test helpers
@@ -4697,6 +4698,48 @@ describe("ChatExecutor", () => {
       expect(options?.toolRouting?.allowedToolNames).toEqual([
         "system.bash",
         "system.readFile",
+      ]);
+    });
+
+    it("preserves the routed tool subset across follow-up tool-loop recalls", async () => {
+      const toolHandler = vi.fn().mockResolvedValue("ok");
+      const provider = createMockProvider("primary", {
+        chat: vi
+          .fn()
+          .mockResolvedValueOnce(
+            mockResponse({
+              content: "",
+              finishReason: "tool_calls",
+              toolCalls: [
+                {
+                  id: "tc-1",
+                  name: "system.bash",
+                  arguments: '{"command":"pwd"}',
+                },
+              ],
+            }),
+          )
+          .mockResolvedValueOnce(mockResponse({ content: "done" })),
+      });
+      const executor = new ChatExecutor({ providers: [provider], toolHandler });
+
+      await executor.execute(
+        createParams({
+          toolRouting: {
+            routedToolNames: ["system.bash"],
+          },
+        }),
+      );
+
+      const firstOptions = (provider.chat as ReturnType<typeof vi.fn>).mock
+        .calls[0][1] as LLMChatOptions | undefined;
+      const secondOptions = (provider.chat as ReturnType<typeof vi.fn>).mock
+        .calls[1][1] as LLMChatOptions | undefined;
+      expect(firstOptions?.toolRouting?.allowedToolNames).toEqual([
+        "system.bash",
+      ]);
+      expect(secondOptions?.toolRouting?.allowedToolNames).toEqual([
+        "system.bash",
       ]);
     });
 
@@ -12531,6 +12574,197 @@ describe("ChatExecutor", () => {
       expect(pipelineExecutor.execute).toHaveBeenCalledTimes(1);
     });
 
+    it("preserves the same request-tree budget scope across planner verifier retries", async () => {
+      const provider = createMockProvider("primary", {
+        chat: vi
+          .fn()
+          .mockResolvedValueOnce(
+            mockResponse({
+              content: safeJson({
+                reason: "verifier_retry_budget_scope",
+                requiresSynthesis: false,
+                steps: [
+                  {
+                    name: "delegate_a",
+                    step_type: "subagent_task",
+                    objective: "Inspect CI failures and report grounded findings.",
+                    input_contract: "CI logs are available.",
+                    acceptance_criteria: ["Ground findings in the logs."],
+                    required_tool_capabilities: ["read_file"],
+                    context_requirements: ["ci_logs"],
+                    execution_context: {
+                      workspace_root: "/tmp/project",
+                      allowed_read_roots: ["/tmp/project"],
+                      required_source_artifacts: ["/tmp/project/ci.log"],
+                      effect_class: "read_only",
+                      verification_mode: "grounded_read",
+                      step_kind: "delegated_review",
+                    },
+                    max_budget_hint: "2m",
+                    can_run_parallel: true,
+                  },
+                  {
+                    name: "delegate_b",
+                    step_type: "subagent_task",
+                    objective: "Verify the first grounded findings against CI logs.",
+                    input_contract: "First review findings are available.",
+                    acceptance_criteria: ["Cross-check the findings against the logs."],
+                    required_tool_capabilities: ["read_file"],
+                    context_requirements: ["ci_logs", "delegate_a"],
+                    execution_context: {
+                      workspace_root: "/tmp/project",
+                      allowed_read_roots: ["/tmp/project"],
+                      required_source_artifacts: ["/tmp/project/ci.log"],
+                      effect_class: "read_only",
+                      verification_mode: "grounded_read",
+                      step_kind: "delegated_review",
+                    },
+                    max_budget_hint: "2m",
+                    can_run_parallel: true,
+                  },
+                ],
+              }),
+            }),
+          )
+          .mockResolvedValueOnce(
+            mockResponse({
+              content: safeJson({
+                overall: "retry",
+                confidence: 0.2,
+                unresolved: ["Need another grounded pass."],
+                steps: [
+                  {
+                    name: "delegate_a",
+                    verdict: "retry",
+                    confidence: 0.2,
+                    retryable: true,
+                    issues: ["insufficient_grounding"],
+                    summary: "Need another grounded pass.",
+                  },
+                  {
+                    name: "delegate_b",
+                    verdict: "retry",
+                    confidence: 0.2,
+                    retryable: true,
+                    issues: ["insufficient_grounding"],
+                    summary: "Need another grounded pass.",
+                  },
+                ],
+              }),
+            }),
+          )
+          .mockResolvedValueOnce(
+            mockResponse({
+              content: safeJson({
+                overall: "pass",
+                confidence: 0.96,
+                unresolved: [],
+                steps: [
+                  {
+                    name: "delegate_a",
+                    verdict: "pass",
+                    confidence: 0.96,
+                    retryable: true,
+                    issues: [],
+                    summary: "Grounded review is sufficient.",
+                  },
+                  {
+                    name: "delegate_b",
+                    verdict: "pass",
+                    confidence: 0.96,
+                    retryable: true,
+                    issues: [],
+                    summary: "Grounded review is sufficient.",
+                  },
+                ],
+              }),
+            }),
+          ),
+      });
+      const pipelineExecutor = {
+        execute: vi.fn().mockResolvedValue({
+          status: "completed",
+          context: {
+            results: {
+              delegate_a: safeJson({
+                status: "completed",
+                subagentSessionId: "sub-review-a",
+                success: true,
+                durationMs: 15,
+                output: "Grounded CI findings.",
+                toolCalls: [
+                  {
+                    name: "system.readFile",
+                    args: { path: "/tmp/project/ci.log" },
+                    result: '{"content":"ci failure"}',
+                    isError: false,
+                  },
+                ],
+              }),
+              delegate_b: safeJson({
+                status: "completed",
+                subagentSessionId: "sub-review-b",
+                success: true,
+                durationMs: 15,
+                output: "Verified grounded CI findings.",
+                toolCalls: [
+                  {
+                    name: "system.readFile",
+                    args: { path: "/tmp/project/ci.log" },
+                    result: '{"content":"ci failure"}',
+                    isError: false,
+                  },
+                ],
+              }),
+            },
+          },
+          completedSteps: 2,
+          totalSteps: 2,
+        }),
+      };
+      const executor = new ChatExecutor({
+        providers: [provider],
+        toolHandler: vi.fn().mockResolvedValue("unused"),
+        plannerEnabled: true,
+        pipelineExecutor: pipelineExecutor as any,
+        delegationDecision: {
+          enabled: true,
+          scoreThreshold: 0.1,
+        },
+        subagentVerifier: {
+          enabled: true,
+          force: true,
+          maxRounds: 2,
+          minConfidence: 0.9,
+        },
+      });
+
+      const result = await executor.execute(
+        createParams({
+          message: createMessage(
+            "First analyze child outputs against CI logs, then verify evidence quality, and retry delegated grounding if verifier confidence is too low.",
+          ),
+        }),
+      );
+
+      expect(pipelineExecutor.execute).toHaveBeenCalledTimes(2);
+      const firstPipeline = pipelineExecutor.execute.mock.calls[0]?.[0] as
+        | Pipeline
+        | undefined;
+      const secondPipeline = pipelineExecutor.execute.mock.calls[1]?.[0] as
+        | Pipeline
+        | undefined;
+      expect(firstPipeline?.requestTreeBudgetKey).toBeDefined();
+      expect(firstPipeline?.requestTreeBudgetKey).toBe(
+        secondPipeline?.requestTreeBudgetKey,
+      );
+      expect(result.plannerSummary?.subagentVerification).toMatchObject({
+        enabled: true,
+        performed: true,
+        rounds: 2,
+      });
+    });
+
     it("uses unlimited end-to-end timeout by default", async () => {
       const provider = createMockProvider("primary", {
         chat: vi.fn().mockResolvedValue(
@@ -15209,10 +15443,9 @@ describe("ChatExecutor", () => {
                 {
                   name: "update_plan",
                   step_type: "subagent_task",
-                  objective:
-                    "Update PLAN.md with the integrated reviewer feedback.",
+                  objective: "Finalize the delegated plan artifact.",
                   input_contract:
-                    "Reviewer feedback has already been synthesized for PLAN.md.",
+                    "Consume the concrete reviewer handoff artifact.",
                   acceptance_criteria: [
                     "PLAN.md is updated with the integrated feedback.",
                   ],
@@ -15231,6 +15464,17 @@ describe("ChatExecutor", () => {
                     effect_class: "filesystem_write",
                     verification_mode: "mutation_required",
                     step_kind: "delegated_write",
+                    role: "writer",
+                    artifact_relations: [
+                      {
+                        relation_type: "read_dependency",
+                        artifact_path: `${workspaceRoot}/PLAN.md`,
+                      },
+                      {
+                        relation_type: "write_owner",
+                        artifact_path: `${workspaceRoot}/PLAN.md`,
+                      },
+                    ],
                     fallback_policy: "fail_request",
                     resume_policy: "checkpoint_resume",
                     approval_profile: "filesystem_write",
@@ -19628,6 +19872,37 @@ describe("ChatExecutor", () => {
           }),
         }),
       );
+    });
+
+    it("fails closed before execution when preserved state cannot be honored by the route", async () => {
+      const provider = createMockProvider("ollama", {
+        getCapabilities: () => ({
+          provider: "ollama",
+          stateful: {
+            assistantPhase: false,
+            previousResponseId: false,
+            encryptedReasoning: false,
+            storedResponseRetrieval: false,
+            storedResponseDeletion: false,
+            opaqueCompaction: false,
+            deterministicFallback: true,
+          },
+        }),
+      });
+      const executor = new ChatExecutor({ providers: [provider] });
+
+      await expect(
+        executor.execute(
+          createParams({
+            sessionId: "stateful-unavailable",
+            message: {
+              ...createMessage("continue"),
+              sessionId: "stateful-unavailable",
+            },
+          }),
+        ),
+      ).rejects.toThrow(/stateful continuation/i);
+      expect(provider.chat).not.toHaveBeenCalled();
     });
 
     it("passes the full normalized history into reconciliationMessages", async () => {

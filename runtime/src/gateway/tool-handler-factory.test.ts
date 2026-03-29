@@ -4034,6 +4034,7 @@ describe("createSessionToolHandler", () => {
           }],
           tokenUsage: undefined,
           providerName: "mock",
+          completionState: "completed",
           stopReason: "completed",
         }),
       getInfo: vi.fn(() => ({ status: "completed" })),
@@ -4078,6 +4079,86 @@ describe("createSessionToolHandler", () => {
       "system.writeFile",
     ]);
     expect(subAgentManager.spawn).not.toHaveBeenCalled();
+  });
+
+  it("records degraded tool-contract state when execute_with_agent resolves abstract capabilities into concrete child tools", async () => {
+    const hostWorkspaceRoot = createTempDir("delegated-file-system-contract-");
+    const subAgentManager = {
+      spawn: vi.fn(async () => "subagent:spawned"),
+      getResult: vi
+        .fn()
+        .mockReturnValueOnce(null)
+        .mockReturnValue(makeCompletedChildResult({
+          sessionId: "subagent:spawned",
+          output: '{"summary":"workspace scaffolded"}',
+          success: true,
+          durationMs: 25,
+          toolCalls: [{
+            name: "system.writeFile",
+            args: {
+              path: "/workspace/runtime/package.json",
+              content: '{"name":"runtime"}',
+            },
+            result: '{"ok":true}',
+            isError: false,
+            durationMs: 5,
+          }],
+          tokenUsage: undefined,
+          providerName: "mock",
+        })),
+      getInfo: vi.fn(() => ({ status: "completed" })),
+    };
+
+    const handler = createSessionToolHandler({
+      sessionId: "session-parent",
+      baseHandler: vi.fn(async () => "should-not-run"),
+      availableToolNames: [
+        "system.listDir",
+        "system.writeFile",
+        "system.mkdir",
+        "system.bash",
+      ],
+      routerId: "router-a",
+      send: vi.fn(),
+      defaultWorkingDirectory: hostWorkspaceRoot,
+      delegation: () => ({
+        subAgentManager: subAgentManager as any,
+        policyEngine: null,
+        verifier: null,
+        lifecycleEmitter: null,
+      }),
+    });
+
+    const result = await handler("execute_with_agent", {
+      task: "Scaffold project and implement the game files in the desktop workspace",
+      objective:
+        "Scaffold project and implement the game files in the desktop workspace",
+      inputContract: "JSON output with created files",
+      requiredToolCapabilities: ["file_system"],
+    });
+    expect(result).toContain("delegatedScopeTrust");
+    expect(subAgentManager.spawn).toHaveBeenCalledTimes(1);
+    expect(subAgentManager.spawn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tools: [
+          "system.listDir",
+          "system.writeFile",
+          "system.mkdir",
+          "system.bash",
+        ],
+        delegationSpec: expect.objectContaining({
+          toolContract: expect.objectContaining({
+            state: "degraded",
+            requiredSubstitution: [
+              "system.listDir",
+              "system.writeFile",
+              "system.mkdir",
+            ],
+            optionalEnrichment: ["system.bash"],
+          }),
+        }),
+      }),
+    );
   });
 
   it("keeps the explicit execute_with_agent delegation spec while promoting an objective-rich child prompt", async () => {
