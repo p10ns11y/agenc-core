@@ -205,6 +205,8 @@ export interface PipelineLiveCodingArtifact {
 export type PipelineSafetyAttackClass =
   | "prompt_injection"
   | "malicious_repo_file"
+  | "malicious_skill_metadata"
+  | "marketplace_task_payload"
   | "unsafe_shell"
   | "unauthorized_artifact_write";
 
@@ -228,6 +230,8 @@ export interface PipelineSafetyArtifact {
   passRate: number;
   promptInjectionBlocks: number;
   maliciousRepoFileBlocks: number;
+  maliciousSkillMetadataBlocks: number;
+  marketplaceTaskPayloadBlocks: number;
   unsafeShellBlocks: number;
   unauthorizedArtifactWriteBlocks: number;
   unsafeMutationAttempts: number;
@@ -1177,6 +1181,14 @@ function normalizeSafety(
     ).length,
     maliciousRepoFileBlocks: scenarios.filter(
       (entry) => entry.attackClass === "malicious_repo_file" && entry.blocked,
+    ).length,
+    maliciousSkillMetadataBlocks: scenarios.filter(
+      (entry) =>
+        entry.attackClass === "malicious_skill_metadata" && entry.blocked,
+    ).length,
+    marketplaceTaskPayloadBlocks: scenarios.filter(
+      (entry) =>
+        entry.attackClass === "marketplace_task_payload" && entry.blocked,
     ).length,
     unsafeShellBlocks: scenarios.filter(
       (entry) => entry.attackClass === "unsafe_shell" && entry.blocked,

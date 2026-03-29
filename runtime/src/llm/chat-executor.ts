@@ -72,6 +72,7 @@ import {
   buildDefaultExecutionContext,
 } from "./chat-executor-types.js";
 import type {
+  DetailedSkillInjectionResult,
   SkillInjector,
   MemoryRetriever,
   ToolCallRecord,
@@ -177,6 +178,13 @@ interface DetailedMemoryRetriever extends MemoryRetriever {
   ): Promise<DetailedMemoryRetrievalResult>;
 }
 
+interface DetailedSkillInjector extends SkillInjector {
+  injectDetailed(
+    message: string,
+    sessionId: string,
+  ): Promise<DetailedSkillInjectionResult>;
+}
+
 function isDetailedMemoryRetriever(
   provider: SkillInjector | MemoryRetriever | undefined,
 ): provider is DetailedMemoryRetriever {
@@ -184,6 +192,16 @@ function isDetailedMemoryRetriever(
     !!provider &&
     "retrieveDetailed" in provider &&
     typeof provider.retrieveDetailed === "function"
+  );
+}
+
+function isDetailedSkillInjector(
+  provider: SkillInjector | MemoryRetriever | undefined,
+): provider is DetailedSkillInjector {
+  return (
+    !!provider &&
+    "injectDetailed" in provider &&
+    typeof provider.injectDetailed === "function"
   );
 }
 
@@ -2893,19 +2911,56 @@ export class ChatExecutor {
     const isSkillInjector = "inject" in provider;
     const providerKind = isSkillInjector ? "skill" : "memory";
     try {
+      const detailedSkillResult =
+        providerKind === "skill" && isDetailedSkillInjector(provider)
+          ? await provider.injectDetailed(message, sessionId)
+          : undefined;
       const detailedMemoryResult =
         providerKind === "memory" && isDetailedMemoryRetriever(provider)
           ? await provider.retrieveDetailed(message, sessionId)
           : undefined;
+      const sectionMaxChars = this.getContextSectionMaxChars(section);
       const context =
-        isSkillInjector
-          ? await provider.inject(message, sessionId)
+        providerKind === "skill"
+          ? (detailedSkillResult?.content ??
+            await (provider as SkillInjector).inject(message, sessionId))
           : (detailedMemoryResult?.content ??
             await (provider as MemoryRetriever).retrieve(message, sessionId));
-      const sectionMaxChars = this.getContextSectionMaxChars(section);
-      const truncatedContext = typeof context === "string" && context.length > 0
+      const hasDetailedSkillSplit =
+        providerKind === "skill" &&
+        (typeof detailedSkillResult?.trustedContent === "string" ||
+          typeof detailedSkillResult?.untrustedContent === "string");
+      const truncatedTrustedContext =
+        providerKind === "skill" &&
+          typeof detailedSkillResult?.trustedContent === "string" &&
+          detailedSkillResult.trustedContent.length > 0
+          ? truncateText(detailedSkillResult.trustedContent, sectionMaxChars)
+          : undefined;
+      const truncatedUntrustedContext =
+        providerKind === "skill" &&
+          typeof detailedSkillResult?.untrustedContent === "string" &&
+          detailedSkillResult.untrustedContent.length > 0
+          ? truncateText(detailedSkillResult.untrustedContent, sectionMaxChars)
+          : undefined;
+      const truncatedContext = (!hasDetailedSkillSplit) &&
+          typeof context === "string" &&
+          context.length > 0
         ? truncateText(context, sectionMaxChars)
         : undefined;
+      if (truncatedTrustedContext) {
+        messages.push({
+          role: "system",
+          content: truncatedTrustedContext,
+        });
+        sections.push(section);
+      }
+      if (truncatedUntrustedContext) {
+        messages.push({
+          role: "user",
+          content: truncatedUntrustedContext,
+        });
+        sections.push("user");
+      }
       if (truncatedContext) {
         messages.push({
           role: "system",
@@ -2913,6 +2968,10 @@ export class ChatExecutor {
         });
         sections.push(section);
       }
+      const injectedChars =
+        (truncatedTrustedContext?.length ?? 0) +
+        (truncatedUntrustedContext?.length ?? 0) +
+        (truncatedContext?.length ?? 0);
       this.emitExecutionTrace(ctx, {
         type: "context_injected",
         phase: "initial",
@@ -2920,11 +2979,25 @@ export class ChatExecutor {
         payload: {
           providerKind,
           section,
-          injected: Boolean(truncatedContext),
+          injected: Boolean(
+            truncatedTrustedContext ||
+              truncatedUntrustedContext ||
+              truncatedContext,
+          ),
           originalChars: typeof context === "string" ? context.length : 0,
-          injectedChars: typeof truncatedContext === "string"
-            ? truncatedContext.length
-            : 0,
+          injectedChars,
+          ...(detailedSkillResult
+            ? {
+                trustedOriginalChars:
+                  detailedSkillResult.trustedContent?.length ?? 0,
+                trustedInjectedChars:
+                  truncatedTrustedContext?.length ?? 0,
+                untrustedOriginalChars:
+                  detailedSkillResult.untrustedContent?.length ?? 0,
+                untrustedInjectedChars:
+                  truncatedUntrustedContext?.length ?? 0,
+              }
+            : {}),
           ...(detailedMemoryResult
             ? {
                 curatedIncluded: detailedMemoryResult.curatedIncluded ?? false,
