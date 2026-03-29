@@ -1,3 +1,10 @@
+## PR #69: test(eval): add missing phase 8 incident fixtures
+- **Date:** 2026-03-29
+- **Files changed:** Phase 8 orchestration incident fixture pairs under `runtime/benchmarks/v1/incidents/`
+- **What worked:** the follow-up branch isolated the ten missing fixture files cleanly, and rerunning the orchestration baseline immediately confirmed the incident corpus and manifest were back in sync after the larger cleanup sweep merged
+- **What didn't:** those files were left untracked during the original Phase 8 merge, so they missed PR #68 and had to be shipped as a small corrective follow-up instead of landing with the rest of the regression rebuild
+- **Rule added to CLAUDE.md:** no
+
 ## PR #68: refactor(runtime): complete orchestration cleanup sweep
 - **Date:** 2026-03-29
 - **Files changed:** runtime workflow/planner/verifier/gateway semantics, eval replay/gate suites, orchestration incident fixtures, regression coverage, runtime architecture docs, cleanup prompts
