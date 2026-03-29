@@ -93,6 +93,15 @@ describe("contract-backed verification integration", () => {
       output: "Completed the requested guide update.",
       toolCalls: [
         {
+          name: "system.listDir",
+          args: { path: workspace },
+          result: JSON.stringify({
+            path: workspace,
+            entries: ["AGENC.md"],
+          }),
+          isError: false,
+        },
+        {
           name: "system.readFile",
           args: { path: targetPath },
           result: JSON.stringify({
@@ -107,6 +116,46 @@ describe("contract-backed verification integration", () => {
           result: JSON.stringify({
             path: targetPath,
             written: true,
+          }),
+          isError: false,
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
+  });
+
+  it("accepts grounded PLAN.md no-op success for the final writer when reviewer findings are already incorporated", () => {
+    const workspace = "/tmp/agenc-verification-plan-noop";
+    const targetPath = `${workspace}/PLAN.md`;
+    const result = validateDelegatedOutputContract({
+      spec: {
+        task: "update_plan_md",
+        objective: "Update PLAN.md with integrated reviewer findings when needed.",
+        inputContract:
+          "Consume the concrete reviewer handoff artifact, inspect PLAN.md, and either update it or report a grounded no-op.",
+        acceptanceCriteria: [
+          "State that PLAN.md already contains the integrated reviewer findings if no mutation is needed.",
+        ],
+        executionContext: {
+          version: "v1",
+          workspaceRoot: workspace,
+          requiredSourceArtifacts: [targetPath],
+          targetArtifacts: [targetPath],
+          stepKind: "delegated_write",
+          verificationMode: "mutation_required",
+          role: "writer",
+        },
+      },
+      output:
+        "PLAN.md already contains the integrated reviewer findings. No mutation needed.",
+      toolCalls: [
+        {
+          name: "system.readFile",
+          args: { path: targetPath },
+          result: JSON.stringify({
+            path: targetPath,
+            content: "# PLAN\nIntegrated reviewer findings already present.\n",
           }),
           isError: false,
         },

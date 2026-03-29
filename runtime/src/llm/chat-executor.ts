@@ -45,6 +45,7 @@ import { deriveWorkflowProgressSnapshot } from "../workflow/completion-progress.
 import { isDocumentationArtifactPath } from "../workflow/artifact-paths.js";
 import {
   buildModelRoutingPolicy,
+  resolveParallelToolCallPolicy,
   resolveModelRoute,
   type ModelRoutingPolicy,
 } from "./model-routing-policy.js";
@@ -928,6 +929,11 @@ export class ChatExecutor {
   private resolveRoutingDecision(
     ctx: ExecutionContext,
     phase: ChatCallUsageRecord["phase"],
+    requirements?: {
+      readonly statefulContinuationRequired?: boolean;
+      readonly structuredOutputRequired?: boolean;
+      readonly routedToolNames?: readonly string[];
+    },
   ) {
     const runClass = this.resolveRunClassForPhase(ctx, phase);
     const pressure = getRuntimeBudgetPressure(
@@ -943,6 +949,7 @@ export class ChatExecutor {
         runClass,
         pressure,
         degradedProviderNames: this.buildDegradedProviderNames(),
+        requirements,
       }),
     };
   }
@@ -1947,11 +1954,36 @@ export class ChatExecutor {
     const effectiveCallSections = groundingMessage && input.callSections
       ? [...input.callSections, "system_runtime" as const]
       : input.callSections;
-    const routingDecision = this.resolveRoutingDecision(ctx, input.phase);
+    const requestedStructuredOutput =
+      input.structuredOutput?.enabled === false ||
+        input.structuredOutput?.schema === undefined
+        ? undefined
+        : input.structuredOutput;
+    let routingDecision: ReturnType<ChatExecutor["resolveRoutingDecision"]>;
+    try {
+      routingDecision = this.resolveRoutingDecision(ctx, input.phase, {
+        statefulContinuationRequired:
+          allowStatefulContinuation && Boolean(input.statefulSessionId),
+        structuredOutputRequired: requestedStructuredOutput !== undefined,
+        routedToolNames: effectiveRoutedToolNames,
+      });
+    } catch (error) {
+      const annotated = annotateFailureError(
+        error,
+        `${input.phase} routing preflight`,
+      );
+      this.setStopReason(ctx, annotated.stopReason, annotated.stopReasonDetail);
+      throw annotated.error;
+    }
+    const parallelToolCalls = resolveParallelToolCallPolicy({
+      policy: this.modelRoutingPolicy,
+      selectedProviderName: routingDecision.route.selectedProviderName,
+      phase: input.phase,
+    });
     const structuredOutput =
-      input.structuredOutput &&
-      this.supportsStructuredOutputsForProviders(routingDecision.route.providers)
-        ? input.structuredOutput
+      requestedStructuredOutput &&
+      routingDecision.route.selectedProviderName === "grok"
+        ? requestedStructuredOutput
         : undefined;
     if (
       this.economicsPolicy.mode === "enforce" &&
@@ -1987,6 +2019,7 @@ export class ChatExecutor {
             : typeof input.toolChoice === "string"
             ? input.toolChoice
             : input.toolChoice.name,
+        parallelToolCalls,
         structuredOutputSchemaName: structuredOutput?.schema?.name,
         messageCount: effectiveCallMessages.length,
         groundingMessageAdded: Boolean(groundingMessage),
@@ -2032,6 +2065,7 @@ export class ChatExecutor {
           ...(input.toolChoice !== undefined
             ? { toolChoice: input.toolChoice }
             : {}),
+          parallelToolCalls,
           ...(structuredOutput !== undefined
             ? { structuredOutput }
             : {}),
@@ -2092,13 +2126,6 @@ export class ChatExecutor {
       }),
     );
     return next.response;
-  }
-
-  private supportsStructuredOutputsForProviders(
-    providers: readonly LLMProvider[],
-  ): boolean {
-    return providers.length > 0 &&
-      providers.every((provider) => provider.name === "grok");
   }
 
   private async runPipelineWithTimeout(
@@ -2814,6 +2841,7 @@ export class ChatExecutor {
       reconciliationMessages?: readonly LLMMessage[];
       routedToolNames?: readonly string[];
       toolChoice?: LLMToolChoice;
+      parallelToolCalls?: boolean;
       requestDeadlineAt?: number;
       signal?: AbortSignal;
       trace?: ChatExecuteParams["trace"];

@@ -9,6 +9,7 @@
 
 import type { LLMProviderEvidence } from "../llm/types.js";
 import type { DelegationExecutionContext } from "./delegation-execution-context.js";
+import type { WorkflowStepRole } from "../workflow/execution-envelope.js";
 import {
   PROVIDER_NATIVE_FILE_SEARCH_TOOL,
   PROVIDER_NATIVE_RESEARCH_TOOL_NAMES,
@@ -70,6 +71,7 @@ export interface DelegationContractSpec {
     readonly sourceSteps?: readonly string[];
   };
   readonly lastValidationCode?: DelegationOutputValidationCode;
+  readonly toolContract?: DelegatedToolContractResolution;
 }
 
 export interface DelegationValidationToolCall {
@@ -82,23 +84,27 @@ export interface DelegationValidationToolCall {
 export interface DelegationValidationProviderEvidence
   extends LLMProviderEvidence {}
 
+export const DELEGATION_OUTPUT_VALIDATION_CODES = [
+  "empty_output",
+  "empty_structured_payload",
+  "expected_json_object",
+  "acceptance_count_mismatch",
+  "acceptance_evidence_missing",
+  "acceptance_probe_failed",
+  "missing_behavior_harness",
+  "forbidden_phase_action",
+  "blocked_phase_output",
+  "contradictory_completion_claim",
+  "missing_successful_tool_evidence",
+  "low_signal_browser_evidence",
+  "missing_workspace_inspection_evidence",
+  "missing_file_mutation_evidence",
+  "missing_required_source_evidence",
+  "missing_file_artifact_evidence",
+] as const;
+
 export type DelegationOutputValidationCode =
-  | "empty_output"
-  | "empty_structured_payload"
-  | "expected_json_object"
-  | "acceptance_count_mismatch"
-  | "acceptance_evidence_missing"
-  | "acceptance_probe_failed"
-  | "missing_behavior_harness"
-  | "forbidden_phase_action"
-  | "blocked_phase_output"
-  | "contradictory_completion_claim"
-  | "missing_successful_tool_evidence"
-  | "low_signal_browser_evidence"
-  | "missing_workspace_inspection_evidence"
-  | "missing_file_mutation_evidence"
-  | "missing_required_source_evidence"
-  | "missing_file_artifact_evidence";
+  typeof DELEGATION_OUTPUT_VALIDATION_CODES[number];
 
 export interface DelegationOutputValidationResult {
   readonly ok: boolean;
@@ -113,6 +119,19 @@ export interface DelegatedChildToolAllowlistRefinement {
   readonly blockedReason?: string;
 }
 
+export type DelegatedToolContractState = "exact" | "enriched" | "degraded";
+
+export interface DelegatedToolContractResolution {
+  readonly state: DelegatedToolContractState;
+  readonly requestedSource: readonly string[];
+  readonly requestedConcreteTools: readonly string[];
+  readonly requestedSemanticCapabilities: readonly string[];
+  readonly resolvedTools: readonly string[];
+  readonly missingRequestedTools: readonly string[];
+  readonly optionalEnrichment: readonly string[];
+  readonly requiredSubstitution: readonly string[];
+}
+
 export interface ResolvedDelegatedChildToolScope
   extends DelegatedChildToolAllowlistRefinement {
   readonly semanticFallback: readonly string[];
@@ -120,6 +139,7 @@ export interface ResolvedDelegatedChildToolScope
   readonly removedAsDelegationTools: readonly string[];
   readonly removedAsUnknownTools: readonly string[];
   readonly allowsToollessExecution: boolean;
+  readonly toolContract: DelegatedToolContractResolution;
 }
 
 const EMPTY_DELEGATION_OUTPUT_VALUES = new Set(["null", "undefined", "{}", "[]"]);
@@ -545,7 +565,16 @@ function hasReviewFindingsIntent(spec: DelegationContractSpec): boolean {
   return REVIEW_FINDINGS_TASK_RE.test(text) && REVIEW_FINDINGS_OUTPUT_RE.test(text);
 }
 
-function isReviewFindingsDelegatedTask(spec: DelegationContractSpec): boolean {
+function getDelegatedWorkflowRole(
+  spec: DelegationContractSpec,
+): WorkflowStepRole | undefined {
+  return spec.executionContext?.role;
+}
+
+function isReviewerDelegatedTask(spec: DelegationContractSpec): boolean {
+  if (getDelegatedWorkflowRole(spec) === "reviewer") {
+    return true;
+  }
   if (!hasReviewFindingsIntent(spec)) {
     return false;
   }
@@ -1304,12 +1333,23 @@ function outputClaimsAlreadySatisfiedWithoutMutation(output: string): boolean {
     !FILE_MUTATION_CLAIM_RE.test(output);
 }
 
+function parsedOutputClaimsAlreadySatisfiedWithoutMutation(
+  parsedOutput: Record<string, unknown> | undefined,
+): boolean {
+  return typeof parsedOutput?.reportedOutcome === "string" &&
+    parsedOutput.reportedOutcome.trim().toLowerCase() === "already_satisfied";
+}
+
 function hasExplicitTargetFileNoopSatisfactionEvidence(
   spec: DelegationContractSpec,
   output: string,
+  parsedOutput: Record<string, unknown> | undefined,
   toolCalls: readonly DelegationValidationToolCall[],
 ): boolean {
-  if (!outputClaimsAlreadySatisfiedWithoutMutation(output)) {
+  if (
+    !outputClaimsAlreadySatisfiedWithoutMutation(output) &&
+    !parsedOutputClaimsAlreadySatisfiedWithoutMutation(parsedOutput)
+  ) {
     return false;
   }
 
@@ -1370,7 +1410,14 @@ function validateRequiredSourceArtifactEvidence(
     return undefined;
   }
 
-  if (hasExplicitTargetFileNoopSatisfactionEvidence(spec, output, toolCalls)) {
+  if (
+    hasExplicitTargetFileNoopSatisfactionEvidence(
+      spec,
+      output,
+      parsedOutput,
+      toolCalls,
+    )
+  ) {
     return undefined;
   }
 
@@ -1844,6 +1891,8 @@ export function resolveDelegatedChildToolScope(params: {
   const allowedTools: string[] = [];
   const explicitRequestedTools: string[] = [];
   const semanticFallback: string[] = [];
+  const requiredSubstitutionCandidates: string[] = [];
+  const optionalEnrichmentCandidates: string[] = [];
   const capabilityProfile = getDelegatedCapabilityProfile(params.spec);
   const taskIntent = classifyDelegatedTaskIntent(params.spec);
   const requireBrowser = specRequiresMeaningfulBrowserEvidence(params.spec);
@@ -1921,6 +1970,9 @@ export function resolveDelegatedChildToolScope(params: {
       removalBucket: removedByPolicy,
       preserveExplicitRequest: true,
     });
+    if (!requiredSubstitutionCandidates.includes(toolName)) {
+      requiredSubstitutionCandidates.push(toolName);
+    }
   };
 
   if (
@@ -1947,16 +1999,29 @@ export function resolveDelegatedChildToolScope(params: {
     addRequestedSemanticTool("system.bash");
   }
 
-  const addSemanticFallback = (toolName: string): void => {
+  const addSemanticFallback = (
+    toolName: string,
+    classification: "optional_enrichment" | "required_substitution" =
+      "optional_enrichment",
+  ): void => {
     if (!semanticFallback.includes(toolName)) {
       semanticFallback.push(toolName);
+    }
+    const bucket = classification === "required_substitution"
+      ? requiredSubstitutionCandidates
+      : optionalEnrichmentCandidates;
+    if (!bucket.includes(toolName)) {
+      bucket.push(toolName);
     }
     addCandidate(toolName);
   };
 
-  const addShellSemanticFallback = (): void => {
-    addSemanticFallback("desktop.bash");
-    addSemanticFallback("system.bash");
+  const addShellSemanticFallback = (
+    classification: "optional_enrichment" | "required_substitution" =
+      "optional_enrichment",
+  ): void => {
+    addSemanticFallback("desktop.bash", classification);
+    addSemanticFallback("system.bash", classification);
   };
 
   if (
@@ -2057,13 +2122,45 @@ export function resolveDelegatedChildToolScope(params: {
   const profiledSemanticFallback = semanticFallback.filter((toolName) =>
     profiledAllowedTools.includes(toolName)
   );
+  const missingRequestedTools = requested.filter((toolName) =>
+    !profiledAllowedTools.includes(toolName)
+  );
+  const filteredRequiredSubstitution = requiredSubstitutionCandidates.filter(
+    (toolName) => profiledAllowedTools.includes(toolName),
+  );
+  const nonRequestedAllowedTools = profiledAllowedTools.filter((toolName) =>
+    !refinedExplicitRequestedTools.includes(toolName),
+  );
+  const inferredRequiredSubstitution = missingRequestedTools.length > 0
+    ? nonRequestedAllowedTools
+    : [];
+  const requiredSubstitution = normalizeToolNames([
+    ...filteredRequiredSubstitution,
+    ...inferredRequiredSubstitution,
+  ]);
+  const optionalEnrichment = optionalEnrichmentCandidates.filter((toolName) =>
+    profiledAllowedTools.includes(toolName) &&
+    !requiredSubstitution.includes(toolName)
+  );
+  const toolContractState: DelegatedToolContractState =
+    requiredSubstitution.length > 0 || missingRequestedTools.length > 0
+      ? "degraded"
+      : optionalEnrichment.length > 0
+      ? "enriched"
+      : "exact";
   const explicitAllowlistUnsatisfied =
     strictExplicitToolAllowlist &&
-    requested.length > 0 &&
-    profiledAllowedTools.length === 0;
+    (
+      missingRequestedTools.length > 0 ||
+      profiledAllowedTools.some((toolName) =>
+        !refinedExplicitRequestedTools.includes(toolName)
+      )
+    );
   const allowsToollessExecution =
     !explicitAllowlistUnsatisfied &&
     profiledAllowedTools.length === 0 &&
+    (requestedSource.length === 0 || contextOnlyCapabilityRequest) &&
+    requested.length === 0 &&
     !specRequiresSuccessfulToolEvidence(params.spec) &&
     !refined.blockedReason;
 
@@ -2080,6 +2177,16 @@ export function resolveDelegatedChildToolScope(params: {
     removedAsDelegationTools,
     removedAsUnknownTools,
     allowsToollessExecution,
+    toolContract: {
+      state: toolContractState,
+      requestedSource,
+      requestedConcreteTools: requested,
+      requestedSemanticCapabilities: semanticCapabilities,
+      resolvedTools: profiledAllowedTools,
+      missingRequestedTools,
+      optionalEnrichment,
+      requiredSubstitution,
+    },
   };
 }
 
@@ -3786,7 +3893,7 @@ function validateContradictoryCompletionClaim(
   parsedOutput: Record<string, unknown> | undefined,
   toolCalls: readonly DelegationValidationToolCall[] | undefined,
 ): DelegationOutputValidationResult | undefined {
-  if (isReviewFindingsDelegatedTask(spec)) {
+  if (isReviewerDelegatedTask(spec)) {
     return undefined;
   }
   const stringValues = [
@@ -3848,7 +3955,7 @@ function validateBlockedPhaseOutput(
   output: string,
   parsedOutput: Record<string, unknown> | undefined,
 ): DelegationOutputValidationResult | undefined {
-  if (isReviewFindingsDelegatedTask(spec)) {
+  if (isReviewerDelegatedTask(spec)) {
     return undefined;
   }
   const stringValues = [
@@ -3939,7 +4046,14 @@ function validateFileMutationEvidence(
   }
 
   if (!hasAnyToolCallFileMutationEvidence(toolCalls)) {
-    if (hasExplicitTargetFileNoopSatisfactionEvidence(spec, output, toolCalls)) {
+    if (
+      hasExplicitTargetFileNoopSatisfactionEvidence(
+        spec,
+        output,
+        parsedOutput,
+        toolCalls,
+      )
+    ) {
       return undefined;
     }
     return validationFailure(
