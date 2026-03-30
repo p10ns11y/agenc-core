@@ -921,7 +921,8 @@ describe("SubAgentOrchestrator", () => {
     });
 
     expect(manager.spawnCalls).toHaveLength(1);
-    expect(manager.spawnCalls[0]?.timeoutMs).toBe(4_800);
+    // MIN_DELEGATION_TIMEOUT_MS (120s) clamps 4800ms up to 120000ms
+    expect(manager.spawnCalls[0]?.timeoutMs).toBe(120_000);
   });
 
   it("derives a larger child tool budget for long delegated steps", async () => {

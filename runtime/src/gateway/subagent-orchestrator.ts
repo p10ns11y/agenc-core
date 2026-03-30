@@ -2544,11 +2544,33 @@ export class SubAgentOrchestrator implements DeterministicPipelineExecutor {
   } {
     const parentPolicyAllowed = resolveParentPolicyAllowlistFn(pipeline, this.allowedParentTools);
     const availableTools = this.resolveAvailableToolNames();
-    const requestedTools =
+    const baseRequestedTools =
       step.executionContext?.allowedTools &&
         step.executionContext.allowedTools.length > 0
         ? step.executionContext.allowedTools
         : safeStepStringArray(step.requiredToolCapabilities);
+    // Enrich tool set based on execution context requirements.
+    // Sub-agents with verificationMode need read/bash tools to satisfy
+    // their verification contract; the planner often under-specifies
+    // requiredToolCapabilities to only include write tools.
+    const verificationEnrichment: string[] = [];
+    const verificationMode = step.executionContext?.verificationMode;
+    if (verificationMode && verificationMode !== "none") {
+      const has = (name: string) =>
+        baseRequestedTools.some((t) => t === name);
+      if (!has("system.readFile")) {
+        verificationEnrichment.push("system.readFile");
+      }
+      if (
+        verificationMode !== "grounded_read" &&
+        !has("system.bash")
+      ) {
+        verificationEnrichment.push("system.bash");
+      }
+    }
+    const requestedTools = verificationEnrichment.length > 0
+      ? [...baseRequestedTools, ...verificationEnrichment]
+      : baseRequestedTools;
     const resolvedScope = resolveDelegatedChildToolScope({
       spec: {
         task: step.name,
