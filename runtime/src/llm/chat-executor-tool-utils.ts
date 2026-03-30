@@ -966,8 +966,6 @@ export function checkToolLoopStuckDetection(
     stuckState.consecutiveAllFailedRounds++;
   } else {
     stuckState.consecutiveAllFailedRounds = 0;
-    stuckState.consecutiveSemanticDuplicateRounds = 0;
-    stuckState.lastRoundSemanticKey = "";
   }
   if (stuckState.consecutiveAllFailedRounds >= MAX_CONSECUTIVE_ALL_FAILED_ROUNDS) {
     return {
@@ -976,30 +974,32 @@ export function checkToolLoopStuckDetection(
     };
   }
 
-  if (roundFailures === roundCalls.length) {
-    const roundSemanticKey = roundCalls
-      .map((call) => buildSemanticToolCallKey(call.name, call.args))
-      .sort()
-      .join("|");
-    if (
-      roundSemanticKey.length > 0 &&
-      roundSemanticKey === stuckState.lastRoundSemanticKey
-    ) {
-      stuckState.consecutiveSemanticDuplicateRounds++;
-    } else {
-      stuckState.consecutiveSemanticDuplicateRounds = 0;
-    }
-    stuckState.lastRoundSemanticKey = roundSemanticKey;
-    if (
-      stuckState.consecutiveSemanticDuplicateRounds >=
-      MAX_CONSECUTIVE_SEMANTIC_DUPLICATE_ROUNDS
-    ) {
-      return {
-        shouldBreak: true,
-        reason:
-          "Detected repeated semantically equivalent tool rounds with no material progress",
-      };
-    }
+  // Semantic duplicate detection — catches loops where the model makes
+  // identical tool calls regardless of success/failure.  Previously this
+  // only fired when every call in the round failed, which let successful
+  // identical writes (same file, same content) loop forever.
+  const roundSemanticKey = roundCalls
+    .map((call) => buildSemanticToolCallKey(call.name, call.args))
+    .sort()
+    .join("|");
+  if (
+    roundSemanticKey.length > 0 &&
+    roundSemanticKey === stuckState.lastRoundSemanticKey
+  ) {
+    stuckState.consecutiveSemanticDuplicateRounds++;
+  } else {
+    stuckState.consecutiveSemanticDuplicateRounds = 0;
+  }
+  stuckState.lastRoundSemanticKey = roundSemanticKey;
+  if (
+    stuckState.consecutiveSemanticDuplicateRounds >=
+    MAX_CONSECUTIVE_SEMANTIC_DUPLICATE_ROUNDS
+  ) {
+    return {
+      shouldBreak: true,
+      reason:
+        "Detected repeated semantically equivalent tool rounds with no material progress",
+    };
   }
 
   return { shouldBreak: false };
