@@ -834,15 +834,17 @@ describe("chat-executor-planner explicit orchestration requirements", () => {
     expect(decision.reason).toContain("delegation_cue");
   });
 
-  it("forces planner routing for grounded plan-artifact expansion requests", () => {
+  it("routes plan-artifact generation through the direct tool loop", () => {
     const decision = assessPlannerDecision(
       true,
       "i want you to read @TODO.md and turn it into a complete plan for making a shell in the c-programming language.",
       [],
     );
 
-    expect(decision.shouldPlan).toBe(true);
-    expect(decision.reason).toContain("plan_artifact_request");
+    // Plan/document generation goes through the direct tool loop where
+    // the LLM can reason and write the file directly.
+    expect(decision.shouldPlan).toBe(false);
+    expect(decision.reason).toBe("plan_generation_direct_path");
   });
 
   it("routes plan-artifact edit requests through the direct tool loop", () => {
