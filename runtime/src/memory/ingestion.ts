@@ -501,8 +501,11 @@ export class MemoryIngestionEngine {
     try {
       const normalized = normalizeForDedup(content);
       const tokenized = tokenizeForSimilarity(content);
+      // For semantic entries, check dedup across ALL sessions (not just
+      // the current one) since semantic memory is now cross-session.
+      // For working/episodic, keep session-scoped dedup.
       const recent = await this.vectorStore.query({
-        sessionId,
+        ...(memoryRole === "semantic" ? {} : { sessionId }),
         order: "desc",
         limit: this.dedupRecentEntries,
       });

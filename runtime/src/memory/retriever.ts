@@ -35,6 +35,10 @@ const DEFAULT_HYBRID_KEYWORD_WEIGHT = 0.3;
 const DEFAULT_WORKING_WINDOW = 12;
 const DEFAULT_MAX_CANDIDATES_PER_ROLE = 24;
 const DEFAULT_DIVERSITY_THRESHOLD = 0.86;
+/** Max age for semantic/episodic cross-session retrieval (30 days).
+ *  Bounds the search scope to prevent noise from ancient entries.
+ *  0 = no age limit (search everything). */
+const DEFAULT_SEMANTIC_MAX_AGE_MS = 30 * 86_400_000;
 const DEFAULT_ROLE_WEIGHTS = {
   working: 0.34,
   episodic: 0.22,
@@ -69,6 +73,8 @@ export interface SemanticMemoryRetrieverConfig {
   diversityThreshold?: number;
   /** Relative role budget split within memory budget. */
   roleBudgetWeights?: Partial<Record<RetrievalMemoryRole, number>>;
+  /** Max age in ms for cross-session semantic/episodic retrieval. 0 = unlimited. Default: 30 days. */
+  maxSemanticAgeMs?: number;
   logger?: Logger;
 }
 
@@ -303,6 +309,7 @@ export class SemanticMemoryRetriever implements MemoryRetriever {
   private readonly workingMemoryWindow: number;
   private readonly maxCandidatesPerRole: number;
   private readonly diversityThreshold: number;
+  private readonly maxSemanticAgeMs: number;
   private readonly roleBudgetWeights: Record<RetrievalMemoryRole, number>;
   private readonly logger: Logger | undefined;
 
@@ -336,6 +343,10 @@ export class SemanticMemoryRetriever implements MemoryRetriever {
     );
     this.diversityThreshold = clamp01(
       config.diversityThreshold ?? DEFAULT_DIVERSITY_THRESHOLD,
+    );
+    this.maxSemanticAgeMs = Math.max(
+      0,
+      Math.floor(config.maxSemanticAgeMs ?? DEFAULT_SEMANTIC_MAX_AGE_MS),
     );
     this.roleBudgetWeights = normalizeRoleWeights(config.roleBudgetWeights);
     this.logger = config.logger;
@@ -552,12 +563,26 @@ export class SemanticMemoryRetriever implements MemoryRetriever {
     role: RetrievalMemoryRole,
     embedding: number[],
   ): Promise<RetrievalCandidate[]> {
+    // Working memory is per-session (recent context).  Semantic and episodic
+    // memory must be cross-session — they represent long-lived facts and
+    // summaries that should survive across sessions within the same context.
+    // Without this, semantic facts ingested in session A are invisible in
+    // session B, making long-term memory effectively useless.
+    // A maxAge filter (default 30 days) bounds the search scope to prevent
+    // noise from ancient, irrelevant entries (skeptic review finding).
+    const isSessionScopedRole = role === "working";
+    const maxAgeMs = this.maxSemanticAgeMs ?? DEFAULT_SEMANTIC_MAX_AGE_MS;
     const searchResults = await this.vectorBackend.searchHybrid(
       message,
       embedding,
       {
         limit: this.maxCandidatesPerRole,
-        sessionId,
+        sessionId: isSessionScopedRole ? sessionId : undefined,
+        ...(
+          !isSessionScopedRole && maxAgeMs > 0
+            ? { after: Date.now() - maxAgeMs }
+            : {}
+        ),
         vectorWeight: this.hybridVectorWeight,
         keywordWeight: this.hybridKeywordWeight,
         memoryRoles: [role],
