@@ -396,13 +396,15 @@ export function assessPlannerDecision(
   const artifactIntent = classifyPlannerPlanArtifactIntent(messageText);
 
   if (artifactIntent === "grounded_plan_generation") {
+    // Plan/document creation is best handled by the direct tool loop.
+    // The LLM can reason about the plan structure and write the file
+    // directly.  The planner's validator rejects single-write plans
+    // and demands "grounding research" that isn't needed for document
+    // generation from the LLM's existing knowledge.
     return {
-      score: Math.max(score, 3),
-      shouldPlan: true,
-      reason:
-        reasons.length > 0
-          ? `${reasons.join("+")}+plan_artifact_request`
-          : "plan_artifact_request",
+      score,
+      shouldPlan: false,
+      reason: "plan_generation_direct_path",
     };
   }
 
