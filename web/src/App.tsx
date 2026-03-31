@@ -44,6 +44,7 @@ import { RunDashboardView } from './components/runs/RunDashboardView';
 import { SettingsView } from './components/settings/SettingsView';
 import { PaymentView } from './components/payment/PaymentView';
 import { DesktopView } from './components/desktop/DesktopView';
+import { SimulationViewer } from './components/simulation';
 
 const CHAT_COMPOSER_SELECTOR = 'textarea[data-chat-composer="true"]';
 
@@ -410,6 +411,14 @@ export default function App() {
           )}
           {currentView === 'payment' && (
             <PaymentView wallet={walletInfo} />
+          )}
+          {currentView === 'simulation' && (
+            <SimulationViewer
+              eventWsUrl="ws://localhost:3201"
+              bridgeUrl="http://localhost:3200"
+              controlUrl="http://localhost:3202"
+              agentIds={['elena', 'marcus', 'sera']}
+            />
           )}
         </main>
 
