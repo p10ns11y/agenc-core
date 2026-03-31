@@ -526,6 +526,8 @@ export function createWatchState({
     inputPreferences: createWatchUiPreferences(persistedWatchState.uiPreferences),
     composerMode: "insert",
     skillCatalog: [],
+    hookCatalog: [],
+    voiceCompanion: null,
     pendingAttachments: Array.isArray(persistedWatchState.pendingAttachments)
       ? persistedWatchState.pendingAttachments.map((attachment) => ({ ...attachment }))
       : [],
@@ -537,6 +539,8 @@ export function createWatchState({
     manualSessionsRequestPending: false,
     manualSessionsQuery: null,
     manualHistoryRequestPending: false,
+    maintenanceSnapshot: null,
+    maintenanceRequestPending: false,
     checkpoints: Array.isArray(persistedWatchState.checkpoints)
       ? persistedWatchState.checkpoints.map((summary) => ({ ...summary }))
       : [],

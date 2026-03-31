@@ -185,9 +185,27 @@ function formatSkillsSection({
   if (runtimeSkills.length > 0) {
     return [
       `- Runtime skills: ${runtimeSkills.length}`,
-      ...runtimeSkills.map((skill) =>
-        `  • ${skill.enabled ? "●" : "○"} ${sanitizeText(skill?.name)} — ${sanitizeText(skill?.description)}`,
-      ),
+      ...runtimeSkills.map((skill) => {
+        const labels = [];
+        if (typeof skill?.available === "boolean") {
+          labels.push(skill.available ? "available" : "unavailable");
+        }
+        if (skill?.tier) labels.push(sanitizeText(skill.tier));
+        if (skill?.primaryEnv) labels.push(sanitizeText(skill.primaryEnv));
+        const pathLabel = skill?.sourcePath ? ` path:${sanitizeText(skill.sourcePath)}` : "";
+        const tagsLabel =
+          Array.isArray(skill?.tags) && skill.tags.length > 0
+            ? ` tags:${skill.tags.map((tag) => sanitizeText(tag)).join(",")}`
+            : "";
+        const reasonLabel = skill?.unavailableReason
+          ? ` reason:${sanitizeText(skill.unavailableReason)}`
+          : Array.isArray(skill?.missingRequirements) && skill.missingRequirements.length > 0
+            ? ` missing:${skill.missingRequirements.map((entry) => sanitizeText(entry)).join(",")}`
+            : "";
+        return `  • ${skill.enabled ? "●" : "○"} ${sanitizeText(skill?.name)} — ${sanitizeText(skill?.description)}${
+          labels.length > 0 ? ` [${labels.join(", ")}]` : ""
+        }${tagsLabel}${pathLabel}${reasonLabel}`;
+      }),
     ];
   }
   if (localSkillCatalog.skills.length > 0) {
@@ -199,14 +217,28 @@ function formatSkillsSection({
   return ["- Skills: none discovered"];
 }
 
-function formatHooksSection(config = {}) {
+function formatHooksSection({
+  watchState,
+  config = {},
+} = {}) {
   const configuredHandlers = Array.isArray(config.hooks?.handlers)
     ? config.hooks.handlers
     : [];
+  const runtimeHooks = Array.isArray(watchState?.hookCatalog) ? watchState.hookCatalog : [];
   const lines = [
     `- Built-in lifecycle events: ${WATCH_HOOK_EVENTS.length}`,
     `  ${WATCH_HOOK_EVENTS.join(", ")}`,
   ];
+  if (runtimeHooks.length > 0) {
+    lines.push(`- Runtime hooks: ${runtimeHooks.length}`);
+    for (const hook of runtimeHooks) {
+      lines.push(
+        `  • ${hook.supported === false ? "○" : "●"} ${sanitizeText(hook?.event)} :: ${sanitizeText(hook?.name)} [${sanitizeText(hook?.source, "runtime")}/${sanitizeText(hook?.kind, "custom")}/${sanitizeText(hook?.handlerType, "runtime")}] p=${Number.isFinite(Number(hook?.priority)) ? Number(hook.priority) : 100}${hook?.target ? ` -> ${sanitizeText(hook.target)}` : ""}`,
+      );
+    }
+  } else {
+    lines.push("- Runtime hooks: none discovered");
+  }
   if (configuredHandlers.length > 0) {
     lines.push(`- Configured hook handlers: ${configuredHandlers.length}`);
     for (const handler of configuredHandlers) {
@@ -271,9 +303,12 @@ export function buildWatchExtensibilityReport({
     return [
       ...header,
       "Hooks",
-      ...formatHooksSection(config),
+      ...formatHooksSection({ watchState, config }),
     ].join("\n");
   }
+  const runtimeHookCount = Array.isArray(watchState?.hookCatalog)
+    ? watchState.hookCatalog.length
+    : 0;
   return [
     ...header,
     "Overview",
@@ -282,6 +317,7 @@ export function buildWatchExtensibilityReport({
     ...formatMcpServers(config),
     ...formatSkillsSection({ watchState, localSkillCatalog }),
     `- Hook events: ${WATCH_HOOK_EVENTS.length}`,
+    `- Runtime hooks: ${runtimeHookCount}`,
     `- User skill path: ${sanitizeText(localSkillCatalog.userSkillsPath)}`,
     ...(localSkillCatalog.error ? [`- User skill scan: ${sanitizeText(localSkillCatalog.error)}`] : []),
   ].join("\n");

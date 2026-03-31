@@ -307,6 +307,13 @@ export interface WebChatSkillSummary {
   name: string;
   description: string;
   enabled: boolean;
+  available?: boolean;
+  tier?: string;
+  sourcePath?: string;
+  tags?: string[];
+  primaryEnv?: string;
+  unavailableReason?: string;
+  missingRequirements?: string[];
 }
 
 function getSessionResumeAnchorResponseId(session: Session | undefined): string | undefined {

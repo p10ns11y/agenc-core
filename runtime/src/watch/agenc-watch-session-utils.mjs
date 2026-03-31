@@ -126,6 +126,29 @@ export function isRetryableBootstrapError(errorText) {
 }
 
 export function buildSurfaceSummaryCacheKey(input = {}) {
+  const maintenanceStatus =
+    input.maintenanceStatus && typeof input.maintenanceStatus === "object"
+      ? input.maintenanceStatus
+      : null;
+  const maintenanceSync =
+    maintenanceStatus?.sync && typeof maintenanceStatus.sync === "object"
+      ? maintenanceStatus.sync
+      : null;
+  const maintenanceMemory =
+    maintenanceStatus?.memory && typeof maintenanceStatus.memory === "object"
+      ? maintenanceStatus.memory
+      : null;
+  const workspaceIndex =
+    input.workspaceIndex && typeof input.workspaceIndex === "object"
+      ? input.workspaceIndex
+      : null;
+  const voiceCompanion =
+    input.voiceCompanion && typeof input.voiceCompanion === "object"
+      ? input.voiceCompanion
+      : null;
+  const workspaceFileCount = Array.isArray(workspaceIndex?.files)
+    ? workspaceIndex.files.length
+    : 0;
   return JSON.stringify({
     connectionState: input.connectionState ?? null,
     phaseLabel: input.phaseLabel ?? null,
@@ -178,6 +201,104 @@ export function buildSurfaceSummaryCacheKey(input = {}) {
       ? Number(input.transcriptScrollOffset)
       : 0,
     lastActivityAt: input.lastActivityAt ?? null,
+    maintenanceGeneratedAt: Number.isFinite(Number(maintenanceStatus?.generatedAt))
+      ? Number(maintenanceStatus.generatedAt)
+      : null,
+    maintenanceOwnerSessionCount: Number.isFinite(Number(maintenanceSync?.ownerSessionCount))
+      ? Number(maintenanceSync.ownerSessionCount)
+      : null,
+    maintenanceActiveSessionId: maintenanceSync?.activeSessionId ?? null,
+    maintenanceActiveSessionOwned:
+      typeof maintenanceSync?.activeSessionOwned === "boolean"
+        ? maintenanceSync.activeSessionOwned
+        : null,
+    maintenanceDurableRunsEnabled:
+      typeof maintenanceSync?.durableRunsEnabled === "boolean"
+        ? maintenanceSync.durableRunsEnabled
+        : null,
+    maintenanceOperatorAvailable:
+      typeof maintenanceSync?.operatorAvailable === "boolean"
+        ? maintenanceSync.operatorAvailable
+        : null,
+    maintenanceInspectAvailable:
+      typeof maintenanceSync?.inspectAvailable === "boolean"
+        ? maintenanceSync.inspectAvailable
+        : null,
+    maintenanceControlAvailable:
+      typeof maintenanceSync?.controlAvailable === "boolean"
+        ? maintenanceSync.controlAvailable
+        : null,
+    maintenanceDisabledCode:
+      typeof maintenanceSync?.disabledCode === "string"
+        ? maintenanceSync.disabledCode
+        : null,
+    maintenanceDisabledReason:
+      typeof maintenanceSync?.disabledReason === "string"
+        ? maintenanceSync.disabledReason
+        : null,
+    maintenanceMemoryBackendConfigured:
+      typeof maintenanceMemory?.backendConfigured === "boolean"
+        ? maintenanceMemory.backendConfigured
+        : null,
+    maintenanceMemorySessionCount: Number.isFinite(Number(maintenanceMemory?.sessionCount))
+      ? Number(maintenanceMemory.sessionCount)
+      : null,
+    maintenanceMemoryTotalMessages: Number.isFinite(Number(maintenanceMemory?.totalMessages))
+      ? Number(maintenanceMemory.totalMessages)
+      : null,
+    maintenanceMemoryLastActiveAt: Number.isFinite(Number(maintenanceMemory?.lastActiveAt))
+      ? Number(maintenanceMemory.lastActiveAt)
+      : null,
+    maintenanceRecentSessionCount: Array.isArray(maintenanceMemory?.recentSessions)
+      ? maintenanceMemory.recentSessions.length
+      : 0,
+    workspaceIndexReady:
+      typeof workspaceIndex?.ready === "boolean" ? workspaceIndex.ready : null,
+    workspaceIndexError:
+      typeof workspaceIndex?.error === "string" ? workspaceIndex.error : null,
+    workspaceIndexFileCount: workspaceFileCount,
+    voiceActive:
+      typeof voiceCompanion?.active === "boolean" ? voiceCompanion.active : null,
+    voiceConnectionState:
+      typeof voiceCompanion?.connectionState === "string"
+        ? voiceCompanion.connectionState
+        : null,
+    voiceCompanionState:
+      typeof voiceCompanion?.companionState === "string"
+        ? voiceCompanion.companionState
+        : null,
+    voicePersona:
+      typeof voiceCompanion?.voice === "string" ? voiceCompanion.voice : null,
+    voiceMode:
+      typeof voiceCompanion?.mode === "string" ? voiceCompanion.mode : null,
+    voiceSessionId:
+      typeof voiceCompanion?.sessionId === "string"
+        ? voiceCompanion.sessionId
+        : null,
+    voiceManagedSessionId:
+      typeof voiceCompanion?.managedSessionId === "string"
+        ? voiceCompanion.managedSessionId
+        : null,
+    voiceDelegationStatus:
+      typeof voiceCompanion?.delegationStatus === "string"
+        ? voiceCompanion.delegationStatus
+        : null,
+    voiceCurrentTask:
+      typeof voiceCompanion?.currentTask === "string"
+        ? voiceCompanion.currentTask
+        : null,
+    voiceLastUserTranscript:
+      typeof voiceCompanion?.lastUserTranscript === "string"
+        ? voiceCompanion.lastUserTranscript
+        : null,
+    voiceLastAssistantTranscript:
+      typeof voiceCompanion?.lastAssistantTranscript === "string"
+        ? voiceCompanion.lastAssistantTranscript
+        : null,
+    voiceLastError:
+      typeof voiceCompanion?.lastError === "string"
+        ? voiceCompanion.lastError
+        : null,
   });
 }
 

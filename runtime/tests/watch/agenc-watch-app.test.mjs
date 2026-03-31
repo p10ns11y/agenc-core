@@ -52,6 +52,21 @@ test("buildSurfaceSummaryCacheKey invalidates richer status chrome inputs", () =
       activeTotal: 0,
       queuedSignalsTotal: 0,
     },
+    maintenanceStatus: {
+      sync: { durableRunsEnabled: true, operatorAvailable: true },
+      memory: { backendConfigured: true, sessionCount: 1, totalMessages: 2 },
+    },
+    workspaceIndex: {
+      ready: true,
+      files: [{ path: "runtime/src/index.ts" }],
+    },
+    voiceCompanion: {
+      active: true,
+      connectionState: "connected",
+      companionState: "listening",
+      voice: "Ara",
+      mode: "vad",
+    },
     runtimeStatus: { state: "live" },
     objective: "Ship status chrome",
     lastUsageSummary: "1.2K total",
@@ -96,12 +111,36 @@ test("buildSurfaceSummaryCacheKey invalidates richer status chrome inputs", () =
     ...base,
     sessionLabel: "Release prep",
   });
+  const maintenanceKey = buildSurfaceSummaryCacheKey({
+    ...base,
+    maintenanceStatus: {
+      ...base.maintenanceStatus,
+      sync: { ...base.maintenanceStatus.sync, durableRunsEnabled: false },
+    },
+  });
+  const workspaceIndexKey = buildSurfaceSummaryCacheKey({
+    ...base,
+    workspaceIndex: {
+      ...base.workspaceIndex,
+      files: [...base.workspaceIndex.files, { path: "runtime/src/watch/index.ts" }],
+    },
+  });
+  const voiceKey = buildSurfaceSummaryCacheKey({
+    ...base,
+    voiceCompanion: {
+      ...base.voiceCompanion,
+      companionState: "delegating",
+    },
+  });
 
   assert.notEqual(firstKey, fallbackKey);
   assert.notEqual(firstKey, runtimeKey);
   assert.notEqual(firstKey, agentKey);
   assert.notEqual(firstKey, attachmentKey);
   assert.notEqual(firstKey, sessionLabelKey);
+  assert.notEqual(firstKey, maintenanceKey);
+  assert.notEqual(firstKey, workspaceIndexKey);
+  assert.notEqual(firstKey, voiceKey);
 });
 
 test("latestSessionSummary prefers sessions from the current workspace root", () => {

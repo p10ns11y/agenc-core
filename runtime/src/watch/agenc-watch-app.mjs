@@ -117,7 +117,10 @@ import {
   buildWatchExportBundle,
   writeWatchExportBundle,
 } from "./agenc-watch-export-bundle.mjs";
-import { buildWatchInsightsReport } from "./agenc-watch-insights.mjs";
+import {
+  buildWatchInsightsReport,
+  buildWatchMaintenanceReport,
+} from "./agenc-watch-insights.mjs";
 import { buildWatchAgentsReport } from "./agenc-watch-agents.mjs";
 import {
   buildWatchLocalConfigReport,
@@ -853,6 +856,7 @@ const surfaceState = createWatchSurfaceStateController({
   normalizeModelRouteImpl: _normalizeModelRoute,
   modelRouteToneImpl: _modelRouteTone,
   resolveSessionLabel: currentSessionLabel,
+  workspaceIndex: workspaceFileIndex,
 });
 
 const {
@@ -1243,6 +1247,7 @@ watchCommandController = createWatchCommandController({
   exportCurrentView,
   exportBundle,
   showInsights,
+  showMaintenance,
   showAgents,
   showExtensibility,
   showInputModes,
@@ -1406,9 +1411,24 @@ function showInsights() {
     projectRoot,
     watchState,
     surfaceSummary: currentSurfaceSummary(),
+    maintenanceStatus: watchState.maintenanceSnapshot ?? null,
+    workspaceIndex: workspaceFileIndex,
   });
   setTransientStatus("insights ready");
   pushEvent("operator", "Watch Insights", report, "slate");
+  return report;
+}
+
+function showMaintenance() {
+  const report = buildWatchMaintenanceReport({
+    projectRoot,
+    watchState,
+    surfaceSummary: currentSurfaceSummary(),
+    maintenanceStatus: watchState.maintenanceSnapshot ?? null,
+    workspaceIndex: workspaceFileIndex,
+  });
+  setTransientStatus("maintenance ready");
+  pushEvent("operator", "Maintenance Status", report, "slate");
   return report;
 }
 
@@ -1621,6 +1641,13 @@ watchTransportController = createWatchTransportController({
   shouldIgnoreOperatorMessage,
   dispatchOperatorSurfaceEvent: (surfaceEvent, rawMessage) => {
     const rawType = rawMessage?.type;
+    if (
+      rawType === "status.update" &&
+      !watchState.maintenanceSnapshot &&
+      watchState.maintenanceRequestPending !== true
+    ) {
+      send("maintenance.status", authPayload({ limit: 8 }));
+    }
     // Intercept voice messages
     if (typeof rawType === "string" && rawType.startsWith("voice.")) {
       const handled = watchVoiceController.handleVoiceMessage(
@@ -1660,12 +1687,56 @@ watchTransportController = createWatchTransportController({
       setTransientStatus(`memory: ${sessions.length} session(s)`);
       return;
     }
+    if (rawType === "maintenance.status") {
+      watchState.maintenanceSnapshot =
+        rawMessage?.payload && typeof rawMessage.payload === "object"
+          ? rawMessage.payload
+          : null;
+      const shouldAnnounce = watchState.maintenanceRequestPending === true;
+      watchState.maintenanceRequestPending = false;
+      if (shouldAnnounce) {
+        showMaintenance();
+      } else {
+        setTransientStatus("maintenance updated");
+        scheduleRender();
+      }
+      return;
+    }
     if (rawType === "skills.list") {
       const skills = Array.isArray(rawMessage?.payload) ? rawMessage.payload : [];
       watchState.skillCatalog = skills.map((skill) => ({
         name: String(skill?.name ?? "").trim(),
         description: String(skill?.description ?? "").trim(),
         enabled: skill?.enabled === true,
+        available:
+          typeof skill?.available === "boolean" ? skill.available : undefined,
+        tier:
+          typeof skill?.tier === "string" && skill.tier.trim().length > 0
+            ? skill.tier.trim()
+            : undefined,
+        sourcePath:
+          typeof skill?.sourcePath === "string" && skill.sourcePath.trim().length > 0
+            ? skill.sourcePath.trim()
+            : undefined,
+        tags: Array.isArray(skill?.tags)
+          ? skill.tags
+              .map((tag) => String(tag ?? "").trim())
+              .filter(Boolean)
+          : [],
+        primaryEnv:
+          typeof skill?.primaryEnv === "string" && skill.primaryEnv.trim().length > 0
+            ? skill.primaryEnv.trim()
+            : undefined,
+        unavailableReason:
+          typeof skill?.unavailableReason === "string" &&
+          skill.unavailableReason.trim().length > 0
+            ? skill.unavailableReason.trim()
+            : undefined,
+        missingRequirements: Array.isArray(skill?.missingRequirements)
+          ? skill.missingRequirements
+              .map((requirement) => String(requirement ?? "").trim())
+              .filter(Boolean)
+          : [],
       }));
       pushEvent(
         "operator",
@@ -1673,13 +1744,59 @@ watchTransportController = createWatchTransportController({
         watchState.skillCatalog.length > 0
           ? watchState.skillCatalog
             .map((skill) =>
-              `${skill.enabled ? "●" : "○"} ${skill.name}${skill.description ? ` — ${skill.description}` : ""}`,
+              `${skill.enabled ? "●" : "○"} ${skill.name}${
+                skill.available === false ? " [unavailable]" : ""
+              }${
+                skill.tier ? ` [${skill.tier}]` : ""
+              }${skill.description ? ` — ${skill.description}` : ""}${
+                skill.primaryEnv ? ` (${skill.primaryEnv})` : ""
+              }${
+                skill.unavailableReason
+                  ? ` | ${skill.unavailableReason}`
+                  : skill.missingRequirements.length > 0
+                    ? ` | missing: ${skill.missingRequirements.join(", ")}`
+                    : ""
+              }`,
             )
             .join("\n")
           : "No skills available.",
         "slate",
       );
       setTransientStatus(`skills: ${watchState.skillCatalog.length}`);
+      return;
+    }
+    if (rawType === "hooks.list") {
+      const hooks = Array.isArray(rawMessage?.payload) ? rawMessage.payload : [];
+      watchState.hookCatalog = hooks.map((hook) => ({
+        event: String(hook?.event ?? "").trim(),
+        name: String(hook?.name ?? "").trim(),
+        priority: Number.isFinite(Number(hook?.priority)) ? Number(hook.priority) : 100,
+        source: String(hook?.source ?? "runtime").trim() || "runtime",
+        kind: String(hook?.kind ?? "custom").trim() || "custom",
+        handlerType: String(hook?.handlerType ?? "runtime").trim() || "runtime",
+        target:
+          typeof hook?.target === "string" && hook.target.trim().length > 0
+            ? hook.target.trim()
+            : undefined,
+        supported: hook?.supported !== false,
+      }));
+      pushEvent(
+        "operator",
+        "Hooks",
+        watchState.hookCatalog.length > 0
+          ? watchState.hookCatalog
+              .map((hook) =>
+                `${hook.supported ? "●" : "○"} ${hook.event} :: ${hook.name} [${
+                  hook.source
+                }/${hook.kind}/${hook.handlerType}] p=${hook.priority}${
+                  hook.target ? ` -> ${hook.target}` : ""
+                }`,
+              )
+              .join("\n")
+          : "No hooks available.",
+        "slate",
+      );
+      setTransientStatus(`hooks: ${watchState.hookCatalog.length}`);
       return;
     }
     dispatchOperatorSurfaceEvent(surfaceEvent, rawMessage, surfaceDispatchApi);

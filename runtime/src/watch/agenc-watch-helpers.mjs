@@ -98,6 +98,11 @@ const CORE_WATCH_COMMANDS = Object.freeze([
     description: "Search conversation memory or list memory sessions.",
   }),
   Object.freeze({
+    name: "/maintenance",
+    usage: "/maintenance",
+    description: "Show maintenance status for sync, memory, and workspace indexing.",
+  }),
+  Object.freeze({
     name: "/context",
     usage: "/context",
     description: "Show current context window and token usage.",

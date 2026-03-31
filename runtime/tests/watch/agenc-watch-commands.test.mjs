@@ -31,25 +31,34 @@ function createCommandHarness(overrides = {}) {
       ["sess-1", "Roadmap"],
     ]),
     skillCatalog: [],
+    hookCatalog: [],
+    voiceCompanion: null,
+    maintenanceSnapshot: null,
+    maintenanceRequestPending: false,
   };
   const queuedOperatorInputs = [];
   const pendingAttachments = watchState.pendingAttachments;
   const calls = [];
+  let statuslineEnabled = overrides.initialStatuslineEnabled ?? false;
   const watchCommands = overrides.WATCH_COMMANDS ?? [
     { name: "/help", usage: "/help", description: "show help", aliases: [] },
     { name: "/clear", usage: "/clear", description: "clear console", aliases: [] },
     { name: "/export", usage: "/export", description: "export view", aliases: [] },
     { name: "/bundle", usage: "/bundle", description: "bundle", aliases: ["/export-bundle"] },
     { name: "/insights", usage: "/insights", description: "insights", aliases: [] },
+    { name: "/maintenance", usage: "/maintenance", description: "maintenance", aliases: [] },
     { name: "/agents", usage: "/agents [query]", description: "agents", aliases: ["/threads"] },
     { name: "/extensibility", usage: "/extensibility [overview|skills|plugins|mcp|hooks]", description: "extensibility", aliases: ["/extensions"] },
     { name: "/skills", usage: "/skills [list|enable <name>|disable <name>]", description: "skills", aliases: [] },
     { name: "/plugins", usage: "/plugins [list|trust <packageName> [subpath ...]|untrust <packageName>]", description: "plugins", aliases: [] },
     { name: "/mcp", usage: "/mcp [list|enable <serverName>|disable <serverName>]", description: "mcp", aliases: [] },
     { name: "/hooks", usage: "/hooks [list|events]", description: "hooks", aliases: [] },
+    { name: "/config", usage: "/config [show]", description: "config", aliases: [] },
     { name: "/input-mode", usage: "/input-mode [show|default|vim]", description: "input mode", aliases: [] },
     { name: "/keybindings", usage: "/keybindings [show|default|vim]", description: "keybindings", aliases: [] },
-    { name: "/theme", usage: "/theme [show|default|aurora|ember]", description: "theme", aliases: [] },
+    { name: "/theme", usage: "/theme [show|default|aurora|ember|matrix]", description: "theme", aliases: [] },
+    { name: "/statusline", usage: "/statusline [show|on|off|toggle]", description: "statusline", aliases: [] },
+    { name: "/vim", usage: "/vim [show|on|off|toggle]", description: "vim", aliases: [] },
     { name: "/init", usage: "/init", description: "init guide", aliases: [] },
     { name: "/logs", usage: "/logs [lines]", description: "logs", aliases: [] },
     { name: "/status", usage: "/status", description: "status", aliases: [] },
@@ -82,6 +91,7 @@ function createCommandHarness(overrides = {}) {
     { name: "/history", usage: "/history", description: "history", aliases: [] },
     { name: "/model", usage: "/model", description: "model", aliases: ["/models"] },
     { name: "/memory", usage: "/memory", description: "memory", aliases: [] },
+    { name: "/voice", usage: "/voice [start|stop|status|<persona>]", description: "voice", aliases: [] },
     { name: "/attach", usage: "/attach <path>", description: "attach", aliases: [] },
     { name: "/attachments", usage: "/attachments", description: "attachments", aliases: [] },
     { name: "/unattach", usage: "/unattach [ref]", description: "unattach", aliases: ["/detach"] },
@@ -133,6 +143,10 @@ function createCommandHarness(overrides = {}) {
       calls.push({ type: "showInsights" });
       return "Watch Insights\n- ok";
     },
+    showMaintenance() {
+      calls.push({ type: "showMaintenance" });
+      return "Maintenance Status\n- ok";
+    },
     showAgents({ query = null } = {}) {
       calls.push({ type: "showAgents", query });
       return "Agent Threads\n- ok";
@@ -144,6 +158,10 @@ function createCommandHarness(overrides = {}) {
     showInputModes() {
       calls.push({ type: "showInputModes" });
       return "Input Preferences\n- ok";
+    },
+    showConfig() {
+      calls.push({ type: "showConfig" });
+      return "Local Config\n- ok";
     },
     resetLiveRunSurface() {
       calls.push({ type: "resetLiveRunSurface" });
@@ -193,6 +211,15 @@ function createCommandHarness(overrides = {}) {
       calls.push({ type: "setThemeName", themeName });
       watchState.inputPreferences.themeName = themeName;
       return watchState.inputPreferences;
+    },
+    currentStatuslineEnabled() {
+      calls.push({ type: "currentStatuslineEnabled" });
+      return statuslineEnabled;
+    },
+    setStatuslineEnabled(enabled) {
+      calls.push({ type: "setStatuslineEnabled", enabled });
+      statuslineEnabled = enabled === true;
+      return statuslineEnabled;
     },
     trustPluginPackage(packageName, allowedSubpaths = []) {
       calls.push({ type: "trustPluginPackage", packageName, allowedSubpaths });
@@ -373,6 +400,18 @@ function createCommandHarness(overrides = {}) {
     bootstrapPending() {
       return false;
     },
+    voiceController: overrides.voiceController ?? {
+      startVoice() {
+        calls.push({ type: "startVoice" });
+      },
+      stopVoice() {
+        calls.push({ type: "stopVoice" });
+      },
+      formatStatusReport() {
+        calls.push({ type: "formatStatusReport" });
+        return "Voice Companion\n- ok";
+      },
+    },
     ...overrides,
   });
   return { controller, watchState, queuedOperatorInputs, pendingAttachments, calls };
@@ -422,16 +461,21 @@ test("command controller shows extensibility sections and mutates local config h
   const { controller, calls } = createCommandHarness();
 
   assert.equal(controller.dispatchOperatorInput("/extensibility mcp"), true);
+  assert.equal(controller.dispatchOperatorInput("/extensibility hooks"), true);
   assert.equal(controller.dispatchOperatorInput("/plugins trust @demo/plugin channels"), true);
   assert.equal(controller.dispatchOperatorInput("/plugins untrust @demo/plugin"), true);
   assert.equal(controller.dispatchOperatorInput("/mcp enable browser"), true);
   assert.equal(controller.dispatchOperatorInput("/hooks"), true);
 
   assert.ok(calls.some((entry) => entry.type === "showExtensibility" && entry.section === "mcp"));
+  assert.ok(calls.some((entry) => entry.type === "showExtensibility" && entry.section === "hooks"));
   assert.ok(calls.some((entry) => entry.type === "trustPluginPackage" && entry.packageName === "@demo/plugin"));
   assert.ok(calls.some((entry) => entry.type === "untrustPluginPackage" && entry.packageName === "@demo/plugin"));
   assert.ok(calls.some((entry) => entry.type === "setMcpServerEnabled" && entry.serverName === "browser" && entry.enabled === true));
-  assert.ok(calls.some((entry) => entry.type === "showExtensibility" && entry.section === "hooks"));
+  assert.equal(
+    calls.filter((entry) => entry.type === "send" && entry.frameType === "hooks.list").length,
+    2,
+  );
 });
 
 test("command controller manages input preferences locally", () => {
@@ -445,6 +489,67 @@ test("command controller manages input preferences locally", () => {
   assert.equal(watchState.inputPreferences.keybindingProfile, "vim");
   assert.equal(watchState.inputPreferences.themeName, "aurora");
   assert.ok(calls.some((entry) => entry.type === "showInputModes"));
+});
+
+test("command controller serves local config, statusline, and vim toggles", () => {
+  const { controller, watchState, calls } = createCommandHarness();
+
+  assert.equal(controller.dispatchOperatorInput("/config"), true);
+  assert.equal(controller.dispatchOperatorInput("/statusline on"), true);
+  assert.equal(controller.dispatchOperatorInput("/vim on"), true);
+  assert.equal(controller.dispatchOperatorInput("/vim off"), true);
+
+  assert.ok(calls.some((entry) => entry.type === "showConfig"));
+  assert.ok(calls.some((entry) => entry.type === "setStatuslineEnabled" && entry.enabled === true));
+  assert.ok(calls.some((entry) => entry.type === "setInputModeProfile" && entry.profile === "vim"));
+  assert.ok(calls.some((entry) => entry.type === "setKeybindingProfile" && entry.profile === "vim"));
+  assert.ok(calls.some((entry) => entry.type === "setInputModeProfile" && entry.profile === "default"));
+  assert.ok(calls.some((entry) => entry.type === "setKeybindingProfile" && entry.profile === "default"));
+  assert.equal(watchState.composerMode, "insert");
+});
+
+test("command controller requests maintenance snapshots through /maintenance", () => {
+  const { controller, watchState, calls } = createCommandHarness();
+
+  assert.equal(controller.dispatchOperatorInput("/maintenance"), true);
+
+  assert.equal(watchState.maintenanceRequestPending, true);
+  assert.ok(
+    calls.some(
+      (entry) =>
+        entry.type === "send" &&
+        entry.frameType === "maintenance.status" &&
+        entry.payload?.auth === true &&
+        entry.payload?.limit === 8,
+    ),
+  );
+  assert.ok(
+    calls.some(
+      (entry) =>
+        entry.type === "status" &&
+        entry.status === "refreshing maintenance",
+    ),
+  );
+});
+
+test("command controller routes voice companion controls locally", () => {
+  const { controller, calls } = createCommandHarness();
+
+  assert.equal(controller.dispatchOperatorInput("/voice"), true);
+  assert.equal(controller.dispatchOperatorInput("/voice stop"), true);
+  assert.equal(controller.dispatchOperatorInput("/voice status"), true);
+
+  assert.ok(calls.some((entry) => entry.type === "startVoice"));
+  assert.ok(calls.some((entry) => entry.type === "stopVoice"));
+  assert.ok(calls.some((entry) => entry.type === "formatStatusReport"));
+  assert.ok(
+    calls.some(
+      (entry) =>
+        entry.type === "event" &&
+        entry.kind === "voice" &&
+        entry.title === "Voice Companion",
+    ),
+  );
 });
 
 test("command controller uses the typed skill catalog messages", () => {

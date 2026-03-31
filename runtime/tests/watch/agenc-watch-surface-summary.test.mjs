@@ -172,6 +172,36 @@ test("buildWatchSurfaceSummary derives route, alerts, and recent tool timeline",
     activeAgentCount: 1,
     sessionId: "session:abcdef12345678",
     sessionLabel: "Roadmap branch",
+    maintenanceStatus: {
+      sync: {
+        durableRunsEnabled: false,
+        disabledReason: "durable sync disabled for this workspace",
+      },
+      memory: {
+        backendConfigured: true,
+        sessionCount: 4,
+        totalMessages: 31,
+      },
+    },
+    workspaceIndex: {
+      ready: true,
+      files: [
+        { path: "runtime/src/watch/agenc-watch-app.mjs" },
+        { path: "runtime/src/watch/agenc-watch-state.mjs" },
+      ],
+    },
+    voiceCompanion: {
+      active: true,
+      connectionState: "connected",
+      companionState: "delegating",
+      voice: "Ara",
+      mode: "vad",
+      currentTask: "Trace the fallback path",
+      delegationStatus: "handoff pending",
+      lastUserTranscript: "Trace the fallback path",
+      lastAssistantTranscript: "Splitting review work now.",
+      lastError: "",
+    },
     following: false,
     detailOpen: false,
     transcriptScrollOffset: 12,
@@ -189,6 +219,14 @@ test("buildWatchSurfaceSummary derives route, alerts, and recent tool timeline",
   assert.equal(summary.overview.sessionLabel, "Roadmap branch");
   assert.equal(summary.overview.transcriptMode, "scroll 12");
   assert.equal(summary.overview.durableRunsState, "disabled");
+  assert.equal(summary.overview.syncState, "disabled");
+  assert.equal(summary.overview.memoryState, "ready");
+  assert.equal(summary.overview.workspaceIndexState, "ready");
+  assert.equal(summary.overview.workspaceFileCount, 2);
+  assert.equal(summary.overview.voiceState, "delegating");
+  assert.equal(summary.overview.voicePersona, "Ara");
+  assert.equal(summary.overview.voiceMode, "vad");
+  assert.equal(summary.overview.voiceCurrentTask, "Trace the fallback path");
   assert.equal(summary.providerLabel, "grok");
   assert.equal(summary.overview.fallbackState, "active");
   assert.equal(summary.overview.runtimeState, "degraded");
@@ -200,6 +238,11 @@ test("buildWatchSurfaceSummary derives route, alerts, and recent tool timeline",
   assert.equal(summary.chips.find((chip) => chip.label === "RUNTIME")?.value, "degraded");
   assert.equal(summary.chips.find((chip) => chip.label === "DURABLE")?.value, "disabled");
   assert.equal(summary.chips.find((chip) => chip.label === "FILES")?.value, "1");
+  assert.equal(summary.chips.find((chip) => chip.label === "SYNC")?.value, "disabled");
+  assert.equal(summary.chips.find((chip) => chip.label === "MEM")?.value, "ready");
+  assert.equal(summary.chips.find((chip) => chip.label === "INDEX")?.value, "ready");
+  assert.equal(summary.chips.find((chip) => chip.label === "VOICE")?.value, "delegating");
+  assert.equal(summary.chips.find((chip) => chip.label === "MAINT")?.value, "limited");
 });
 
 test("buildWatchSurfaceSummary marks detail mode explicitly", () => {
@@ -539,6 +582,34 @@ test("buildWatchFooterSummary emits a structured statusline when enabled", () =>
     detailOpen: false,
     transcriptScrollOffset: 0,
     lastActivityAt: "15:47:00",
+    maintenanceStatus: {
+      sync: {
+        durableRunsEnabled: true,
+        operatorAvailable: true,
+        ownerSessionCount: 1,
+        activeSessionId: "session:99887766",
+        activeSessionOwned: true,
+      },
+      memory: {
+        backendConfigured: true,
+        sessionCount: 6,
+        totalMessages: 64,
+      },
+    },
+    workspaceIndex: {
+      ready: true,
+      files: [
+        { path: "runtime/src/watch/agenc-watch-app.mjs" },
+        { path: "runtime/src/watch/agenc-watch-commands.mjs" },
+      ],
+    },
+    voiceCompanion: {
+      active: true,
+      connectionState: "connected",
+      companionState: "listening",
+      voice: "Ara",
+      mode: "vad",
+    },
     backgroundRunStatus: {
       enabled: true,
       operatorAvailable: true,
@@ -584,6 +655,10 @@ test("buildWatchFooterSummary emits a structured statusline when enabled", () =>
   assert.match(footer.statuslineText, /QUEUE 2/);
   assert.match(footer.statuslineText, /FILES 2/);
   assert.match(footer.statuslineText, /GUARD 1 error/);
+  assert.match(footer.statuslineText, /SYNC ready/);
+  assert.match(footer.statuslineText, /MEM ready/);
+  assert.match(footer.statuslineText, /INDEX ready/);
+  assert.match(footer.statuslineText, /VOICE listening/);
   assert.match(footer.statuslineText, /CKPT cp-3/);
   assert.match(footer.statuslineText, /INPUT vim\/normal/);
   assert.match(footer.statuslineText, /THEME aurora/);

@@ -37,6 +37,7 @@ const BADGE_MAP = Object.freeze({
   approval: { label: "AUTH", tone: "red" },
   queued: { label: "QUEUE", tone: "amber" },
   subagent: { label: "AGENT", tone: "magenta" },
+  voice: { label: "VOICE", tone: "purple" },
 });
 
 function sanitizeText(value, fallback = "") {
@@ -142,6 +143,21 @@ function buildFooterStatuslineSegments(
   }
   if (isPresentStatuslineValue(overview.durableRunsState)) {
     segments.push(`DURABLE ${overview.durableRunsState}`);
+  }
+  if (isPresentStatuslineValue(overview.syncState)) {
+    segments.push(`SYNC ${overview.syncState}`);
+  }
+  if (isPresentStatuslineValue(overview.memoryState)) {
+    segments.push(`MEM ${overview.memoryState}`);
+  }
+  if (isPresentStatuslineValue(overview.workspaceIndexState)) {
+    segments.push(`INDEX ${overview.workspaceIndexState}`);
+  }
+  if (
+    isPresentStatuslineValue(overview.voiceState) &&
+    !["inactive", "stopped"].includes(String(overview.voiceState).toLowerCase())
+  ) {
+    segments.push(`VOICE ${overview.voiceState}`);
   }
   if (isPresentStatuslineValue(overview.transcriptMode)) {
     segments.push(`MODE ${overview.transcriptMode}`);
@@ -537,6 +553,12 @@ export function buildWatchFooterSummary({
   if (formatCount(surfaceSummary?.overview?.pendingAttachmentCount, 0) > 0) {
     leftDetails.push(`attachments ${surfaceSummary.overview.pendingAttachmentCount}`);
   }
+  if (
+    isPresentStatuslineValue(surfaceSummary?.overview?.voiceState) &&
+    !["inactive", "stopped"].includes(String(surfaceSummary.overview.voiceState).toLowerCase())
+  ) {
+    leftDetails.push(`voice ${surfaceSummary.overview.voiceState}`);
+  }
   const statuslineEnabled = featureFlags?.statusline === true;
   const checkpointSummary =
     featureFlags?.checkpoints === true && activeCheckpointId
@@ -555,6 +577,17 @@ export function buildWatchFooterSummary({
   if (statuslineEnabled && formatCount(surfaceSummary?.overview?.pendingAttachmentCount, 0) > 0) {
     const attachmentDetail = `attachments ${surfaceSummary.overview.pendingAttachmentCount}`;
     const detailIndex = leftDetails.indexOf(attachmentDetail);
+    if (detailIndex >= 0) {
+      leftDetails.splice(detailIndex, 1);
+    }
+  }
+  if (
+    statuslineEnabled &&
+    isPresentStatuslineValue(surfaceSummary?.overview?.voiceState) &&
+    !["inactive", "stopped"].includes(String(surfaceSummary.overview.voiceState).toLowerCase())
+  ) {
+    const voiceDetail = `voice ${surfaceSummary.overview.voiceState}`;
+    const detailIndex = leftDetails.indexOf(voiceDetail);
     if (detailIndex >= 0) {
       leftDetails.splice(detailIndex, 1);
     }
@@ -655,6 +688,9 @@ export function buildWatchSurfaceSummary({
   plannerStatus = null,
   plannerNote = null,
   sessionLabel = null,
+  maintenanceStatus = null,
+  workspaceIndex = null,
+  voiceCompanion = null,
   detail = null,
 }) {
   const recentEvents = events.slice(-24);
@@ -748,6 +784,114 @@ export function buildWatchSurfaceSummary({
   );
   const durableActiveTotal = formatCount(backgroundRunStatus?.activeTotal, 0);
   const durableQueuedSignalsTotal = formatCount(backgroundRunStatus?.queuedSignalsTotal, 0);
+  const maintenanceSync =
+    maintenanceStatus?.sync && typeof maintenanceStatus.sync === "object"
+      ? maintenanceStatus.sync
+      : null;
+  const maintenanceMemory =
+    maintenanceStatus?.memory && typeof maintenanceStatus.memory === "object"
+      ? maintenanceStatus.memory
+      : null;
+  const syncState = !maintenanceSync
+    ? "pending"
+    : maintenanceSync.durableRunsEnabled === false
+      ? "disabled"
+      : maintenanceSync.operatorAvailable ||
+          maintenanceSync.inspectAvailable ||
+          maintenanceSync.controlAvailable
+        ? "ready"
+        : "limited";
+  const syncLabel = !maintenanceSync
+    ? "sync snapshot pending"
+    : maintenanceSync.durableRunsEnabled === false
+      ? sanitizeText(maintenanceSync.disabledReason, "durable sync disabled")
+      : [
+          `${formatCount(maintenanceSync.ownerSessionCount, 0)} owned session${formatCount(maintenanceSync.ownerSessionCount, 0) === 1 ? "" : "s"}`,
+          maintenanceSync.activeSessionId
+            ? maintenanceSync.activeSessionOwned === true
+              ? "active attached"
+              : "active external"
+            : "no active session",
+        ].join(" · ");
+  const memoryState = !maintenanceMemory
+    ? "pending"
+    : maintenanceMemory.backendConfigured === false
+      ? "disabled"
+      : "ready";
+  const memoryLabel = !maintenanceMemory
+    ? "memory snapshot pending"
+    : maintenanceMemory.backendConfigured === false
+      ? "memory backend not configured"
+      : `${formatCount(maintenanceMemory.sessionCount, 0)} sessions · ${formatCount(maintenanceMemory.totalMessages, 0)} msgs`;
+  const workspaceFileCount = Array.isArray(workspaceIndex?.files)
+    ? workspaceIndex.files.length
+    : 0;
+  const workspaceIndexState = !workspaceIndex
+    ? "pending"
+    : workspaceIndex.ready === true
+      ? "ready"
+      : workspaceIndex.error
+        ? "error"
+        : "pending";
+  const workspaceIndexLabel = !workspaceIndex
+    ? "workspace index pending"
+    : workspaceIndex.ready === true
+      ? `${workspaceFileCount} files indexed`
+      : sanitizeText(workspaceIndex.error, "workspace index unavailable");
+  const voiceSnapshot =
+    voiceCompanion && typeof voiceCompanion === "object"
+      ? voiceCompanion
+      : null;
+  const voiceActive =
+    typeof voiceSnapshot?.active === "boolean" ? voiceSnapshot.active : false;
+  const voiceState = !voiceSnapshot
+    ? "inactive"
+    : sanitizeText(
+      voiceSnapshot.companionState,
+      voiceActive
+        ? sanitizeText(voiceSnapshot.connectionState, "active")
+        : "inactive",
+    );
+  const voiceLabel = !voiceSnapshot
+    ? "voice companion idle"
+    : [
+        sanitizeText(voiceSnapshot.connectionState, voiceActive ? "connected" : "disconnected"),
+        voiceState,
+        sanitizeText(voiceSnapshot.voice, ""),
+        sanitizeText(voiceSnapshot.mode, ""),
+      ]
+        .filter(Boolean)
+        .join(" · ");
+  const voiceCurrentTask = sanitizeText(voiceSnapshot?.currentTask, "");
+  const voiceDelegationStatus = sanitizeText(voiceSnapshot?.delegationStatus, "");
+  const voiceLastUserTranscript = sanitizeText(voiceSnapshot?.lastUserTranscript, "");
+  const voiceLastAssistantTranscript = sanitizeText(
+    voiceSnapshot?.lastAssistantTranscript,
+    "",
+  );
+  const voiceLastError = sanitizeText(voiceSnapshot?.lastError, "");
+  let maintenanceState = "ready";
+  if (
+    syncState === "error" ||
+    memoryState === "error" ||
+    workspaceIndexState === "error"
+  ) {
+    maintenanceState = "degraded";
+  } else if (
+    syncState === "disabled" ||
+    syncState === "limited" ||
+    memoryState === "disabled" ||
+    workspaceIndexState === "disabled"
+  ) {
+    maintenanceState = "limited";
+  } else if (
+    syncState === "pending" ||
+    memoryState === "pending" ||
+    workspaceIndexState === "pending"
+  ) {
+    maintenanceState = "pending";
+  }
+  const maintenanceLabel = `${syncState} sync · ${memoryState} memory · ${workspaceIndexState} index`;
 
   return {
     routeLabel,
@@ -771,6 +915,24 @@ export function buildWatchSurfaceSummary({
       usage: sanitizeText(lastUsageSummary, "n/a"),
       durableRunsState,
       durableRunsLabel,
+      syncState,
+      syncLabel,
+      memoryState,
+      memoryLabel,
+      maintenanceState,
+      maintenanceLabel,
+      workspaceIndexState,
+      workspaceIndexLabel,
+      workspaceFileCount,
+      voiceState,
+      voiceLabel,
+      voiceCurrentTask,
+      voiceDelegationStatus,
+      voicePersona: sanitizeText(voiceSnapshot?.voice, ""),
+      voiceMode: sanitizeText(voiceSnapshot?.mode, ""),
+      voiceLastUserTranscript,
+      voiceLastAssistantTranscript,
+      voiceLastError,
       queuedInputCount: formatCount(queuedInputCount, 0),
       pendingAttachmentCount: formatCount(pendingAttachmentCount, 0),
       planCount: formatCount(planCount, 0),
@@ -810,6 +972,19 @@ export function buildWatchSurfaceSummary({
       { label: "GUARD", value: guardValue, tone: approvalAlertCount > 0 ? "red" : errorAlertCount > 0 ? "amber" : "green" },
       { label: "RUNTIME", value: runtimeState, tone: stateTone(runtimeState) },
       { label: "DURABLE", value: durableRunsState, tone: stateTone(durableRunsState) },
+      { label: "SYNC", value: syncState, tone: stateTone(syncState) },
+      { label: "MEM", value: memoryState, tone: stateTone(memoryState) },
+      { label: "INDEX", value: workspaceIndexState, tone: stateTone(workspaceIndexState) },
+      ...(
+        voiceSnapshot
+          ? [{
+            label: "VOICE",
+            value: voiceState,
+            tone: voiceActive ? stateTone(voiceState) : "slate",
+          }]
+          : []
+      ),
+      { label: "MAINT", value: maintenanceState, tone: stateTone(maintenanceState) },
       { label: "MODE", value: transcriptMode, tone: detailOpen ? "cyan" : following ? "green" : "amber" },
     ],
     attention: {

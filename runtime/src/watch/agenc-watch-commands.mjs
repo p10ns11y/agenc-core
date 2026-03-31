@@ -919,6 +919,7 @@ export function createWatchCommandController(dependencies = {}) {
     exportCurrentView,
     exportBundle,
     showInsights,
+    showMaintenance,
     showAgents,
     showExtensibility,
     showInputModes,
@@ -1023,6 +1024,9 @@ export function createWatchCommandController(dependencies = {}) {
   }
   if (commandNames.has("/insights")) {
     assertFunction("showInsights", showInsights);
+  }
+  if (commandNames.has("/maintenance")) {
+    assertFunction("showMaintenance", showMaintenance);
   }
   if (commandNames.has("/agents")) {
     assertFunction("showAgents", showAgents);
@@ -1248,6 +1252,22 @@ export function createWatchCommandController(dependencies = {}) {
         return true;
       }
 
+      if (canonicalName === "/maintenance") {
+        if (shouldQueueOperatorInput()) {
+          return maybeQueue("session bootstrap not complete");
+        }
+        watchState.maintenanceRequestPending = true;
+        pushEvent(
+          "operator",
+          "Maintenance",
+          "Refreshing maintenance status.",
+          "teal",
+        );
+        send("maintenance.status", authPayload({ limit: 8 }));
+        setTransientStatus("refreshing maintenance");
+        return true;
+      }
+
       if (canonicalName === "/agents") {
         showAgents({
           query: parsedSlash.args.join(" ").trim() || null,
@@ -1261,11 +1281,17 @@ export function createWatchCommandController(dependencies = {}) {
           pushEvent("error", "Usage Error", action.error, "red");
           return true;
         }
+        if (action.section === "hooks") {
+          send("hooks.list", {});
+          setTransientStatus("requesting hooks");
+        }
         showExtensibility({ section: action.section });
         return true;
       }
 
       if (canonicalName === "/hooks") {
+        send("hooks.list", {});
+        setTransientStatus("requesting hooks");
         showExtensibility({ section: "hooks" });
         return true;
       }
@@ -1542,6 +1568,16 @@ export function createWatchCommandController(dependencies = {}) {
             voiceController.stopVoice();
           } else if (!voiceArg || voiceArg === "start" || voiceArg === "on") {
             voiceController.startVoice();
+          } else if (voiceArg === "status") {
+            pushEvent(
+              "voice",
+              "Voice Companion",
+              typeof voiceController.formatStatusReport === "function"
+                ? voiceController.formatStatusReport()
+                : "Voice companion status unavailable.",
+              "slate",
+            );
+            setTransientStatus("voice status ready");
           } else {
             // Voice persona change or config query — forward to daemon
             send("chat.message", authPayload({ content: value }));

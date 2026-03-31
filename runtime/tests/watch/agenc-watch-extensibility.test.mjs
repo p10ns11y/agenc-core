@@ -17,7 +17,27 @@ test("buildWatchExtensibilityReport summarizes config and live skills", () => {
         ],
       },
       skillCatalog: [
-        { name: "browser", description: "Drive MCP browser flows", enabled: true },
+        {
+          name: "browser",
+          description: "Drive MCP browser flows",
+          enabled: true,
+          available: true,
+          tier: "user",
+          primaryEnv: "node",
+          tags: ["browser", "mcp"],
+        },
+      ],
+      hookCatalog: [
+        {
+          event: "tool:after",
+          name: "tool-audit-logger",
+          priority: 90,
+          source: "builtin",
+          kind: "lifecycle",
+          handlerType: "builtin",
+          target: "tool-audit-logger",
+          supported: true,
+        },
       ],
     },
     configSnapshot: {
@@ -42,6 +62,7 @@ test("buildWatchExtensibilityReport summarizes config and live skills", () => {
   assert.match(report, /Trusted packages: 1/);
   assert.match(report, /MCP servers: 1/);
   assert.match(report, /Runtime skills: 1/);
+  assert.match(report, /Runtime hooks: 1/);
 });
 
 test("updateWatchTrustedPluginPackage writes a trusted package entry", () => {

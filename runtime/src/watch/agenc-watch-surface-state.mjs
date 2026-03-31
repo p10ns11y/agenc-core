@@ -17,6 +17,7 @@ export function createWatchSurfaceStateController(dependencies = {}) {
     normalizeModelRouteImpl,
     modelRouteToneImpl,
     resolveSessionLabel,
+    workspaceIndex,
   } = dependencies;
 
   let cachedSurfaceSummaryKey = null;
@@ -171,6 +172,9 @@ export function createWatchSurfaceStateController(dependencies = {}) {
       detailOpen: Boolean(watchState.expandedEventId),
       transcriptScrollOffset: watchState.transcriptScrollOffset,
       lastActivityAt: watchState.lastActivityAt,
+      maintenanceStatus: watchState.maintenanceSnapshot ?? null,
+      workspaceIndex: workspaceIndex ?? null,
+      voiceCompanion: watchState.voiceCompanion ?? null,
     });
     if (summaryKey === cachedSurfaceSummaryKey && cachedSurfaceSummary) {
       return cachedSurfaceSummary;
@@ -203,6 +207,9 @@ export function createWatchSurfaceStateController(dependencies = {}) {
       plannerStatus: watchState.plannerDagStatus,
       plannerNote: watchState.plannerDagNote,
       sessionLabel: currentSessionLabel(),
+      maintenanceStatus: watchState.maintenanceSnapshot ?? null,
+      workspaceIndex: workspaceIndex ?? null,
+      voiceCompanion: watchState.voiceCompanion ?? null,
     });
     cachedSurfaceSummaryKey = summaryKey;
     return cachedSurfaceSummary;
