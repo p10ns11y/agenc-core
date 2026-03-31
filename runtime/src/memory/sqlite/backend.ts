@@ -28,6 +28,11 @@ import { TELEMETRY_METRIC_NAMES } from "../../telemetry/metric-names.js";
 import type { EncryptionProvider } from "../encryption.js";
 import { createAES256GCMProvider } from "../encryption.js";
 
+/** Security H-2: escape SQL LIKE wildcards in prefix parameters. */
+function escapeLikePrefix(prefix: string): string {
+  return prefix.replace(/%/g, "\\%").replace(/_/g, "\\_");
+}
+
 export class SqliteBackend implements MemoryBackend {
   readonly name = "sqlite";
 
@@ -67,11 +72,29 @@ export class SqliteBackend implements MemoryBackend {
     const ttl = options.ttlMs ?? this.defaultTtlMs;
     const expiresAt = ttl > 0 ? now + ttl : null;
 
+    // Security H-1: per-entry size limits to prevent DoS
+    const MAX_CONTENT_BYTES = 102_400; // 100KB
+    const MAX_METADATA_BYTES = 10_240; // 10KB
+    if (options.content.length > MAX_CONTENT_BYTES) {
+      throw new MemoryBackendError(
+        this.name,
+        `Content exceeds size limit (${options.content.length} > ${MAX_CONTENT_BYTES} bytes)`,
+      );
+    }
+
     let metadataJson: string | null = null;
     if (options.metadata) {
       try {
         metadataJson = JSON.stringify(options.metadata);
+        // Security H-1: metadata size limit
+        if (metadataJson.length > MAX_METADATA_BYTES) {
+          throw new MemoryBackendError(
+            this.name,
+            `Metadata exceeds size limit (${metadataJson.length} > ${MAX_METADATA_BYTES} bytes)`,
+          );
+        }
       } catch (err) {
+        if (err instanceof MemoryBackendError) throw err;
         throw new MemorySerializationError(
           this.name,
           `Failed to serialize metadata: ${(err as Error).message}`,
@@ -228,7 +251,7 @@ export class SqliteBackend implements MemoryBackend {
           `SELECT DISTINCT session_id FROM memory_entries
          WHERE (expires_at IS NULL OR expires_at > ?) AND session_id LIKE ?`,
         )
-        .all(now, `${prefix}%`);
+        .all(now, `${escapeLikePrefix(prefix)}%`);
       return rows.map((r: any) => r.session_id);
     }
 
@@ -313,7 +336,7 @@ export class SqliteBackend implements MemoryBackend {
         .prepare(
           "SELECT key FROM memory_kv WHERE (expires_at IS NULL OR expires_at > ?) AND key LIKE ?",
         )
-        .all(now, `${prefix}%`);
+        .all(now, `${escapeLikePrefix(prefix)}%`);
       return rows.map((r: any) => r.key);
     }
 
