@@ -77,6 +77,10 @@ export interface SemanticMemoryRetrieverConfig {
   maxSemanticAgeMs?: number;
   /** Workspace/context scope for retrieval isolation (Phase 2). */
   workspaceId?: string;
+  /** Optional knowledge graph for entity-based retrieval (Phase 3.5). */
+  graph?: import("./graph.js").MemoryGraph;
+  /** Optional shared memory backend (Phase 8.3). */
+  sharedMemory?: import("./shared-memory.js").SharedMemoryBackend;
   logger?: Logger;
 }
 
@@ -339,6 +343,8 @@ export class SemanticMemoryRetriever implements MemoryRetriever {
   private readonly diversityThreshold: number;
   private readonly maxSemanticAgeMs: number;
   private readonly workspaceId: string | undefined;
+  private readonly graph: import("./graph.js").MemoryGraph | undefined;
+  private readonly sharedMemory: import("./shared-memory.js").SharedMemoryBackend | undefined;
   private readonly roleBudgetWeights: Record<RetrievalMemoryRole, number>;
   private readonly logger: Logger | undefined;
 
@@ -378,6 +384,8 @@ export class SemanticMemoryRetriever implements MemoryRetriever {
       Math.floor(config.maxSemanticAgeMs ?? DEFAULT_SEMANTIC_MAX_AGE_MS),
     );
     this.workspaceId = config.workspaceId;
+    this.graph = config.graph;
+    this.sharedMemory = config.sharedMemory;
     this.roleBudgetWeights = normalizeRoleWeights(config.roleBudgetWeights);
     this.logger = config.logger;
   }
@@ -436,6 +444,42 @@ export class SemanticMemoryRetriever implements MemoryRetriever {
       ]);
     } else {
       this.logger?.debug("Empty memory query embedding, skipping semantic/episodic retrieval");
+    }
+
+    // Phase 3.5: knowledge graph retrieval — extract entity mentions from query
+    // and retrieve related graph nodes for injection as context.
+    let graphBlocks: string[] = [];
+    if (this.graph) {
+      try {
+        // Simple entity extraction from query: look for capitalized words
+        const entityMentions = message.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*/g) ?? [];
+        for (const mention of entityMentions.slice(0, 3)) {
+          const result = await this.graph.findByEntity(mention, this.workspaceId);
+          for (const node of result.nodes.slice(0, 2)) {
+            const sanitized = node.content
+              .replace(/<memory[\s>]/g, "&lt;memory ")
+              .replace(/<\/memory>/g, "&lt;/memory&gt;");
+            graphBlocks.push(
+              `<memory source="graph" role="knowledge" entity="${attrEscape(node.entityName ?? mention)}" confidence="${(node.baseConfidence ?? 0.7).toFixed(2)}">\n${sanitized}\n</memory>`,
+            );
+          }
+        }
+      } catch (err) {
+        this.logger?.debug?.("Knowledge graph retrieval failed (non-blocking)", err);
+      }
+    }
+
+    // Phase 8.3: shared memory injection — retrieve cross-world facts
+    let sharedBlocks: string[] = [];
+    if (this.sharedMemory) {
+      try {
+        const userFacts = await this.sharedMemory.getFacts("user", undefined, 3);
+        const orgFacts = await this.sharedMemory.getFacts("organization", undefined, 2);
+        const allShared = [...userFacts, ...orgFacts];
+        sharedBlocks = allShared.map((f) => this.sharedMemory!.formatForPrompt([f]));
+      } catch (err) {
+        this.logger?.debug?.("Shared memory retrieval failed (non-blocking)", err);
+      }
     }
 
     const candidates = this.deduplicateCandidates([
@@ -508,6 +552,28 @@ export class SemanticMemoryRetriever implements MemoryRetriever {
         remainingBudget -= candidate.blockTokens;
         if (remainingBudget <= 0) break;
       }
+    }
+
+    // Phase 3.5: append knowledge graph blocks (max 10% of budget)
+    const graphBudget = Math.floor(this.maxTokenBudget * 0.1);
+    let graphTokensUsed = 0;
+    for (const block of graphBlocks) {
+      const tokens = Math.ceil(block.length / 4);
+      if (graphTokensUsed + tokens > graphBudget) break;
+      blocks.push(block);
+      graphTokensUsed += tokens;
+      remainingBudget -= tokens;
+    }
+
+    // Phase 8.3: append shared memory blocks (max 10% of budget)
+    const sharedBudget = Math.floor(this.maxTokenBudget * 0.1);
+    let sharedTokensUsed = 0;
+    for (const block of sharedBlocks) {
+      const tokens = Math.ceil(block.length / 4);
+      if (sharedTokensUsed + tokens > sharedBudget) break;
+      blocks.push(block);
+      sharedTokensUsed += tokens;
+      remainingBudget -= tokens;
     }
 
     const content = blocks.length > 0 ? blocks.join("\n") : undefined;
