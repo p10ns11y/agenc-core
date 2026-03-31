@@ -1,0 +1,73 @@
+/**
+ * Simulation play/pause/step controls.
+ * Phase 4 of CONCORDIA_TODO.MD.
+ */
+
+import type { SimulationStatus } from "./useSimulation";
+
+interface SimulationControlsProps {
+  status: SimulationStatus;
+  onPlay: () => void;
+  onPause: () => void;
+  onStep: () => void;
+  onStop: () => void;
+}
+
+export function SimulationControls({
+  status,
+  onPlay,
+  onPause,
+  onStep,
+  onStop,
+}: SimulationControlsProps) {
+  return (
+    <div className="flex items-center gap-2 p-2 border-b border-green-800 bg-black text-green-400 font-mono text-sm">
+      <span className="font-bold">
+        {status.world_id || "No simulation"}
+      </span>
+      <span className="text-green-600">|</span>
+      <span>
+        Step {status.step}/{status.max_steps}
+      </span>
+      <span className="text-green-600">|</span>
+      <span>
+        {status.running
+          ? status.paused
+            ? "PAUSED"
+            : "RUNNING"
+          : "STOPPED"}
+      </span>
+
+      <div className="flex gap-1 ml-auto">
+        <button
+          onClick={onPlay}
+          disabled={!status.running || !status.paused}
+          className="px-2 py-0.5 border border-green-700 hover:bg-green-900 disabled:opacity-30"
+        >
+          Play
+        </button>
+        <button
+          onClick={onPause}
+          disabled={!status.running || status.paused}
+          className="px-2 py-0.5 border border-green-700 hover:bg-green-900 disabled:opacity-30"
+        >
+          Pause
+        </button>
+        <button
+          onClick={onStep}
+          disabled={!status.running}
+          className="px-2 py-0.5 border border-green-700 hover:bg-green-900 disabled:opacity-30"
+        >
+          Step
+        </button>
+        <button
+          onClick={onStop}
+          disabled={!status.running}
+          className="px-2 py-0.5 border border-red-700 hover:bg-red-900 disabled:opacity-30"
+        >
+          Stop
+        </button>
+      </div>
+    </div>
+  );
+}
