@@ -2450,9 +2450,11 @@ export class ChatExecutor {
         "system_runtime",
       );
     }
-    // Session-scoped persistence should not bleed into truly fresh chats.
-    // For the first turn, only inject static skill context.
-    if (enableMemoryContext && ctx.hasHistory) {
+    // Persistent semantic memory (workspace-scoped, cross-session) is always
+    // injected — it provides facts learned in prior sessions (e.g. user's name).
+    // The retriever handles its own scoping: working memory is session-scoped,
+    // semantic/episodic memory is workspace-scoped with maxAge filtering.
+    if (enableMemoryContext) {
       await this.injectContext(
         ctx,
         this.memoryRetriever,
@@ -2462,6 +2464,11 @@ export class ChatExecutor {
         ctx.messageSections,
         "memory_semantic",
       );
+    }
+    // Session-scoped providers (learning patterns, progress tracker) are gated
+    // on hasHistory since they rely on current-session context and should not
+    // inject stale session state into a truly fresh first turn.
+    if (enableMemoryContext && ctx.hasHistory) {
       await this.injectContext(
         ctx,
         this.learningProvider,
