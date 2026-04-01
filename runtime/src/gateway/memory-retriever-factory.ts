@@ -68,11 +68,15 @@ export interface MemoryRetrieversResult {
 // Vector DB path resolution
 // ---------------------------------------------------------------------------
 
-function resolveVectorDbPath(workspacePath: string): string | undefined {
-  if (!workspacePath) return undefined;
+function resolveVectorDbPath(_workspacePath: string): string | undefined {
+  // Use a single global vector DB at ~/.agenc/vectors.db so memories
+  // are accessible across all workspaces.  The daemon serves sessions
+  // from many workspaces but only opens one vector backend, so a
+  // per-workspace DB makes memories invisible to other workspaces.
   try {
     const { existsSync, mkdirSync } = require("node:fs");
-    const vectorDir = join(workspacePath, ".agenc");
+    const home = process.env.HOME ?? process.env.USERPROFILE ?? "/tmp";
+    const vectorDir = join(home, ".agenc");
     if (!existsSync(vectorDir)) {
       mkdirSync(vectorDir, { recursive: true });
     }
