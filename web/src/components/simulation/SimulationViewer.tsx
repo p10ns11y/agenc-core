@@ -26,12 +26,14 @@ export function SimulationViewer({
   onBackToDashboard,
 }: SimulationViewerProps) {
   const [inspectedAgent, setInspectedAgent] = useState<string | null>(null);
+  const initialStatus = useMemo(() => buildSimulationStatus(simulation), [simulation]);
   const { state, play, pause, step, stop } = useSimulation({
     simulationId: simulation.simulation_id,
     bridgeUrl,
     agentIds: simulation.agent_ids,
     pollIntervalMs: active ? 750 : 3000,
     active,
+    initialStatus,
   });
 
   const displayStatus = useMemo(
@@ -163,6 +165,10 @@ function buildDisplayStatus(
   if (liveStatus.simulation_id === simulation.simulation_id) {
     return liveStatus;
   }
+  return buildSimulationStatus(simulation);
+}
+
+function buildSimulationStatus(simulation: SimulationRecord): SimulationStatus {
   return {
     simulation_id: simulation.simulation_id,
     world_id: simulation.world_id,
