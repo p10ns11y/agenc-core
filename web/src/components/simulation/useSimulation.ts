@@ -10,6 +10,69 @@
 
 import { useCallback, useEffect, useReducer, useRef } from "react";
 
+export interface SimulationCheckpointStatus {
+  checkpoint_id: string;
+  checkpoint_path: string;
+  schema_version: number;
+  created_at: number;
+  step: number;
+  source: string;
+  simulation_id: string;
+  lineage_id: string | null;
+  world_id: string;
+  workspace_id: string;
+  runtime_cursor: {
+    current_step: number;
+    start_step: number;
+    max_steps: number | null;
+    last_step_outcome: string | null;
+  };
+}
+
+export interface SimulationSummary {
+  simulation_id: string;
+  world_id: string;
+  workspace_id: string;
+  lineage_id: string | null;
+  parent_simulation_id: string | null;
+  status:
+    | "launching"
+    | "running"
+    | "paused"
+    | "stopping"
+    | "stopped"
+    | "finished"
+    | "failed"
+    | "archived"
+    | "deleted";
+  reason: string | null;
+  error: string | null;
+  created_at: number;
+  updated_at: number;
+  started_at: number | null;
+  ended_at: number | null;
+  agent_ids: string[];
+  current_alias: boolean;
+  pid: number | null;
+  last_completed_step: number;
+  last_step_outcome: string | null;
+  replay_event_count: number;
+  checkpoint: SimulationCheckpointStatus | null;
+}
+
+export interface SimulationRecord extends SimulationSummary {
+  agents: Array<{
+    agent_id: string;
+    agent_name: string;
+    personality: string;
+    goal: string;
+  }>;
+  premise: string;
+  max_steps: number | null;
+  gm_model?: string;
+  gm_provider?: string;
+}
+
 export interface SimulationEvent {
   event_id?: string;
   type: string;
@@ -71,7 +134,15 @@ export interface SimulationStatus {
   updated_at: number;
   last_step_outcome: string | null;
   terminal_reason: string | null;
+  checkpoint: SimulationCheckpointStatus | null;
 }
+
+export type SimulationTransportState =
+  | "idle"
+  | "replay-hydrating"
+  | "live"
+  | "reconnecting"
+  | "disconnected";
 
 export interface SimulationState {
   events: SimulationEvent[];
@@ -79,6 +150,8 @@ export interface SimulationState {
   status: SimulationStatus;
   connected: boolean;
   error: string | null;
+  notFound: boolean;
+  transportState: SimulationTransportState;
 }
 
 type SimAction =
@@ -87,7 +160,9 @@ type SimAction =
   | { type: "SET_AGENT_STATE"; agentId: string; state: AgentState }
   | { type: "SET_STATUS"; status: SimulationStatus }
   | { type: "SET_CONNECTED"; connected: boolean }
-  | { type: "SET_ERROR"; error: string | null };
+  | { type: "SET_ERROR"; error: string | null }
+  | { type: "SET_NOT_FOUND"; notFound: boolean }
+  | { type: "SET_TRANSPORT_STATE"; transportState: SimulationTransportState };
 
 const initialStatus: SimulationStatus = {
   simulation_id: "",
@@ -106,6 +181,7 @@ const initialStatus: SimulationStatus = {
   updated_at: 0,
   last_step_outcome: null,
   terminal_reason: null,
+  checkpoint: null,
 };
 
 const initialState: SimulationState = {
@@ -114,6 +190,8 @@ const initialState: SimulationState = {
   status: initialStatus,
   connected: false,
   error: null,
+  notFound: false,
+  transportState: "idle",
 };
 
 function reducer(state: SimulationState, action: SimAction): SimulationState {
@@ -131,11 +209,19 @@ function reducer(state: SimulationState, action: SimAction): SimulationState {
         agentStates: { ...state.agentStates, [action.agentId]: action.state },
       };
     case "SET_STATUS":
-      return { ...state, status: action.status };
+      return {
+        ...state,
+        status: action.status,
+        notFound: false,
+      };
     case "SET_CONNECTED":
       return { ...state, connected: action.connected };
     case "SET_ERROR":
       return { ...state, error: action.error };
+    case "SET_NOT_FOUND":
+      return { ...state, notFound: action.notFound };
+    case "SET_TRANSPORT_STATE":
+      return { ...state, transportState: action.transportState };
     default:
       return state;
   }
@@ -146,12 +232,14 @@ export function useSimulation(config: {
   bridgeUrl?: string;
   agentIds?: string[];
   pollIntervalMs?: number;
+  active?: boolean;
 }) {
   const {
     simulationId = null,
     bridgeUrl = "http://localhost:3200",
     agentIds = [],
     pollIntervalMs = 2000,
+    active = true,
   } = config;
 
   const [state, dispatch] = useReducer(reducer, initialState);
@@ -177,6 +265,24 @@ export function useSimulation(config: {
   useEffect(() => {
     if (!simulationId) {
       dispatch({ type: "SET_CONNECTED", connected: false });
+      dispatch({ type: "SET_TRANSPORT_STATE", transportState: "idle" });
+      dispatch({ type: "SET_NOT_FOUND", notFound: false });
+      return;
+    }
+    if (!active) {
+      dispatch({ type: "SET_CONNECTED", connected: false });
+      dispatch({ type: "SET_TRANSPORT_STATE", transportState: "disconnected" });
+      return;
+    }
+    dispatch({ type: "SET_TRANSPORT_STATE", transportState: "replay-hydrating" });
+  }, [active, simulationId]);
+
+  useEffect(() => {
+    if (!simulationId || !active) {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
       return;
     }
 
@@ -206,10 +312,12 @@ export function useSimulation(config: {
         reconnectDelayMs = 1000;
         dispatch({ type: "SET_CONNECTED", connected: true });
         dispatch({ type: "SET_ERROR", error: null });
+        dispatch({ type: "SET_TRANSPORT_STATE", transportState: "live" });
       };
 
       source.onerror = () => {
         dispatch({ type: "SET_CONNECTED", connected: false });
+        dispatch({ type: "SET_TRANSPORT_STATE", transportState: "reconnecting" });
         source.close();
         eventSourceRef.current = null;
         if (disposed) {
@@ -254,10 +362,10 @@ export function useSimulation(config: {
         eventSourceRef.current = null;
       }
     };
-  }, [bridgeUrl, simulationId]);
+  }, [active, bridgeUrl, simulationId]);
 
   useEffect(() => {
-    if (!simulationId) {
+    if (!simulationId || !active) {
       return;
     }
 
@@ -272,6 +380,12 @@ export function useSimulation(config: {
           `${bridgeUrl}/simulations/${encodeURIComponent(simulationId)}/status`,
           { signal: controller.signal },
         );
+        if (resp.status === 404) {
+          dispatch({ type: "SET_NOT_FOUND", notFound: true });
+          dispatch({ type: "SET_CONNECTED", connected: false });
+          dispatch({ type: "SET_TRANSPORT_STATE", transportState: "disconnected" });
+          return;
+        }
         if (!resp.ok || disposed) {
           return;
         }
@@ -299,10 +413,10 @@ export function useSimulation(config: {
       }
       controllers.clear();
     };
-  }, [bridgeUrl, pollIntervalMs, simulationId]);
+  }, [active, bridgeUrl, pollIntervalMs, simulationId]);
 
   useEffect(() => {
-    if (!simulationId || agentIds.length === 0) {
+    if (!simulationId || !active || agentIds.length === 0) {
       return;
     }
 
@@ -344,7 +458,7 @@ export function useSimulation(config: {
       }
       controllers.clear();
     };
-  }, [agentIds, bridgeUrl, pollIntervalMs, simulationId]);
+  }, [active, agentIds, bridgeUrl, pollIntervalMs, simulationId]);
 
   const sendControlCommand = useCallback(async (command: "play" | "pause" | "step" | "stop") => {
     if (!simulationId) {
