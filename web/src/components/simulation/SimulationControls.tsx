@@ -13,6 +13,13 @@ interface SimulationControlsProps {
   onStop: () => void;
 }
 
+function formatExecutionPhase(phase: SimulationStatus["execution_phase"]): string | null {
+  if (!phase || phase === "idle") {
+    return null;
+  }
+  return phase.replace(/_/g, " ").toUpperCase();
+}
+
 export function SimulationControls({
   status,
   onPlay,
@@ -20,8 +27,14 @@ export function SimulationControls({
   onStep,
   onStop,
 }: SimulationControlsProps) {
+  const phaseLabel = formatExecutionPhase(status.execution_phase);
+  const stepInProgress = status.status === "running" &&
+    phaseLabel !== null &&
+    status.execution_phase !== "waiting_for_permission" &&
+    status.execution_phase !== "step_complete";
+
   return (
-    <div className="flex items-center gap-2 p-2 border-b border-green-800 bg-black text-green-400 font-mono text-sm">
+    <div className="flex items-center gap-2 border-b border-green-800 bg-black p-2 font-mono text-sm text-green-400">
       <span className="font-bold">
         {status.world_id || "No simulation"}
       </span>
@@ -31,8 +44,16 @@ export function SimulationControls({
       </span>
       <span className="text-green-600">|</span>
       <span>{status.status.toUpperCase()}</span>
+      {phaseLabel && (
+        <>
+          <span className="text-green-600">|</span>
+          <span className={stepInProgress ? "text-yellow-300" : "text-green-500"}>
+            {stepInProgress ? `STEP IN PROGRESS: ${phaseLabel}` : phaseLabel}
+          </span>
+        </>
+      )}
 
-      <div className="flex gap-1 ml-auto">
+      <div className="ml-auto flex gap-1">
         <button
           onClick={onPlay}
           disabled={status.status !== "paused"}

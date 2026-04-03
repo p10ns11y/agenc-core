@@ -17,6 +17,10 @@ export function WorldStatePanel({ agentStates, worldId }: WorldStatePanelProps) 
   // Aggregate world facts from any agent (they see the same world facts)
   const firstAgent = agents[0]?.[1];
   const worldFacts = firstAgent?.worldFacts ?? [];
+  const worldProjection = firstAgent?.worldProjection ?? null;
+  const sceneName = worldProjection?.clock?.scene_name ?? worldProjection?.active_scene_id ?? null;
+  const timeOfDay = worldProjection?.clock?.time_of_day ?? null;
+  const dayIndex = worldProjection?.clock?.day_index ?? null;
 
   // Aggregate relationships across all agents
   const allRelationships: Array<{
@@ -45,6 +49,21 @@ export function WorldStatePanel({ agentStates, worldId }: WorldStatePanelProps) 
         <span>
           World: <span className="text-green-300">{worldId}</span>
         </span>
+        {sceneName && (
+          <span>
+            Scene: <span className="text-green-300">{sceneName}</span>
+          </span>
+        )}
+        {timeOfDay && (
+          <span>
+            Time: <span className="text-green-300">{timeOfDay}</span>
+          </span>
+        )}
+        {dayIndex !== null && dayIndex !== undefined && (
+          <span>
+            Day: <span className="text-green-300">{dayIndex}</span>
+          </span>
+        )}
         <span>
           Facts: <span className="text-green-300">{worldFacts.length}</span>
         </span>

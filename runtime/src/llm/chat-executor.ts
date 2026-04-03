@@ -2029,6 +2029,7 @@ export class ChatExecutor {
       phase: input.phase,
     });
     const disableStreaming =
+      ctx.plannerDecision.reason === "concordia_generate_agents_turn" ||
       ctx.plannerDecision.reason === "exact_response_turn" ||
       ctx.plannerDecision.reason === "dialogue_memory_turn";
     const structuredOutput =
@@ -2293,6 +2294,7 @@ export class ChatExecutor {
       extractExplicitDeterministicToolRequirements(
         messageText,
         explicitRequirementToolNames,
+        message.metadata,
       );
     const explicitSubagentOrchestrationRequirements =
       extractExplicitSubagentOrchestrationRequirements(messageText);

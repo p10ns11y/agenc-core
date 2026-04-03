@@ -8601,6 +8601,83 @@ describe("ChatExecutor", () => {
       expect(constructorStreamCallback).not.toHaveBeenCalled();
     });
 
+    it("treats concordia agent generation turns as direct structured-response turns instead of exact-response literals", async () => {
+      const provider = createMockProvider("primary", {
+        chat: vi.fn().mockResolvedValue(
+          mockResponse({
+            content: JSON.stringify([
+              {
+                id: "captain-thorne",
+                name: "Captain Garrick Thorne",
+                personality: "impulsive and distrustful",
+                goal: "Close the dawn deal before the patrol arrives.",
+              },
+              {
+                id: "harbor-broker",
+                name: "Elara Finch",
+                personality: "methodical and opportunistic",
+                goal: "Exploit Thorne's urgency to take control of the negotiation.",
+              },
+            ]),
+          }),
+        ),
+      });
+      const executor = new ChatExecutor({
+        providers: [provider],
+        toolHandler: vi.fn().mockResolvedValue("unused"),
+        plannerEnabled: true,
+        allowedTools: ["system.calendarInfo", "system.bash", "execute_with_agent"],
+      });
+
+      const result = await executor.execute(
+        createParams({
+          message: {
+            ...createMessage(
+              [
+                "Generate exactly 2 diverse characters for this simulation scenario.",
+                "",
+                "Premise: A tense harbor negotiation at dawn.",
+                "",
+                "Respond exactly with ONLY a JSON array (no markdown, no prose). Each item must contain \"id\", \"name\", \"personality\", and \"goal\".",
+                "Use lowercase hyphenated \"id\" values.",
+                "Make the characters meaningfully different so the simulation has conflict, alliances, and competing incentives.",
+              ].join("\n"),
+            ),
+            channel: "concordia",
+            senderId: "concordia-agent-generator",
+            sessionId: "concordia:generator:test",
+            metadata: {
+              type: "concordia_generate_agents",
+            },
+          },
+          contextInjection: { memory: false },
+        }),
+      );
+
+      expect(result.content).toBe(
+        JSON.stringify([
+          {
+            id: "captain-thorne",
+            name: "Captain Garrick Thorne",
+            personality: "impulsive and distrustful",
+            goal: "Close the dawn deal before the patrol arrives.",
+          },
+          {
+            id: "harbor-broker",
+            name: "Elara Finch",
+            personality: "methodical and opportunistic",
+            goal: "Exploit Thorne's urgency to take control of the negotiation.",
+          },
+        ]),
+      );
+      expect(result.plannerSummary?.routeReason).toBe("concordia_generate_agents_turn");
+      expect(provider.chat).toHaveBeenCalledTimes(1);
+      expect((provider.chat as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]).toMatchObject({
+        toolChoice: "none",
+        toolRouting: { allowedToolNames: [] },
+      });
+    });
+
     it("treats concordia action turns as direct simulation turns instead of exact-response turns", async () => {
       const provider = createMockProvider("primary", {
         chat: vi.fn().mockResolvedValue(

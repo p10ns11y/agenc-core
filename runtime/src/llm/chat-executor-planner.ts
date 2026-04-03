@@ -69,6 +69,11 @@ import {
 } from "./chat-executor-constants.js";
 import { hasRuntimeLimit } from "./runtime-limit-policy.js";
 import {
+  hasConcordiaGenerateAgentsContract,
+  hasConcordiaSimulationTurnContract,
+  looksLikeConcordiaGenerateAgentsPrompt,
+} from "./chat-executor-turn-contracts.js";
+import {
   truncateText,
   extractLLMMessageText,
   parseJsonObjectFromText,
@@ -94,7 +99,6 @@ import {
   MIN_DELEGATION_TIMEOUT_MS,
 } from "../gateway/delegation-timeout.js";
 import type { HostToolingProfile } from "../gateway/host-tooling.js";
-import { hasConcordiaSimulationTurnContract } from "./chat-executor-turn-contracts.js";
 import { collectDirectModeShellControlTokens } from "../tools/system/command-line.js";
 import {
   buildDelegationExecutionContext,
@@ -324,6 +328,17 @@ export function assessPlannerDecision(
       score,
       shouldPlan: false,
       reason: "concordia_simulation_turn",
+    };
+  }
+
+  if (
+    hasConcordiaGenerateAgentsContract(metadata) ||
+    looksLikeConcordiaGenerateAgentsPrompt(messageText)
+  ) {
+    return {
+      score,
+      shouldPlan: false,
+      reason: "concordia_generate_agents_turn",
     };
   }
 
@@ -1490,6 +1505,7 @@ export function extractPlannerVerificationCommandRequirements(
 export function extractExplicitDeterministicToolRequirements(
   messageText: string,
   allowedToolNames: readonly string[],
+  metadata?: Readonly<Record<string, unknown>>,
 ): ExplicitDeterministicToolRequirements | undefined {
   const orderedToolNames = extractExplicitImperativeToolNames(
     messageText,
@@ -1512,7 +1528,7 @@ export function extractExplicitDeterministicToolRequirements(
     forcePlanner: Object.values(minimumToolCallsByName).some(
       (count) => count > 1,
     ),
-    exactResponseLiteral: extractExactResponseLiteral(messageText),
+    exactResponseLiteral: extractExactResponseLiteral(messageText, metadata),
   };
 }
 
@@ -1602,7 +1618,17 @@ function countStructuredDirectiveBullets(segment: string): number {
   return bulletLines.length >= 2 ? bulletLines.length : 0;
 }
 
-function extractExactResponseLiteral(messageText: string): string | undefined {
+function extractExactResponseLiteral(
+  messageText: string,
+  metadata?: Readonly<Record<string, unknown>>,
+): string | undefined {
+  if (
+    hasConcordiaGenerateAgentsContract(metadata) ||
+    looksLikeConcordiaGenerateAgentsPrompt(messageText)
+  ) {
+    return undefined;
+  }
+
   const directiveMatch = EXACT_RESPONSE_LITERAL_DIRECTIVE_RE.exec(messageText);
   if (!directiveMatch) {
     return extractExactAliasLiteral(messageText);

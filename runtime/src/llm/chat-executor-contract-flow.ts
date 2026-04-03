@@ -44,6 +44,7 @@ import {
   plannerRequestNeedsPlanArtifactExecution,
   requestRequiresToolGroundedExecution,
 } from "./chat-executor-planner.js";
+import { hasConcordiaSimulationTurnContract } from "./chat-executor-turn-contracts.js";
 import {
   PROVIDER_NATIVE_GROUNDED_INFORMATION_TOOL_NAMES,
 } from "./provider-native-search.js";
@@ -201,8 +202,17 @@ export function resolveLegacyCompletionCompatibility(input: {
 }): LegacyCompletionCompatibilityDecision {
   const analysis = analyzeLegacyCompletionTurn(input.ctx);
   const plannerRouteReason = input.ctx.plannerSummaryState.routeReason;
+  if (hasConcordiaSimulationTurnContract(input.ctx.messageMetadata)) {
+    return {
+      allowed: true,
+      compatibilityClass: "plan_only",
+      reason:
+        "Legacy completion remains allowed for Concordia simulation turns outside workflow-owned implementation completion.",
+    };
+  }
   if (
     plannerRouteReason === "concordia_simulation_turn" ||
+    plannerRouteReason === "concordia_generate_agents_turn" ||
     plannerRouteReason === "exact_response_turn" ||
     plannerRouteReason === "dialogue_memory_turn"
   ) {
@@ -268,6 +278,9 @@ export function resolveLegacyCompletionCompatibility(input: {
 export function requiresWorkflowOwnedImplementationCompletion(input: {
   readonly ctx: ContractFlowContext;
 }): boolean {
+  if (hasConcordiaSimulationTurnContract(input.ctx.messageMetadata)) {
+    return false;
+  }
   return analyzeLegacyCompletionTurn(input.ctx).implementationLikeTurn;
 }
 
@@ -496,6 +509,9 @@ function mergeWorkflowVerificationContext(input: {
 function synthesizeDirectImplementationWorkflowContext(
   ctx: ContractFlowContext,
 ): RuntimeWorkflowContextResolution | undefined {
+  if (hasConcordiaSimulationTurnContract(ctx.messageMetadata)) {
+    return undefined;
+  }
   if (
     plannerRequestNeedsGroundedPlanArtifact(ctx.messageText) ||
     plannerRequestNeedsPlanArtifactExecution(ctx.messageText)
@@ -601,6 +617,16 @@ interface LegacyCompletionTurnAnalysis {
 function analyzeLegacyCompletionTurn(
   ctx: ContractFlowContext,
 ): LegacyCompletionTurnAnalysis {
+  if (hasConcordiaSimulationTurnContract(ctx.messageMetadata)) {
+    return {
+      successfulToolCalls: [],
+      mutatedArtifacts: [],
+      hasMutationProgress: false,
+      hasResearchEvidence: false,
+      hasBuildOrBehaviorEvidence: false,
+      implementationLikeTurn: false,
+    };
+  }
   const successfulToolCalls = ctx.allToolCalls.filter(
     (toolCall) => !didToolCallFail(toolCall.isError, toolCall.result),
   );

@@ -47,6 +47,19 @@ export interface SimulationSummary {
     | "failed"
     | "archived"
     | "deleted";
+  execution_phase?:
+    | "idle"
+    | "launching"
+    | "waiting_for_permission"
+    | "observing"
+    | "choosing_actor"
+    | "acting"
+    | "collecting_actions"
+    | "resolving"
+    | "checkpointing"
+    | "step_complete"
+    | "stopped"
+    | null;
   reason: string | null;
   error: string | null;
   created_at: number;
@@ -108,6 +121,17 @@ export interface AgentState {
   worldFacts: Array<{ content: string; observedBy: string; confirmations: number }>;
   turnCount: number;
   lastAction: string | null;
+  worldProjection?: {
+    active_scene_id?: string | null;
+    active_zone_id?: string | null;
+    active_location_id?: string | null;
+    clock?: {
+      scene_name?: string | null;
+      time_of_day?: string | null;
+      day_index?: number | null;
+      step?: number | null;
+    } | null;
+  } | null;
 }
 
 export interface SimulationStatus {
@@ -124,6 +148,19 @@ export interface SimulationStatus {
     | "failed"
     | "archived"
     | "deleted";
+  execution_phase?:
+    | "idle"
+    | "launching"
+    | "waiting_for_permission"
+    | "observing"
+    | "choosing_actor"
+    | "acting"
+    | "collecting_actions"
+    | "resolving"
+    | "checkpointing"
+    | "step_complete"
+    | "stopped"
+    | null;
   reason: string | null;
   error: string | null;
   step: number;
@@ -192,6 +229,7 @@ const initialStatus: SimulationStatus = {
   world_id: "",
   workspace_id: "",
   status: "launching",
+  execution_phase: null,
   reason: null,
   error: null,
   step: 0,

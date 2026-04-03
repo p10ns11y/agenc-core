@@ -458,6 +458,7 @@ export async function executeToolCallLoop(
   const suppressToolsForDialogueTurn =
     !ctx.plannerDecision.shouldPlan &&
     (ctx.plannerDecision.reason === "concordia_simulation_turn" ||
+      ctx.plannerDecision.reason === "concordia_generate_agents_turn" ||
       ctx.plannerDecision.reason === "exact_response_turn" ||
       ctx.plannerDecision.reason === "dialogue_memory_turn" ||
       ctx.plannerDecision.reason === "dialogue_recall_turn");

@@ -5,6 +5,7 @@ import type {
 } from "../llm/chat-executor.js";
 import type {
   LLMProviderTraceEvent,
+  LLMStructuredOutputRequest,
   ToolHandler,
 } from "../llm/types.js";
 import type { MemoryBackend } from "../memory/types.js";
@@ -18,6 +19,9 @@ import {
   buildDaemonMemoryEntryOptions,
   shouldPersistToDaemonMemory,
 } from "./channel-message-memory.js";
+import {
+  isConcordiaGenerateAgentsMessage,
+} from "../llm/chat-executor-turn-contracts.js";
 import {
   buildSessionStatefulOptions,
   persistSessionStatefulContinuation,
@@ -39,6 +43,51 @@ import {
   truncateToolLogText,
   type ResolvedTraceLoggingConfig,
 } from "./daemon-trace.js";
+
+const CONCORDIA_GENERATED_AGENTS_SCHEMA_NAME =
+  "concordia_generated_agents";
+
+function buildConcordiaGenerateAgentsStructuredOutput(
+  msg: GatewayMessage,
+): LLMStructuredOutputRequest | undefined {
+  if (!isConcordiaGenerateAgentsMessage(msg)) {
+    return undefined;
+  }
+
+  const countMatch = msg.content.match(/\bGenerate exactly\s+(\d+)\b/i);
+  const expectedCount = countMatch ? Number.parseInt(countMatch[1] ?? "", 10) : undefined;
+  const countBounds =
+    typeof expectedCount === "number" && Number.isFinite(expectedCount) && expectedCount > 0
+      ? { minItems: expectedCount, maxItems: expectedCount }
+      : {};
+
+  return {
+    enabled: true,
+    schema: {
+      type: "json_schema",
+      name: CONCORDIA_GENERATED_AGENTS_SCHEMA_NAME,
+      strict: true,
+      schema: {
+        type: "array",
+        ...countBounds,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["id", "name", "personality", "goal"],
+          properties: {
+            id: {
+              type: "string",
+              pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+            },
+            name: { type: "string", minLength: 1 },
+            personality: { type: "string", minLength: 1 },
+            goal: { type: "string", minLength: 1 },
+          },
+        },
+      },
+    },
+  };
+}
 
 export interface ExecuteTextChannelTurnParams {
   readonly logger: Logger;
@@ -168,6 +217,9 @@ export async function executeTextChannelTurn(
   }
 
   const sessionStateful = buildSessionStatefulOptions(session);
+  const isConcordiaGenerateAgentsTurn = isConcordiaGenerateAgentsMessage(msg);
+  const structuredOutput =
+    buildConcordiaGenerateAgentsStructuredOutput(msg);
   const effectiveMaxToolRounds = resolveTurnMaxToolRounds(
     defaultMaxToolRounds,
     toolRoutingDecision,
@@ -180,6 +232,10 @@ export async function executeTextChannelTurn(
     toolHandler,
     maxToolRounds: effectiveMaxToolRounds,
     ...(sessionStateful ? { stateful: sessionStateful } : {}),
+    ...(structuredOutput ? { structuredOutput } : {}),
+    ...(isConcordiaGenerateAgentsTurn
+      ? { contextInjection: { memory: false } }
+      : {}),
     toolRouting: toolRoutingDecision
       ? {
           routedToolNames: toolRoutingDecision.routedToolNames,

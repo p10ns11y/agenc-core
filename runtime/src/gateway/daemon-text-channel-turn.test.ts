@@ -198,6 +198,68 @@ describe("executeTextChannelTurn", () => {
     });
   });
 
+  it("passes a strict structured-output contract for Concordia agent generation turns", async () => {
+    const logger = createLoggerStub();
+    const session = createSession();
+    const sessionMgr = { appendMessage: vi.fn() } as any;
+    const execute = vi.fn(async () => createResult({ content: JSON.stringify([
+      { id: "dockmaster-rhea", name: "Dockmaster Rhea", personality: "Decisive", goal: "Secure the pier." },
+      { id: "broker-ives", name: "Broker Ives", personality: "Calculating", goal: "Win the contract." },
+      { id: "runner-tamsin", name: "Runner Tamsin", personality: "Restless", goal: "Carry the message." },
+      { id: "clerk-milo", name: "Clerk Milo", personality: "Methodical", goal: "Protect the ledger." },
+    ]) }));
+
+    await executeTextChannelTurn({
+      logger,
+      channelName: "concordia",
+      msg: {
+        sessionId: "concordia:generator:test",
+        senderId: "concordia-agent-generator",
+        channel: "concordia",
+        content:
+          "Generate exactly 4 diverse characters for this simulation scenario. Respond exactly with ONLY a JSON array.",
+      },
+      session,
+      sessionMgr,
+      systemPrompt: "system",
+      chatExecutor: { execute } as any,
+      toolHandler: vi.fn() as any,
+      defaultMaxToolRounds: 3,
+      traceConfig: {
+        enabled: false,
+        includeHistory: true,
+        includeSystemPrompt: true,
+        includeToolArgs: true,
+        includeToolResults: true,
+        includeProviderPayloads: false,
+        maxChars: 20_000,
+      },
+      turnTraceId: "trace-generate",
+      memoryBackend: createMemoryBackendStub(),
+      buildToolRoutingDecision: () => undefined,
+      recordToolRoutingOutcome: vi.fn(),
+      persistToDaemonMemory: false,
+    });
+
+    expect(execute).toHaveBeenCalledWith(
+      expect.objectContaining({
+        structuredOutput: expect.objectContaining({
+          enabled: true,
+          schema: expect.objectContaining({
+            name: "concordia_generated_agents",
+            strict: true,
+            schema: expect.objectContaining({
+              type: "array",
+              minItems: 4,
+              maxItems: 4,
+            }),
+          }),
+        }),
+        contextInjection: { memory: false },
+      }),
+    );
+  });
+
   it("rethrows executor failures without mutating session history", async () => {
     const session = createSession();
     const sessionMgr = {

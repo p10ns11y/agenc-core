@@ -96,6 +96,18 @@ export function SimulationViewer({
       <div className="flex flex-wrap items-center gap-2 border-b border-green-950 px-3 py-1 text-xs">
         <StatePill label={displayStatus.status.toUpperCase()} tone={historicalMode ? 'muted' : 'live'} />
         {displayStatus.status === 'launching' && <StatePill label="launching" tone="warn" />}
+        {displayStatus.execution_phase && displayStatus.execution_phase !== 'idle' && (
+          <StatePill
+            label={displayStatus.execution_phase.replace(/_/g, ' ')}
+            tone={
+              displayStatus.execution_phase === 'stopped'
+                ? 'muted'
+                : displayStatus.execution_phase === 'step_complete'
+                  ? 'live'
+                  : 'warn'
+            }
+          />
+        )}
         {state.transportState === 'replay-hydrating' && <StatePill label="replay-hydrating" tone="warn" />}
         {state.transportState === 'reconnecting' && <StatePill label="reconnecting" tone="warn" />}
         {state.transportState === 'disconnected' && !historicalMode && <StatePill label="disconnected" tone="error" />}
@@ -174,6 +186,7 @@ function buildSimulationStatus(simulation: SimulationRecord): SimulationStatus {
     world_id: simulation.world_id,
     workspace_id: simulation.workspace_id,
     status: simulation.status,
+    execution_phase: simulation.execution_phase ?? null,
     reason: simulation.reason,
     error: simulation.error,
     step: simulation.last_completed_step,

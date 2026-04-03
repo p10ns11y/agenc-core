@@ -53,7 +53,11 @@ import {
   sanitizeDelegatedAssistantEnvironmentSummary,
 } from "../utils/delegated-scope-trust.js";
 import { buildWorkflowRecoveryStateLines } from "./chat-executor-recovery.js";
-import { hasConcordiaSimulationTurnContract } from "./chat-executor-turn-contracts.js";
+import {
+  hasConcordiaGenerateAgentsContract,
+  hasConcordiaSimulationTurnContract,
+  looksLikeConcordiaGenerateAgentsPrompt,
+} from "./chat-executor-turn-contracts.js";
 
 // ============================================================================
 // JSON parsing helpers (used by planner + verifier)
@@ -356,7 +360,9 @@ function extractExactResponseLiteral(
 ): string | undefined {
   if (
     hasConcordiaSimulationTurnContract(metadata) ||
-    /^\[Concordia (?:Action|Speech|Choice|Numeric) Request\]/.test(messageText)
+    hasConcordiaGenerateAgentsContract(metadata) ||
+    /^\[Concordia (?:Action|Speech|Choice|Numeric) Request\]/.test(messageText) ||
+    looksLikeConcordiaGenerateAgentsPrompt(messageText)
   ) {
     return undefined;
   }
