@@ -1080,7 +1080,7 @@ export function createWatchCommandController(dependencies = {}) {
   }
 
   function printHelp() {
-    pushEvent(
+    const helpEvent = pushEvent(
       "help",
       "Command Help",
       [
@@ -1100,6 +1100,10 @@ export function createWatchCommandController(dependencies = {}) {
       ].join("\n\n"),
       "slate",
     );
+    if (helpEvent?.id) {
+      watchState.expandedEventId = helpEvent.id;
+      watchState.detailScrollOffset = 0;
+    }
   }
 
   function queueOperatorInput(value, reason = "bootstrap pending") {
