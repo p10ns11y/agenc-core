@@ -4113,9 +4113,15 @@ function validateContradictoryCompletionClaim(
   if (isReviewerDelegatedTask(spec)) {
     return undefined;
   }
-  // When the completion contract allows partial completion, don't reject
-  // honest partial progress reports as "contradictory."
-  if (spec.executionContext?.completionContract?.partialCompletionAllowed) {
+  // Don't reject partial progress or honest status reports from write/scaffold
+  // tasks. The completionContract is often not set on the execution context
+  // at validation time, so also check stepKind directly.
+  const stepKind = spec.executionContext?.stepKind;
+  if (
+    spec.executionContext?.completionContract?.partialCompletionAllowed ||
+    stepKind === "delegated_write" ||
+    stepKind === "delegated_scaffold"
+  ) {
     return undefined;
   }
   const stringValues = [
@@ -4181,9 +4187,19 @@ function validateBlockedPhaseOutput(
   if (isReviewerDelegatedTask(spec)) {
     return undefined;
   }
-  // When the completion contract allows partial completion, don't reject
-  // honest partial progress reports as "blocked."
-  if (spec.executionContext?.completionContract?.partialCompletionAllowed) {
+  // Don't reject honest blocked/incomplete status reports. A subagent that
+  // reports "Blocked: missing system dependency" has done useful work and
+  // should surface the result to the user, not get rejected as malformed.
+  // The partialCompletionAllowed guard was insufficient because the
+  // completionContract is often not set on the execution context at
+  // validation time. Accept all delegated_write and delegated_scaffold
+  // outputs that report blocked status — the parent can decide what to do.
+  const stepKind = spec.executionContext?.stepKind;
+  if (
+    spec.executionContext?.completionContract?.partialCompletionAllowed ||
+    stepKind === "delegated_write" ||
+    stepKind === "delegated_scaffold"
+  ) {
     return undefined;
   }
   const stringValues = [
