@@ -12,6 +12,14 @@ const SCENARIO_MAPS: Record<string, MapConfig> = {
     mapJson: '/assets/maps/medieval-town/medieval-town.json',
     tilesetBase: '/assets/maps/medieval-town/',
   },
+  'trading-floor': {
+    mapJson: '/assets/maps/trading-floor/trading-floor.json',
+    tilesetBase: '/assets/maps/trading-floor/',
+  },
+  'research-lab': {
+    mapJson: '/assets/maps/research-lab/research-lab.json',
+    tilesetBase: '/assets/maps/research-lab/',
+  },
 };
 
 const DEFAULT_MAP: MapConfig = {
@@ -25,4 +33,8 @@ export function getMapConfig(worldId: string): MapConfig {
 
 export function hasCustomMap(worldId: string): boolean {
   return worldId in SCENARIO_MAPS;
+}
+
+export function getAvailableMapIds(): string[] {
+  return Object.keys(SCENARIO_MAPS);
 }
