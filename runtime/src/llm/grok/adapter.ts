@@ -1265,7 +1265,8 @@ export class GrokProvider implements LLMProvider {
         providerEvidence,
         structuredOutput:
           options?.structuredOutput?.enabled === false ||
-            !options?.structuredOutput?.schema
+            !options?.structuredOutput?.schema ||
+            content.trim().length === 0
             ? undefined
             : parseStructuredOutputText(
               content,
@@ -1316,7 +1317,8 @@ export class GrokProvider implements LLMProvider {
           providerEvidence,
           structuredOutput:
             options?.structuredOutput?.enabled === false ||
-              !options?.structuredOutput?.schema
+              !options?.structuredOutput?.schema ||
+              content.trim().length === 0
               ? undefined
               : parseStructuredOutputText(
                 content,
