@@ -9,10 +9,7 @@ import type {
   PlannerVerificationSnapshot,
   WorkflowCompletionState,
 } from "./completion-state.js";
-import {
-  deriveVerificationObligations,
-  type WorkflowVerificationContract,
-} from "./verification-obligations.js";
+import type { WorkflowVerificationContract } from "./verification-obligations.js";
 
 export type WorkflowProgressRequirement =
   | "workflow_verifier_pass"
@@ -81,19 +78,7 @@ export function deriveWorkflowProgressSnapshot(params: {
     verificationContract: params.verificationContract,
     completionContract: params.completionContract,
   });
-  const obligations = mergedContract
-    ? deriveVerificationObligations(mergedContract)
-    : undefined;
   const requiredRequirements = new Set<WorkflowProgressRequirement>();
-  if (obligations?.requiresBuildVerification) {
-    requiredRequirements.add("build_verification");
-  }
-  if (obligations?.requiresBehaviorVerification) {
-    requiredRequirements.add("behavior_verification");
-  }
-  if (obligations?.requiresReviewVerification) {
-    requiredRequirements.add("review_verification");
-  }
   if (params.completionState === "needs_verification") {
     requiredRequirements.add("workflow_verifier_pass");
   }
