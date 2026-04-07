@@ -174,16 +174,6 @@ export function createChatExecutor(
     toolBudgetPerRequest: llmConfig?.toolBudgetPerRequest,
     maxModelRecallsPerRequest: llmConfig?.maxModelRecallsPerRequest,
     maxFailureBudgetPerRequest: llmConfig?.maxFailureBudgetPerRequest,
-    delegationDecision: {
-      enabled: subagentConfig.enabled,
-      mode: subagentConfig.mode,
-      scoreThreshold: subagentConfig.baseSpawnDecisionThreshold,
-      maxFanoutPerTurn: subagentConfig.maxFanoutPerTurn,
-      maxDepth: subagentConfig.maxDepth,
-      handoffMinPlannerConfidence:
-        subagentConfig.handoffMinPlannerConfidence,
-      hardBlockedTaskClasses: subagentConfig.hardBlockedTaskClasses,
-    },
     subagentVerifier: {
       enabled: subagentConfig.enabled,
       force: subagentConfig.forceVerifier,

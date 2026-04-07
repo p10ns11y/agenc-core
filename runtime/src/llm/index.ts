@@ -124,16 +124,6 @@ export type {
   MemoryRetriever,
 } from "./chat-executor.js";
 
-// Delegation decision config (Cut 1.2: assessDelegationDecision deleted;
-// live delegation flows through gateway/delegation-admission.ts).
-export {
-  resolveDelegationDecisionConfig,
-} from "./delegation-decision.js";
-export type {
-  DelegationDecisionConfig,
-  ResolvedDelegationDecisionConfig,
-} from "./delegation-decision.js";
-
 // Delegation learning (Workstream H1/H2)
 export {
   DELEGATION_TRAJECTORY_SCHEMA_VERSION,

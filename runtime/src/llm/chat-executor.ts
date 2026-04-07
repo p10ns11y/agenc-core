@@ -41,10 +41,6 @@ import {
   type ModelRoutingPolicy,
 } from "./model-routing-policy.js";
 import { isConcordiaSimulationTurnMessage } from "./chat-executor-turn-contracts.js";
-import {
-  resolveDelegationDecisionConfig,
-  type ResolvedDelegationDecisionConfig,
-} from "./delegation-decision.js";
 import type { HookRegistry } from "./hooks/index.js";
 import type { CanUseToolFn } from "./can-use-tool.js";
 import type { IsConcurrencySafeFn } from "./tool-orchestration.js";
@@ -343,7 +339,6 @@ export class ChatExecutor {
   private readonly onCompaction?: (sessionId: string, summary: string) => void;
   private readonly plannerEnabled: boolean;
   private readonly plannerMaxTokens: number;
-  private readonly delegationDecisionConfig: ResolvedDelegationDecisionConfig;
   private readonly subagentVerifierConfig: ResolvedSubagentVerifierConfig;
   private readonly toolBudgetPerRequest: number;
   private readonly maxModelRecallsPerRequest: number;
@@ -449,9 +444,6 @@ export class ChatExecutor {
     this.plannerMaxTokens = normalizeRuntimeLimit(
       config.plannerMaxTokens,
       DEFAULT_PLANNER_MAX_TOKENS,
-    );
-    this.delegationDecisionConfig = resolveDelegationDecisionConfig(
-      config.delegationDecision,
     );
     this.resolveHostWorkspaceRoot = config.resolveHostWorkspaceRoot;
     this.subagentVerifierConfig = ChatExecutor.resolveSubagentVerifierConfig(
@@ -1308,7 +1300,6 @@ export class ChatExecutor {
         providerName: this.providers[0]?.name ?? "unknown",
         plannerEnabled: this.plannerEnabled,
         subagentVerifierEnabled: this.subagentVerifierConfig.enabled,
-        delegationScoreThreshold: this.delegationDecisionConfig.scoreThreshold,
         defaultRunClass: this.defaultRunClass,
         economicsPolicy: this.economicsPolicy,
       },
