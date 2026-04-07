@@ -487,6 +487,7 @@ export class ChatExecutor {
   private readonly onCompaction?: (sessionId: string, summary: string) => void;
   private readonly evaluator?: EvaluatorConfig;
   private readonly plannerEnabled: boolean;
+  private readonly simpleAgentLoop: boolean;
   private readonly plannerMaxTokens: number;
   private readonly delegationNestingDepth: number;
   private readonly pipelineExecutor?: DeterministicPipelineExecutor;
@@ -554,6 +555,14 @@ export class ChatExecutor {
     this.onCompaction = config.onCompaction;
     this.evaluator = config.evaluator;
     this.plannerEnabled = config.plannerEnabled ?? false;
+    // Default false in the constructor for the duration of the
+    // transition: existing test fixtures (273 instantiations across
+    // chat-executor.test.ts) were written against the planner-driven
+    // flow and would all need rewriting otherwise. Production callers
+    // pass `true` explicitly via gateway/chat-executor-factory.ts.
+    // Once the planner subsystem is deleted in Phase 2 of the refactor,
+    // the legacy tests are deleted with it and this default flips.
+    this.simpleAgentLoop = config.simpleAgentLoop ?? false;
     this.plannerMaxTokens = normalizeRuntimeLimit(
       config.plannerMaxTokens,
       DEFAULT_PLANNER_MAX_TOKENS,
@@ -667,8 +676,13 @@ export class ChatExecutor {
   ): Promise<ChatExecutorResult> {
     const ctx = await this.initializeExecutionContext(params);
 
-    // Planner path (complexity-based delegation)
+    // Planner path (complexity-based delegation).
+    // Skipped entirely when `simpleAgentLoop` is enabled — the simple
+    // path is a Claude Code-style tool loop with no planner phase, no
+    // structured plan validation, and no contract synthesis. See the
+    // ChatExecutorConfig.simpleAgentLoop docstring.
     if (
+      !this.simpleAgentLoop &&
       this.plannerEnabled &&
       ctx.plannerDecision.shouldPlan &&
       this.pipelineExecutor &&
@@ -868,6 +882,16 @@ export class ChatExecutor {
     verificationContract?: WorkflowVerificationContract;
     completionContract?: ImplementationCompletionContract;
   } {
+    // Simple agent loop has NO inferred contracts. The model + system
+    // prompt + tools are the entire contract. With no
+    // verificationContract and no completionContract, every downstream
+    // gate (`enforce*BeforeCompletion`, `synchronizeCompletionState`,
+    // the placeholder/stub detector, the `reconcileTerminal*`
+    // rewriters) becomes a no-op and the executor just delivers the
+    // model's last assistant message verbatim.
+    if (this.simpleAgentLoop) {
+      return {};
+    }
     const workflowContext = resolveRuntimeWorkflowContext({ ctx });
     return {
       verificationContract: workflowContext.verificationContract,
