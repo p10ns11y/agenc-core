@@ -43,7 +43,6 @@ import type { WorkflowProgressSnapshot } from "../workflow/completion-progress.j
 import type {
   WorkflowVerificationContract,
 } from "../workflow/verification-obligations.js";
-import type { DelegationDecisionConfig } from "./delegation-decision.js";
 import type {
   RuntimeEconomicsPolicy,
   RuntimeEconomicsState,
@@ -473,8 +472,6 @@ export interface ChatExecutorConfig {
   readonly delegationNestingDepth?: number;
   /** Optional deterministic workflow executor used when planner emits executable steps. */
   readonly pipelineExecutor?: DeterministicPipelineExecutor;
-  /** Delegation utility scoring controls for planner-emitted subagent tasks. */
-  readonly delegationDecision?: DelegationDecisionConfig;
   /** Optional verifier/critic loop for planner-emitted subagent outputs. */
   readonly subagentVerifier?: {
     /** Enable verifier flow for planner-emitted subagent steps. */
@@ -747,7 +744,6 @@ export interface BuildExecutionContextConfig {
   readonly providerName: string;
   readonly plannerEnabled: boolean;
   readonly subagentVerifierEnabled: boolean;
-  readonly delegationScoreThreshold: number;
   readonly defaultRunClass?: RuntimeRunClass;
   readonly economicsPolicy: RuntimeEconomicsPolicy;
 }
