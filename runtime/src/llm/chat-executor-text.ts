@@ -88,6 +88,44 @@ export function truncateText(value: string, maxChars: number): string {
   return value.slice(0, maxChars - 3) + "...";
 }
 
+function collapseRunawayRepetition(content: string): string {
+  const lines = content.split(/\r?\n/);
+  if (lines.length < REPETITIVE_LINE_MIN_COUNT) return content;
+
+  const normalized = lines.map((line) =>
+    line.trim().replace(/\s+/g, " ").toLowerCase(),
+  );
+  const nonEmpty = normalized.filter((line) => line.length > 0);
+  if (nonEmpty.length < REPETITIVE_LINE_MIN_COUNT) return content;
+
+  const freq = new Map<string, number>();
+  for (const line of nonEmpty) {
+    if (line.length > 80) continue;
+    freq.set(line, (freq.get(line) ?? 0) + 1);
+  }
+
+  let topCount = 0;
+  for (const count of freq.values()) {
+    if (count > topCount) topCount = count;
+  }
+
+  const uniqueRatio = new Set(nonEmpty).size / nonEmpty.length;
+  if (
+    topCount < REPETITIVE_LINE_MIN_REPEATS ||
+    uniqueRatio > REPETITIVE_LINE_MAX_UNIQUE_RATIO
+  ) {
+    return content;
+  }
+
+  const preview = lines.slice(0, 24).join("\n");
+  return `${preview}\n\n[response truncated: repetitive model output suppressed]`;
+}
+
+function isBase64Like(value: string): boolean {
+  if (value.length < 128) return false;
+  return /^[A-Za-z0-9+/=\r\n]+$/.test(value);
+}
+
 export function sanitizeFinalContent(content: string): string {
   if (!content) return content;
   const collapsed = collapseRunawayRepetition(content);
@@ -176,17 +214,6 @@ function delegatedResultPreview(
 
 
 
-const EXECUTION_PLAN_LINE_RE =
-  /^(?:\d+\.\s+|[-*]\s+)(?:scaffold|create|write|edit|implement|build|compile|validate|verify|run|research|compare|open|test|fix|install)\b/i;
-const PLAN_HEADING_RE = /^(?:\*\*)?plan(?:\*\*)?:?/im;
-const FUTURE_EXECUTION_SIGNAL_RE =
-  /\b(?:starting execution|begin(?:ning)? execution|i(?:'ll| will)|going to|next(?: up)?|after that|then)\b/i;
-const EXECUTION_DEFERRAL_SIGNAL_RE =
-  /\b(?:let me know|ready for (?:the )?(?:next|follow[- ]?up|another|you to)|next (?:feature|module|step)|deepen next|specific feature|specific module|continue next|follow up next)\b/i;
-const EXECUTION_PROGRESS_SUMMARY_SIGNAL_RE =
-  /\b(?:summary of process|current status|compiled|build succeeded|updated\s+`|updated\s+src\/|wrote\s+|fixed\s+|implemented\s+|ready)\b/i;
-const EXECUTION_BLOCKER_SIGNAL_RE =
-  /\b(?:blocked|blocker|cannot continue|can't continue|unable to continue|needs verification|requires verification|verification pending|waiting on)\b/i;
 
 
 
@@ -215,74 +242,7 @@ function isLowInformationCompletion(content: string): boolean {
   );
 }
 
-export function looksLikeExecutionPlan(content: string): boolean {
-  const lines = content
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-  if (lines.length === 0 || lines.length > 12) return false;
-  const planLines = lines.filter((line) => EXECUTION_PLAN_LINE_RE.test(line));
-  return planLines.length >= Math.min(3, lines.length);
-}
 
-export function isPlanOnlyExecutionResponse(content: string): boolean {
-  const trimmed = content.trim();
-  if (!looksLikeExecutionPlan(trimmed)) return false;
-  return PLAN_HEADING_RE.test(trimmed) || FUTURE_EXECUTION_SIGNAL_RE.test(trimmed);
-}
-
-export function isExecutionDeferralResponse(content: string): boolean {
-  const trimmed = content.trim();
-  if (trimmed.length === 0) return false;
-  if (EXECUTION_BLOCKER_SIGNAL_RE.test(trimmed)) return false;
-  return (
-    EXECUTION_DEFERRAL_SIGNAL_RE.test(trimmed) &&
-    EXECUTION_PROGRESS_SUMMARY_SIGNAL_RE.test(trimmed)
-  );
-}
-
-
-
-
-
-
-export function collapseRunawayRepetition(content: string): string {
-  const lines = content.split(/\r?\n/);
-  if (lines.length < REPETITIVE_LINE_MIN_COUNT) return content;
-
-  const normalized = lines.map((line) =>
-    line.trim().replace(/\s+/g, " ").toLowerCase(),
-  );
-  const nonEmpty = normalized.filter((line) => line.length > 0);
-  if (nonEmpty.length < REPETITIVE_LINE_MIN_COUNT) return content;
-
-  const freq = new Map<string, number>();
-  for (const line of nonEmpty) {
-    if (line.length > 80) continue;
-    freq.set(line, (freq.get(line) ?? 0) + 1);
-  }
-
-  let topCount = 0;
-  for (const count of freq.values()) {
-    if (count > topCount) topCount = count;
-  }
-
-  const uniqueRatio = new Set(nonEmpty).size / nonEmpty.length;
-  if (
-    topCount < REPETITIVE_LINE_MIN_REPEATS ||
-    uniqueRatio > REPETITIVE_LINE_MAX_UNIQUE_RATIO
-  ) {
-    return content;
-  }
-
-  const preview = lines.slice(0, 24).join("\n");
-  return `${preview}\n\n[response truncated: repetitive model output suppressed]`;
-}
-
-export function isBase64Like(value: string): boolean {
-  if (value.length < 128) return false;
-  return /^[A-Za-z0-9+/=\r\n]+$/.test(value);
-}
 
 const DATA_IMAGE_URL_PATTERN =
   /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/;

@@ -1084,7 +1084,7 @@ export function buildSemanticToolCallKey(
   return `${name}:${normalizeSemanticValue(args)}`;
 }
 
-export function normalizeSemanticValue(value: unknown): string {
+function normalizeSemanticValue(value: unknown): string {
   if (value === null || value === undefined) return "null";
   if (typeof value === "string") {
     return value.trim().replace(/\s+/g, " ").toLowerCase();
