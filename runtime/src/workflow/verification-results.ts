@@ -1,27 +1,15 @@
 /**
- * Workflow verification results — collapsed type stub (Cut 1.1).
+ * Workflow verification results — opaque type stub (Cut 1.1).
  *
- * Replaces the previous 127-LOC channel-decision builder API used by
- * the deleted planner verifier. Kept as opaque types so workflow/index
- * still re-exports cleanly.
+ * The planner-era channel-decision builder API has been deleted. Only the
+ * opaque decision type remains so that the verification-contract stub can
+ * still advertise a no-op return shape to its sole consumer
+ * (eval/implementation-gate-suite.ts).
  *
  * @module
  */
 
-import type {
-  DelegationOutputValidationCode,
-  DelegationOutputValidationResult,
-} from "../utils/delegation-validation.js";
-
-const RUNTIME_VERIFICATION_CHANNEL_NAMES = [
-  "artifact_state",
-  "placeholder_stub",
-  "executable_outcome",
-  "rubric",
-] as const;
-
-type RuntimeVerificationChannelName =
-  typeof RUNTIME_VERIFICATION_CHANNEL_NAMES[number];
+import type { DelegationOutputValidationCode } from "../utils/delegation-validation.js";
 
 export interface RuntimeVerificationDiagnostic {
   readonly code: DelegationOutputValidationCode;
@@ -29,7 +17,7 @@ export interface RuntimeVerificationDiagnostic {
 }
 
 interface RuntimeVerificationChannelDecision {
-  readonly channel: RuntimeVerificationChannelName;
+  readonly channel: "artifact_state" | "placeholder_stub" | "executable_outcome" | "rubric";
   readonly ok: boolean;
   readonly message: string;
   readonly evidence?: readonly string[];
@@ -41,27 +29,4 @@ export interface RuntimeVerificationDecision {
   readonly compatibilityFallbackSuggested?: boolean;
   readonly diagnostic?: RuntimeVerificationDiagnostic;
   readonly channels: readonly RuntimeVerificationChannelDecision[];
-}
-
-export function verificationPass(
-  channels: readonly RuntimeVerificationChannelDecision[] = [],
-): RuntimeVerificationDecision {
-  return { ok: true, channels };
-}
-
-export function verificationFail(
-  code: DelegationOutputValidationCode,
-  message: string,
-): RuntimeVerificationDecision {
-  return {
-    ok: false,
-    diagnostic: { code, message },
-    channels: [],
-  };
-}
-
-export function toDelegationOutputValidationResult(
-  _params: Record<string, unknown>,
-): DelegationOutputValidationResult | undefined {
-  return undefined;
 }
