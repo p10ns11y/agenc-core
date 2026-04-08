@@ -184,11 +184,6 @@ export type { ArtifactContract, ArtifactAccessMode } from "./artifact-contract.j
 export { buildArtifactContract, isArtifactAccessAllowed } from "./artifact-contract.js";
 export type { WorkflowVerificationContract } from "./verification-obligations.js";
 export type {
-  RuntimeVerificationDiagnostic,
-  RuntimeVerificationDecision,
-} from "./verification-results.js";
-export { validateRuntimeVerificationContract } from "./verification-contract.js";
-export type {
   EffectLedgerVersion,
   EffectStatus,
   EffectKind,

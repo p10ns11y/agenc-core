@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -9,12 +9,9 @@ import { SqliteBackend } from "../memory/sqlite/backend.js";
 import { ChatExecutor } from "../llm/chat-executor.js";
 import { LLMTimeoutError } from "../llm/errors.js";
 import type { LLMProvider, LLMResponse } from "../llm/types.js";
-import { runCommand } from "../utils/process.js";
-import type { DelegationValidationToolCall } from "../utils/delegation-validation.js";
 import { resolveWorkflowCompletionState } from "../workflow/completion-state.js";
 import type { WorkflowProgressSnapshot } from "../workflow/completion-progress.js";
 import type { WorkflowVerificationContract } from "../workflow/verification-obligations.js";
-import { validateRuntimeVerificationContract } from "../workflow/verification-contract.js";
 import { TrajectoryReplayEngine } from "./replay.js";
 import { parseTrajectoryTrace } from "./types.js";
 
@@ -70,130 +67,6 @@ function ratio(numerator: number, denominator: number): number {
   return numerator / denominator;
 }
 
-function stableJson(value: Record<string, unknown>): string {
-  return JSON.stringify(value);
-}
-
-function createWriteToolCall(targetPath: string, content: string): DelegationValidationToolCall {
-  return {
-    name: "system.writeFile",
-    args: {
-      path: targetPath,
-      content,
-    },
-    result: stableJson({
-      path: targetPath,
-      ok: true,
-    }),
-    isError: false,
-  };
-}
-
-function createReadToolCall(targetPath: string, content: string): DelegationValidationToolCall {
-  return {
-    name: "system.readFile",
-    args: { path: targetPath },
-    result: stableJson({
-      path: targetPath,
-      content,
-    }),
-    isError: false,
-  };
-}
-
-async function createVerificationToolCall(params: {
-  readonly cwd: string;
-  readonly command: string;
-  readonly args: readonly string[];
-  readonly category: "build" | "behavior";
-}): Promise<DelegationValidationToolCall> {
-  const execution = await runCommand(params.command, [...params.args], {
-    cwd: params.cwd,
-  });
-  const commandText = [params.command, ...params.args].join(" ");
-  const successPrefix =
-    params.category === "behavior"
-      ? "behavior test passed"
-      : "build verification passed";
-  const failurePrefix =
-    params.category === "behavior"
-      ? "behavior test failed"
-      : "build verification failed";
-  return {
-    name: "system.bash",
-    args: {
-      command: commandText,
-      cwd: params.cwd,
-    },
-    result: stableJson({
-      stdout:
-        execution.exitCode === 0
-          ? [
-              successPrefix,
-              execution.stdout,
-            ]
-              .filter(Boolean)
-              .join("\n")
-          : [
-              failurePrefix,
-              execution.stdout,
-            ]
-              .filter(Boolean)
-              .join("\n"),
-      stderr: execution.stderr || "",
-      exitCode: execution.exitCode,
-      __agencVerification: {
-        category: params.category,
-        repoLocal: true,
-        command: commandText,
-        cwd: params.cwd,
-      },
-    }),
-    isError: execution.exitCode !== 0,
-  };
-}
-
-function resolveVerifiedCompletionState(params: {
-  readonly toolCalls: readonly DelegationValidationToolCall[];
-  readonly verificationContract: WorkflowVerificationContract;
-  readonly verifierPerformed: boolean;
-  readonly verifierPassed: boolean;
-}): string {
-  return resolveWorkflowCompletionState({
-    stopReason: "completed",
-    toolCalls: params.toolCalls.map((toolCall) => ({
-      name: toolCall.name ?? "",
-      args:
-        toolCall.args && typeof toolCall.args === "object" && !Array.isArray(toolCall.args)
-          ? (toolCall.args as Record<string, unknown>)
-          : {},
-      result: typeof toolCall.result === "string" ? toolCall.result : "",
-      isError: toolCall.isError === true,
-    })),
-    verificationContract: params.verificationContract,
-    verifier: {
-      performed: params.verifierPerformed,
-      overall: params.verifierPerformed
-        ? params.verifierPassed
-          ? "pass"
-          : "fail"
-        : "skipped",
-    },
-  });
-}
-
-async function withTempRepo<T>(
-  label: string,
-  fn: (repoDir: string) => Promise<T>,
-): Promise<T> {
-  const repoDir = await mkdtemp(path.join(tmpdir(), `agenc-phase8-${label}-`));
-  try {
-    return await fn(repoDir);
-  } finally {
-    await rm(repoDir, { recursive: true, force: true });
-  }
-}
-
 async function runShellStubReplayScenario(
   incidentFixtureDir: string,
 ): Promise<PipelineImplementationGateScenarioArtifact> {
@@ -225,174 +98,6 @@ async function runShellStubReplayScenario(
     expectedOutcome: expected.expectedReplay.finalStatus,
     notes: `errors=${replay.errors.length} warnings=${replay.warnings.length}`,
   };
-}
-
-async function runDeterministicImplementationScenario(): Promise<PipelineImplementationGateScenarioArtifact> {
-  return withTempRepo("deterministic-false-completion", async (repoDir) => {
-    await mkdir(path.join(repoDir, "src"), { recursive: true });
-    await writeFile(path.join(repoDir, "package.json"), '{"type":"module"}\n', "utf8");
-    const targetPath = path.join(repoDir, "src", "runner.js");
-    const stubContent = [
-      "export function runPipeline(input) {",
-      "  // placeholder stub",
-      "  return input;",
-      "}",
-      "",
-    ].join("\n");
-    await writeFile(targetPath, stubContent, "utf8");
-    const toolCalls: DelegationValidationToolCall[] = [
-      createWriteToolCall(targetPath, stubContent),
-      await createVerificationToolCall({
-        cwd: repoDir,
-        command: process.execPath,
-        args: ["--check", targetPath],
-        category: "build",
-      }),
-    ];
-    const verificationContract: WorkflowVerificationContract = {
-      workspaceRoot: repoDir,
-      targetArtifacts: [targetPath],
-      acceptanceCriteria: [
-        "Build succeeds cleanly.",
-        "Runtime behavior works for real scenario inputs.",
-      ],
-      completionContract: {
-        taskClass: "behavior_required",
-        placeholdersAllowed: false,
-        partialCompletionAllowed: false,
-        placeholderTaxonomy: "implementation",
-      },
-    };
-    const decision = validateRuntimeVerificationContract({
-      verificationContract,
-      output: "**Implemented** All shell runtime paths are done.",
-      toolCalls,
-    });
-    const completionState = resolveVerifiedCompletionState({
-      toolCalls,
-      verificationContract,
-      verifierPerformed: true,
-      verifierPassed: decision?.ok === true,
-    });
-    return {
-      scenarioId: "deterministic_impl_behavior_gap",
-      title: "Deterministic implementation cannot complete on build-only success with behavioral gaps",
-      category: "deterministic_false_completion",
-      mandatory: true,
-      executionMode: "temp_repo",
-      passed: decision?.ok === false && completionState !== "completed",
-      falseCompleted: completionState === "completed",
-      observedOutcome: completionState,
-      expectedOutcome: "partial",
-      notes: decision?.diagnostic?.code ?? "missing_decision",
-    };
-  });
-}
-
-async function runValidScaffoldScenario(): Promise<PipelineImplementationGateScenarioArtifact> {
-  return withTempRepo("valid-scaffold", async (repoDir) => {
-    await mkdir(path.join(repoDir, "src"), { recursive: true });
-    const targetPath = path.join(repoDir, "src", "feature.ts");
-    const scaffoldContent = [
-      "export interface FeatureConfig {",
-      "  // scaffold placeholder",
-      "}",
-      "",
-    ].join("\n");
-    await writeFile(targetPath, scaffoldContent, "utf8");
-    const toolCalls: DelegationValidationToolCall[] = [
-      createWriteToolCall(targetPath, scaffoldContent),
-    ];
-    const verificationContract: WorkflowVerificationContract = {
-      workspaceRoot: repoDir,
-      targetArtifacts: [targetPath],
-      acceptanceCriteria: ["Scaffold the module shape and leave clear placeholders."],
-      completionContract: {
-        taskClass: "scaffold_allowed",
-        placeholdersAllowed: true,
-        partialCompletionAllowed: true,
-        placeholderTaxonomy: "scaffold",
-      },
-    };
-    const decision = validateRuntimeVerificationContract({
-      verificationContract,
-      output: "Scaffolded the module with placeholders as requested.",
-      toolCalls,
-    });
-    const completionState = resolveVerifiedCompletionState({
-      toolCalls,
-      verificationContract,
-      verifierPerformed: true,
-      verifierPassed: decision?.ok === true,
-    });
-    return {
-      scenarioId: "valid_scaffold_placeholders",
-      title: "Scaffold tasks may keep explicit placeholders when the contract allows them",
-      category: "scaffold_placeholder",
-      mandatory: true,
-      executionMode: "temp_repo",
-      passed: decision?.ok === true && completionState === "completed",
-      falseCompleted: false,
-      observedOutcome: completionState,
-      expectedOutcome: "completed",
-      notes: decision?.channels[1]?.message,
-    };
-  });
-}
-
-async function runImplementationRepairScenario(): Promise<PipelineImplementationGateScenarioArtifact> {
-  return withTempRepo("implementation-repair", async (repoDir) => {
-    await mkdir(path.join(repoDir, "src"), { recursive: true });
-    const targetPath = path.join(repoDir, "src", "greeter.js");
-    const scaffoldContent = "export const greet = () => 'TODO placeholder';\n";
-    const finalContent = "export const greet = (name) => `hello ${name}`;\n";
-    await writeFile(targetPath, scaffoldContent, "utf8");
-    const toolCalls: DelegationValidationToolCall[] = [
-      createReadToolCall(targetPath, scaffoldContent),
-      createWriteToolCall(targetPath, finalContent),
-      await createVerificationToolCall({
-        cwd: repoDir,
-        command: process.execPath,
-        args: ["--check", targetPath],
-        category: "build",
-      }),
-    ];
-    const verificationContract: WorkflowVerificationContract = {
-      workspaceRoot: repoDir,
-      requiredSourceArtifacts: [targetPath],
-      targetArtifacts: [targetPath],
-      acceptanceCriteria: ["Build succeeds cleanly after replacing the scaffold placeholder."],
-      completionContract: {
-        taskClass: "build_required",
-        placeholdersAllowed: false,
-        partialCompletionAllowed: false,
-        placeholderTaxonomy: "repair",
-      },
-    };
-    const decision = validateRuntimeVerificationContract({
-      verificationContract,
-      output: "Implemented the real behavior and removed the scaffold placeholder.",
-      toolCalls,
-    });
-    const completionState = resolveVerifiedCompletionState({
-      toolCalls,
-      verificationContract,
-      verifierPerformed: true,
-      verifierPassed: decision?.ok === true,
-    });
-    return {
-      scenarioId: "implementation_replaces_scaffold",
-      title: "Implementation repair replaces scaffold placeholders and remains executable",
-      category: "implementation_repair",
-      mandatory: true,
-      executionMode: "temp_repo",
-      passed: decision?.ok === true && completionState === "completed",
-      falseCompleted: false,
-      observedOutcome: completionState,
-      expectedOutcome: "completed",
-      notes: decision?.channels.find((channel) => channel.channel === "executable_outcome")?.message,
-    };
-  });
 }
 
 async function runResumeAfterPartialScenario(): Promise<PipelineImplementationGateScenarioArtifact> {
@@ -567,11 +272,11 @@ async function runDegradedProviderRetryScenario(): Promise<PipelineImplementatio
       placeholderTaxonomy: "implementation",
     },
   };
-  const completionState = resolveVerifiedCompletionState({
+  const completionState = resolveWorkflowCompletionState({
+    stopReason: "completed",
     toolCalls: [],
     verificationContract,
-    verifierPerformed: false,
-    verifierPassed: false,
+    verifier: { performed: false, overall: "skipped" },
   });
   return {
     scenarioId: "degraded_provider_retry_without_false_completion",
@@ -616,11 +321,11 @@ async function runSafetyIncompleteOutputScenario(): Promise<PipelineImplementati
       placeholderTaxonomy: "implementation",
     },
   };
-  const completionState = resolveVerifiedCompletionState({
+  const completionState = resolveWorkflowCompletionState({
+    stopReason: "completed",
     toolCalls: [],
     verificationContract,
-    verifierPerformed: false,
-    verifierPassed: false,
+    verifier: { performed: false, overall: "skipped" },
   });
   const blocked = outcome.status === "deny" || outcome.status === "require_approval";
   return {
@@ -642,9 +347,6 @@ export async function runImplementationGateSuite(
 ): Promise<PipelineImplementationGateArtifact> {
   const scenarios = await Promise.all([
     runShellStubReplayScenario(config.incidentFixtureDir),
-    runDeterministicImplementationScenario(),
-    runValidScaffoldScenario(),
-    runImplementationRepairScenario(),
     runResumeAfterPartialScenario(),
     runDegradedProviderRetryScenario(),
     runSafetyIncompleteOutputScenario(),
