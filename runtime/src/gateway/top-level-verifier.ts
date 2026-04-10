@@ -13,13 +13,25 @@ import {
   type PlannerVerificationSnapshot,
 } from "../workflow/completion-state.js";
 import { createExecutionEnvelope } from "../workflow/execution-envelope.js";
-import { normalizeArtifactPaths, normalizeWorkspaceRoot } from "../workflow/path-normalization.js";
+import {
+  normalizeArtifactPaths,
+  normalizeWorkspaceRoot,
+} from "../workflow/path-normalization.js";
 import type { Logger } from "../utils/logger.js";
 import type { AgentDefinition } from "./agent-loader.js";
 import type { DelegationVerifierService } from "./delegation-runtime.js";
 import { isSubAgentSessionId } from "./delegation-runtime.js";
-import type { SubAgentConfig, SubAgentManager, SubAgentResult } from "./sub-agent.js";
+import type {
+  SubAgentConfig,
+  SubAgentManager,
+  SubAgentResult,
+} from "./sub-agent.js";
 import type { LLMStructuredOutputRequest } from "../llm/types.js";
+import type { RuntimeVerifierVerdict } from "../runtime-contract/types.js";
+import {
+  updateRuntimeContractLegacyVerifierMode,
+  updateRuntimeContractVerifierVerdict,
+} from "../runtime-contract/types.js";
 
 const DEFAULT_VERIFY_TOOLS = [
   "system.readFile",
@@ -72,14 +84,41 @@ const VERIFY_STRUCTURED_OUTPUT: LLMStructuredOutputRequest = {
   },
 };
 
-interface MaybeRunTopLevelVerifierParams {
+interface TopLevelVerifierParams {
   readonly sessionId: string;
   readonly userRequest: string;
-  readonly result: ChatExecutorResult;
+  readonly result: Pick<
+    ChatExecutorResult,
+    | "content"
+    | "stopReason"
+    | "completionState"
+    | "turnExecutionContract"
+    | "toolCalls"
+    | "stopReasonDetail"
+    | "validationCode"
+    | "completionProgress"
+    | "runtimeContractSnapshot"
+  >;
   readonly subAgentManager: Pick<SubAgentManager, "spawn" | "waitForResult"> | null;
-  readonly verifierService: Pick<DelegationVerifierService, "shouldVerifySubAgentResult"> | null;
+  readonly verifierService: Pick<
+    DelegationVerifierService,
+    "shouldVerifySubAgentResult"
+  > | null;
   readonly agentDefinitions?: readonly AgentDefinition[];
   readonly logger?: Logger;
+}
+
+export interface TopLevelVerifierValidationResult {
+  readonly outcome:
+    | "pass"
+    | "retry_with_blocking_message"
+    | "fail_closed"
+    | "skipped";
+  readonly verifier: PlannerVerificationSnapshot;
+  readonly runtimeVerifier: RuntimeVerifierVerdict;
+  readonly summary: string;
+  readonly blockingMessage?: string;
+  readonly exhaustedDetail?: string;
 }
 
 function truncate(text: string, max: number): string {
@@ -144,6 +183,22 @@ function buildVerifierPrompt(params: {
   return lines.join("\n");
 }
 
+function buildVerifierBlockingMessage(params: {
+  readonly summary: string;
+  readonly verdict: RuntimeVerifierVerdict["overall"];
+}): string {
+  const verdictLabel =
+    params.verdict === "retry" ? "RETRY" : params.verdict.toUpperCase();
+  return [
+    `Runtime verification blocked completion because the verifier returned ${verdictLabel}.`,
+    "",
+    "Verifier summary:",
+    params.summary,
+    "",
+    "Use tools to fix the implementation until verification passes. Do not restate completion while verifier failures remain.",
+  ].join("\n");
+}
+
 function parseStructuredVerifierSnapshot(result: SubAgentResult | null): {
   readonly snapshot: PlannerVerificationSnapshot;
   readonly summary: string;
@@ -153,9 +208,10 @@ function parseStructuredVerifierSnapshot(result: SubAgentResult | null): {
     return null;
   }
   const object = parsed as Record<string, unknown>;
-  const verdict = typeof object.verdict === "string"
-    ? object.verdict.trim().toLowerCase()
-    : "";
+  const verdict =
+    typeof object.verdict === "string"
+      ? object.verdict.trim().toLowerCase()
+      : "";
   const summary =
     typeof object.summary === "string" && object.summary.trim().length > 0
       ? truncate(object.summary.trim(), 2000)
@@ -215,72 +271,18 @@ function parseVerifierSnapshot(result: SubAgentResult | null): {
   return { snapshot, summary };
 }
 
-function buildVerifierAdjustedResult(params: {
-  readonly result: ChatExecutorResult;
-  readonly verifier: PlannerVerificationSnapshot;
-  readonly verifierSummary: string;
-}): ChatExecutorResult {
-  const requiredToolEvidence = mergeTurnExecutionRequiredToolEvidence({
-    turnExecutionContract: params.result.turnExecutionContract,
-  });
-  const workflowEvidence = resolveWorkflowEvidenceFromRequiredToolEvidence({
-    requiredToolEvidence,
-    runtimeContext: {
-      workspaceRoot: params.result.turnExecutionContract.workspaceRoot,
-      activeTaskContext: deriveActiveTaskContext(params.result.turnExecutionContract),
-    },
-  });
-  const completionState = resolveWorkflowCompletionState({
-    stopReason: params.result.stopReason,
-    toolCalls: params.result.toolCalls,
-    verificationContract: workflowEvidence.verificationContract,
-    completionContract: workflowEvidence.completionContract,
-    validationCode: params.result.validationCode,
-    verifier: params.verifier,
-  });
-  const nextProgress = deriveWorkflowProgressSnapshot({
-    stopReason: params.result.stopReason,
-    completionState,
-    stopReasonDetail:
-      params.verifier.overall === "pass"
-        ? params.result.stopReasonDetail
-        : `Top-level verifier ${params.verifier.overall}: ${params.verifierSummary}`,
-    validationCode: params.result.validationCode,
-    toolCalls: params.result.toolCalls,
-    verificationContract: workflowEvidence.verificationContract,
-    completionContract: workflowEvidence.completionContract,
-    updatedAt: Date.now(),
-    contractFingerprint: params.result.turnExecutionContract.contractFingerprint,
-    verifier: params.verifier,
-  });
-  const completionProgress = mergeWorkflowProgressSnapshots({
-    previous: params.result.completionProgress,
-    next: nextProgress,
-  });
-
-  if (params.verifier.overall === "pass") {
-    return {
-      ...params.result,
-      completionState,
-      ...(completionProgress ? { completionProgress } : {}),
-    };
-  }
-
-  const content = params.result.content.trim().length > 0
-    ? `${params.result.content.trim()}\n\nVerification did not pass.\n${params.verifierSummary}`
-    : `Verification did not pass.\n${params.verifierSummary}`;
-
+function toRuntimeVerifierVerdict(params: {
+  readonly snapshot: PlannerVerificationSnapshot;
+  readonly summary: string;
+}): RuntimeVerifierVerdict {
   return {
-    ...params.result,
-    content,
-    completionState,
-    ...(completionProgress ? { completionProgress } : {}),
-    stopReasonDetail: `Top-level verifier ${params.verifier.overall}: ${params.verifierSummary}`,
+    attempted: params.snapshot.performed,
+    overall: params.snapshot.overall,
+    ...(params.summary.trim().length > 0 ? { summary: params.summary } : {}),
   };
 }
 
-function shouldRunTopLevelVerifier(params: MaybeRunTopLevelVerifierParams): boolean {
-  if (!params.subAgentManager || !params.verifierService) return false;
+function shouldRunTopLevelVerifier(params: TopLevelVerifierParams): boolean {
   if (isSubAgentSessionId(params.sessionId)) return false;
   if (params.result.stopReason !== "completed") return false;
   if (params.result.completionState !== "completed") return false;
@@ -289,18 +291,49 @@ function shouldRunTopLevelVerifier(params: MaybeRunTopLevelVerifierParams): bool
   }
   const targetArtifacts = params.result.turnExecutionContract.targetArtifacts ?? [];
   if (targetArtifacts.length === 0) return false;
+  if (!params.verifierService) {
+    return true;
+  }
   return params.verifierService.shouldVerifySubAgentResult(true);
 }
 
-export async function maybeRunTopLevelVerifier(
-  params: MaybeRunTopLevelVerifierParams,
-): Promise<ChatExecutorResult> {
+export async function runTopLevelVerifierValidation(
+  params: TopLevelVerifierParams,
+): Promise<TopLevelVerifierValidationResult> {
   if (!shouldRunTopLevelVerifier(params)) {
-    return params.result;
+    return {
+      outcome: "skipped",
+      verifier: { performed: false, overall: "skipped" },
+      runtimeVerifier: { attempted: false, overall: "skipped" },
+      summary: "Top-level verifier skipped.",
+    };
+  }
+  if (!params.verifierService) {
+    return {
+      outcome: "fail_closed",
+      verifier: { performed: false, overall: "retry" },
+      runtimeVerifier: {
+        attempted: false,
+        overall: "retry",
+        summary: "Top-level verifier runtime is unavailable.",
+      },
+      summary: "Top-level verifier runtime is unavailable.",
+      exhaustedDetail: "Top-level verifier runtime is unavailable.",
+    };
   }
   const subAgentManager = params.subAgentManager;
   if (!subAgentManager) {
-    return params.result;
+    return {
+      outcome: "fail_closed",
+      verifier: { performed: false, overall: "retry" },
+      runtimeVerifier: {
+        attempted: false,
+        overall: "retry",
+        summary: "Top-level verifier worker is unavailable.",
+      },
+      summary: "Top-level verifier worker is unavailable.",
+      exhaustedDetail: "Top-level verifier worker is unavailable.",
+    };
   }
 
   const workspaceRoot = normalizeWorkspaceRoot(
@@ -361,17 +394,27 @@ export async function maybeRunTopLevelVerifier(
   } catch (error) {
     params.logger?.warn(
       "Failed to spawn top-level verifier worker",
-      { sessionId: params.sessionId, error: error instanceof Error ? error.message : String(error) },
+      {
+        sessionId: params.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      },
     );
-    return buildVerifierAdjustedResult({
-      result: params.result,
+    return {
+      outcome: "fail_closed",
       verifier: { performed: false, overall: "retry" },
-      verifierSummary: "Top-level verifier worker could not be started.",
-    });
+      runtimeVerifier: {
+        attempted: false,
+        overall: "retry",
+        summary: "Top-level verifier worker could not be started.",
+      },
+      summary: "Top-level verifier worker could not be started.",
+      exhaustedDetail: "Top-level verifier worker could not be started.",
+    };
   }
 
   const verifierResult = await subAgentManager.waitForResult(childSessionId);
   const parsed = parseVerifierSnapshot(verifierResult);
+  const runtimeVerifier = toRuntimeVerifierVerdict(parsed);
   if (parsed.snapshot.overall !== "pass") {
     params.logger?.warn(
       "Top-level verifier did not pass",
@@ -382,10 +425,147 @@ export async function maybeRunTopLevelVerifier(
       },
     );
   }
+  if (!parsed.snapshot.performed) {
+    return {
+      outcome: "fail_closed",
+      verifier: parsed.snapshot,
+      runtimeVerifier,
+      summary: parsed.summary,
+      exhaustedDetail: `Top-level verifier retry: ${parsed.summary}`,
+    };
+  }
+  if (parsed.snapshot.overall === "pass") {
+    return {
+      outcome: "pass",
+      verifier: parsed.snapshot,
+      runtimeVerifier,
+      summary: parsed.summary,
+    };
+  }
+  return {
+    outcome: "retry_with_blocking_message",
+    verifier: parsed.snapshot,
+    runtimeVerifier,
+    summary: parsed.summary,
+    blockingMessage: buildVerifierBlockingMessage({
+      summary: parsed.summary,
+      verdict: runtimeVerifier.overall,
+    }),
+    exhaustedDetail: `Top-level verifier ${parsed.snapshot.overall}: ${parsed.summary}`,
+  };
+}
+
+function buildVerifierAdjustedResult(params: {
+  readonly result: ChatExecutorResult;
+  readonly verifier: PlannerVerificationSnapshot;
+  readonly runtimeVerifier: RuntimeVerifierVerdict;
+  readonly verifierSummary: string;
+  readonly legacyTopLevelVerifierMode: "applied" | "skipped";
+}): ChatExecutorResult {
+  const requiredToolEvidence = mergeTurnExecutionRequiredToolEvidence({
+    turnExecutionContract: params.result.turnExecutionContract,
+  });
+  const workflowEvidence = resolveWorkflowEvidenceFromRequiredToolEvidence({
+    requiredToolEvidence,
+    runtimeContext: {
+      workspaceRoot: params.result.turnExecutionContract.workspaceRoot,
+      activeTaskContext: deriveActiveTaskContext(params.result.turnExecutionContract),
+    },
+  });
+  const completionState = resolveWorkflowCompletionState({
+    stopReason: params.result.stopReason,
+    toolCalls: params.result.toolCalls,
+    verificationContract: workflowEvidence.verificationContract,
+    completionContract: workflowEvidence.completionContract,
+    validationCode: params.result.validationCode,
+    verifier: params.verifier,
+  });
+  const nextProgress = deriveWorkflowProgressSnapshot({
+    stopReason: params.result.stopReason,
+    completionState,
+    stopReasonDetail:
+      params.verifier.overall === "pass"
+        ? params.result.stopReasonDetail
+        : `Top-level verifier ${params.verifier.overall}: ${params.verifierSummary}`,
+    validationCode: params.result.validationCode,
+    toolCalls: params.result.toolCalls,
+    verificationContract: workflowEvidence.verificationContract,
+    completionContract: workflowEvidence.completionContract,
+    updatedAt: Date.now(),
+    contractFingerprint: params.result.turnExecutionContract.contractFingerprint,
+    verifier: params.verifier,
+  });
+  const completionProgress = mergeWorkflowProgressSnapshots({
+    previous: params.result.completionProgress,
+    next: nextProgress,
+  });
+  const runtimeContractSnapshot = params.result.runtimeContractSnapshot
+    ? updateRuntimeContractLegacyVerifierMode({
+      snapshot: updateRuntimeContractVerifierVerdict({
+        snapshot: params.result.runtimeContractSnapshot,
+        verifier: params.runtimeVerifier,
+      }),
+      legacyTopLevelVerifierMode: params.legacyTopLevelVerifierMode,
+    })
+    : undefined;
+
+  if (params.verifier.overall === "pass") {
+    return {
+      ...params.result,
+      completionState,
+      verifierSnapshot: params.verifier,
+      ...(completionProgress ? { completionProgress } : {}),
+      ...(runtimeContractSnapshot ? { runtimeContractSnapshot } : {}),
+    };
+  }
+
+  const content = params.result.content.trim().length > 0
+    ? `${params.result.content.trim()}\n\nVerification did not pass.\n${params.verifierSummary}`
+    : `Verification did not pass.\n${params.verifierSummary}`;
+
+  return {
+    ...params.result,
+    content,
+    completionState,
+    verifierSnapshot: params.verifier,
+    ...(completionProgress ? { completionProgress } : {}),
+    ...(runtimeContractSnapshot ? { runtimeContractSnapshot } : {}),
+    stopReasonDetail: `Top-level verifier ${params.verifier.overall}: ${params.verifierSummary}`,
+  };
+}
+
+export async function applyLegacyTopLevelVerifier(
+  params: {
+    readonly sessionId: string;
+    readonly userRequest: string;
+    readonly result: ChatExecutorResult;
+    readonly subAgentManager: Pick<SubAgentManager, "spawn" | "waitForResult"> | null;
+    readonly verifierService: Pick<
+      DelegationVerifierService,
+      "shouldVerifySubAgentResult"
+    > | null;
+    readonly agentDefinitions?: readonly AgentDefinition[];
+    readonly logger?: Logger;
+  },
+): Promise<ChatExecutorResult> {
+  const validation = await runTopLevelVerifierValidation(params);
+  if (validation.outcome === "skipped") {
+    return params.result.runtimeContractSnapshot
+      ? {
+        ...params.result,
+        runtimeContractSnapshot: updateRuntimeContractLegacyVerifierMode({
+          snapshot: params.result.runtimeContractSnapshot,
+          legacyTopLevelVerifierMode: "skipped",
+        }),
+      }
+      : params.result;
+  }
 
   return buildVerifierAdjustedResult({
     result: params.result,
-    verifier: parsed.snapshot,
-    verifierSummary: parsed.summary,
+    verifier: validation.verifier,
+    runtimeVerifier: validation.runtimeVerifier,
+    verifierSummary: validation.summary,
+    legacyTopLevelVerifierMode: "applied",
   });
 }

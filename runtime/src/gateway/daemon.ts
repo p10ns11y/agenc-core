@@ -1968,6 +1968,14 @@ export class DaemonManager {
         toolAllowList: config.policy?.toolAllowList,
         toolDenyList: config.policy?.toolDenyList,
       }),
+      completionValidation: {
+        topLevelVerifier: {
+          subAgentManager: this._subAgentManager,
+          verifierService: this._delegationVerifierService,
+          agentDefinitions: this._agentDefinitions,
+          logger: this.logger,
+        },
+      },
     });
 
     const sessionMgr = this.createSessionManager(hooks);
@@ -3486,6 +3494,14 @@ export class DaemonManager {
           toolAllowList: newConfig.policy?.toolAllowList,
           toolDenyList: newConfig.policy?.toolDenyList,
         }),
+        completionValidation: {
+          topLevelVerifier: {
+            subAgentManager: this._subAgentManager,
+            verifierService: this._delegationVerifierService,
+            agentDefinitions: this._agentDefinitions,
+            logger: this.logger,
+          },
+        },
       });
 
       const providerNames = providers.map((p) => p.name).join(" → ") || "none";

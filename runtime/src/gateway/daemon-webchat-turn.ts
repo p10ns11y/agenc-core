@@ -24,7 +24,7 @@ import {
   persistSessionStatefulContinuation,
   persistWebSessionRuntimeState,
 } from "./daemon-session-state.js";
-import { maybeRunTopLevelVerifier } from "./top-level-verifier.js";
+import { applyLegacyTopLevelVerifier } from "./top-level-verifier.js";
 import { filterSystemPromptForToolRouting } from "./system-prompt-routing.js";
 import {
   logExecutionTraceEvent,
@@ -315,15 +315,18 @@ export async function executeWebChatConversationTurn(
         },
       },
     });
-    const result = await maybeRunTopLevelVerifier({
-      sessionId: msg.sessionId,
-      userRequest: msg.content,
-      result: rawResult,
-      subAgentManager,
-      verifierService,
-      agentDefinitions,
-      logger,
-    });
+    const result =
+      rawResult.runtimeContractSnapshot?.flags.runtimeContractV2 === true
+        ? rawResult
+        : await applyLegacyTopLevelVerifier({
+          sessionId: msg.sessionId,
+          userRequest: msg.content,
+          result: rawResult,
+          subAgentManager,
+          verifierService,
+          agentDefinitions,
+          logger,
+        });
     recordToolRoutingOutcome(msg.sessionId, result.toolRoutingSummary);
 
     webChat.clearAbortController(msg.sessionId);
@@ -351,6 +354,8 @@ export async function executeWebChatConversationTurn(
         ),
         stopReason: result.stopReason,
         completionState: result.completionState,
+        verifierSnapshot: result.verifierSnapshot,
+        runtimeContractSnapshot: result.runtimeContractSnapshot,
         stopReasonDetail: result.stopReasonDetail,
         response: truncateToolLogText(result.content, traceConfig.maxChars),
         toolCalls: result.toolCalls.map((toolCall) => ({
@@ -398,6 +403,8 @@ export async function executeWebChatConversationTurn(
             toolRoutingSummary: result.toolRoutingSummary,
             stopReason: result.stopReason,
             completionState: result.completionState,
+            verifierSnapshot: result.verifierSnapshot,
+            runtimeContractSnapshot: result.runtimeContractSnapshot,
             stopReasonDetail: result.stopReasonDetail,
             response: result.content,
             toolCalls: result.toolCalls.map((toolCall) => ({

@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { ChatExecutorResult } from "../llm/chat-executor.js";
-import { maybeRunTopLevelVerifier } from "./top-level-verifier.js";
+import { createRuntimeContractSnapshot } from "../runtime-contract/types.js";
+import {
+  applyLegacyTopLevelVerifier,
+  runTopLevelVerifierValidation,
+} from "./top-level-verifier.js";
 
 function createResult(
   overrides: Partial<ChatExecutorResult> = {},
@@ -25,6 +29,17 @@ function createResult(
     compacted: false,
     stopReason: "completed",
     completionState: "completed",
+    runtimeContractSnapshot: createRuntimeContractSnapshot({
+      runtimeContractV2: false,
+      stopHooksEnabled: false,
+      asyncTasksEnabled: false,
+      persistentWorkersEnabled: false,
+      mailboxEnabled: false,
+      verifierRuntimeRequired: false,
+      verifierProjectBootstrap: false,
+      workerIsolationWorktree: false,
+      workerIsolationRemote: false,
+    }),
     turnExecutionContract: {
       version: 1,
       turnClass: "workflow_implementation",
@@ -50,7 +65,7 @@ function createResult(
   };
 }
 
-describe("maybeRunTopLevelVerifier", () => {
+describe("runTopLevelVerifierValidation", () => {
   it("spawns the verifier worker with grounded read evidence", async () => {
     const spawn = vi.fn(async () => "subagent:verify-1");
     const waitForResult = vi.fn(async () => ({
@@ -71,7 +86,7 @@ describe("maybeRunTopLevelVerifier", () => {
       stopReason: "completed",
     }));
 
-    const updated = await maybeRunTopLevelVerifier({
+    const decision = await runTopLevelVerifierValidation({
       sessionId: "session:test",
       userRequest: "Implement every phase from PLAN.md",
       result: createResult(),
@@ -112,9 +127,9 @@ describe("maybeRunTopLevelVerifier", () => {
         }),
       }),
     );
-    expect(updated.completionState).toBe("partial");
-    expect(updated.content).toContain("Verification did not pass.");
-    expect(updated.stopReasonDetail).toContain("Top-level verifier fail");
+    expect(decision.outcome).toBe("retry_with_blocking_message");
+    expect(decision.runtimeVerifier.overall).toBe("fail");
+    expect(decision.blockingMessage).toContain("Runtime verification blocked completion");
   });
 
   it("prefers structured verifier verdicts over text parsing", async () => {
@@ -137,7 +152,7 @@ describe("maybeRunTopLevelVerifier", () => {
       stopReason: "completed",
     }));
 
-    const updated = await maybeRunTopLevelVerifier({
+    const decision = await runTopLevelVerifierValidation({
       sessionId: "session:test",
       userRequest: "Implement every phase from PLAN.md",
       result: createResult(),
@@ -147,15 +162,17 @@ describe("maybeRunTopLevelVerifier", () => {
       },
     });
 
-    expect(updated.completionState).toBe("partial");
-    expect(updated.content).toContain("Build fails under verifier-run acceptance checks.");
-    expect(updated.stopReasonDetail).toContain("Top-level verifier fail");
+    expect(decision.outcome).toBe("retry_with_blocking_message");
+    expect(decision.summary).toContain(
+      "Build fails under verifier-run acceptance checks.",
+    );
+    expect(decision.runtimeVerifier.overall).toBe("fail");
   });
 
   it("skips verifier workers for non-workflow turns", async () => {
     const spawn = vi.fn(async () => "subagent:verify-1");
 
-    const updated = await maybeRunTopLevelVerifier({
+    const decision = await runTopLevelVerifierValidation({
       sessionId: "session:test",
       userRequest: "hello",
       result: createResult({
@@ -173,6 +190,63 @@ describe("maybeRunTopLevelVerifier", () => {
     });
 
     expect(spawn).not.toHaveBeenCalled();
-    expect(updated.completionState).toBe("completed");
+    expect(decision.outcome).toBe("skipped");
+    expect(decision.runtimeVerifier.overall).toBe("skipped");
+  });
+
+  it("fails closed when runtime-required verifier services are unavailable", async () => {
+    const decision = await runTopLevelVerifierValidation({
+      sessionId: "session:test",
+      userRequest: "Implement every phase from PLAN.md",
+      result: createResult(),
+      subAgentManager: null,
+      verifierService: null,
+    });
+
+    expect(decision.outcome).toBe("fail_closed");
+    expect(decision.runtimeVerifier.overall).toBe("retry");
+    expect(decision.summary).toContain("runtime is unavailable");
+  });
+});
+
+describe("applyLegacyTopLevelVerifier", () => {
+  it("downgrades legacy top-level completion when verification fails", async () => {
+    const spawn = vi.fn(async () => "subagent:verify-legacy");
+    const waitForResult = vi.fn(async () => ({
+      sessionId: "subagent:verify-legacy",
+      output: "Verifier wrote a long narrative without a VERDICT line.",
+      success: false,
+      durationMs: 25,
+      toolCalls: [],
+      structuredOutput: {
+        type: "json_schema",
+        name: "agenc_top_level_verifier_decision",
+        parsed: {
+          verdict: "fail",
+          summary: "Build fails under verifier-run acceptance checks.",
+        },
+      },
+      completionState: "completed",
+      stopReason: "completed",
+    }));
+
+    const updated = await applyLegacyTopLevelVerifier({
+      sessionId: "session:test",
+      userRequest: "Implement every phase from PLAN.md",
+      result: createResult(),
+      subAgentManager: { spawn, waitForResult },
+      verifierService: {
+        shouldVerifySubAgentResult: vi.fn(() => true),
+      },
+    });
+
+    expect(updated.completionState).toBe("partial");
+    expect(updated.content).toContain(
+      "Build fails under verifier-run acceptance checks.",
+    );
+    expect(updated.stopReasonDetail).toContain("Top-level verifier fail");
+    expect(updated.runtimeContractSnapshot?.legacyTopLevelVerifierMode).toBe(
+      "applied",
+    );
   });
 });

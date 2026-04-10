@@ -33,6 +33,7 @@ import type {
   ContentReplacementState,
   ToolBudgetConfig,
 } from "./tool-result-budget.js";
+import type { RuntimeContractFlags } from "../runtime-contract/types.js";
 // ---------------------------------------------------------------------------
 // Imports from extracted sibling modules
 // ---------------------------------------------------------------------------
@@ -152,6 +153,8 @@ export class ChatExecutor {
   private readonly economicsPolicy: RuntimeEconomicsPolicy;
   private readonly modelRoutingPolicy: ModelRoutingPolicy;
   private readonly defaultRunClass?: RuntimeRunClass;
+  private readonly runtimeContractFlags: RuntimeContractFlags;
+  private readonly completionValidation: ChatExecutorConfig["completionValidation"];
   /**
    * Cut 5.2: optional hook registry. When set, the chat-executor fires
    * PreToolUse/PostToolUse/PostToolUseFailure events at the tool
@@ -305,6 +308,18 @@ export class ChatExecutor {
       economicsPolicy: this.economicsPolicy,
     });
     this.defaultRunClass = config.defaultRunClass;
+    this.runtimeContractFlags = config.runtimeContractFlags ?? {
+      runtimeContractV2: false,
+      stopHooksEnabled: false,
+      asyncTasksEnabled: false,
+      persistentWorkersEnabled: false,
+      mailboxEnabled: false,
+      verifierRuntimeRequired: false,
+      verifierProjectBootstrap: false,
+      workerIsolationWorktree: false,
+      workerIsolationRemote: false,
+    };
+    this.completionValidation = config.completionValidation;
     this.hookRegistry = config.hookRegistry;
     this.canUseTool = config.canUseTool;
     this.isConcurrencySafe = config.isConcurrencySafe;
@@ -367,6 +382,8 @@ export class ChatExecutor {
       toolHandler: this.toolHandler,
       onStreamChunk: this.onStreamChunk,
       resolveHostWorkspaceRoot: this.resolveHostWorkspaceRoot,
+      runtimeContractFlags: this.runtimeContractFlags,
+      completionValidation: this.completionValidation,
       // Hook registry (optional)
       hookRegistry: this.hookRegistry,
     };
@@ -458,6 +475,8 @@ export class ChatExecutor {
       allowedTools: this.allowedTools,
       toolFailureBreaker: this.toolFailureBreaker,
       contextWindowTokens: this.promptBudget.contextWindowTokens,
+      runtimeContractFlags: this.runtimeContractFlags,
+      completionValidation: this.completionValidation,
       ...(this.hookRegistry ? { hookRegistry: this.hookRegistry } : {}),
       ...(this.canUseTool ? { canUseTool: this.canUseTool } : {}),
       ...(this.isConcurrencySafe

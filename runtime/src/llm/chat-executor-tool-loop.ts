@@ -71,12 +71,7 @@ import {
   ANTI_FABRICATION_HARNESS_OVERWRITE_REASON,
   evaluateWriteOverFailedVerification,
 } from "./verification-target-guard.js";
-import {
-  evaluateArtifactEvidenceGate,
-  evaluateTurnEndStopGate,
-  checkFilesystemArtifacts,
-} from "./chat-executor-stop-gate.js";
-import { runDeterministicAcceptanceProbes } from "./deterministic-acceptance-probes.js";
+import { buildCompletionValidators } from "./completion-validators.js";
 import { evaluateShellWorkspaceWritePolicy } from "./shell-write-policy.js";
 import {
   sanitizeToolCallsForReplay,
@@ -115,6 +110,10 @@ import {
   setStopReason,
 } from "./chat-executor-ctx-helpers.js";
 import type { DelegationOutputValidationCode } from "../utils/delegation-validation.js";
+import {
+  updateRuntimeContractValidatorSnapshot,
+  updateRuntimeContractVerifierVerdict,
+} from "../runtime-contract/types.js";
 
 // ============================================================================
 // Callback interfaces
@@ -224,6 +223,8 @@ export interface ToolLoopConfig {
     readonly action: "noop" | "consolidated";
     readonly summaryMessage?: import("./types.js").LLMMessage;
   };
+  readonly runtimeContractFlags: import("../runtime-contract/types.js").RuntimeContractFlags;
+  readonly completionValidation?: import("./chat-executor-types.js").ChatExecutorConfig["completionValidation"];
 }
 
 // ============================================================================
@@ -1606,130 +1607,128 @@ export async function executeToolCallLoop(
     ctx.response.finishReason !== "tool_calls" &&
     ctx.stopReason === "completed"
   ) {
-    const artifactGateDecision = evaluateArtifactEvidenceGate({
-      requiredToolEvidence: ctx.requiredToolEvidence,
-      runtimeContext: {
-        workspaceRoot: ctx.runtimeWorkspaceRoot,
+    const validators = buildCompletionValidators({
+      ctx,
+      runtimeContractFlags: config.runtimeContractFlags,
+      completionValidation: config.completionValidation,
+    });
+    callbacks.emitExecutionTrace(ctx, {
+      type: "completion_validation_started",
+      phase: "tool_followup",
+      callIndex: ctx.callIndex,
+      payload: {
+        validatorOrder: validators.map((validator) => validator.id),
+        runtimeContract: ctx.runtimeContractSnapshot,
       },
-      allToolCalls: ctx.allToolCalls,
     });
-    if (artifactGateDecision.shouldIntervene) {
-      await attemptCompletionRecovery({
-        reason: artifactGateDecision.validationCode ?? "artifact_evidence_gate",
-        blockingMessage: artifactGateDecision.blockingMessage,
-        evidence: artifactGateDecision.evidence,
-        maxAttempts: ctx.requiredToolEvidence?.maxCorrectionAttempts ?? 0,
-        budgetReason:
-          "Max model recalls exceeded during artifact-evidence recovery turn",
-        exhaustedDetail:
-          artifactGateDecision.stopReasonDetail ??
-          "Artifact-evidence recovery exhausted.",
-        validationCode: artifactGateDecision.validationCode,
-      });
-      if (shouldContinueAfterStopGate) {
+
+    let completionValidationStatus = "passed";
+    for (const validator of validators) {
+      if (!validator.enabled) {
+        ctx.runtimeContractSnapshot = updateRuntimeContractValidatorSnapshot({
+          snapshot: ctx.runtimeContractSnapshot,
+          id: validator.id,
+          enabled: false,
+          executed: false,
+          outcome: "skipped",
+        });
         continue;
       }
-    }
 
-    const gateDecision = evaluateTurnEndStopGate({
-      finalContent: ctx.response.content ?? "",
-      allToolCalls: ctx.allToolCalls,
-    });
-    if (gateDecision.shouldIntervene) {
-      await attemptCompletionRecovery({
-        attemptKey: "turn_end_stop_gate",
-        reason: gateDecision.reason ?? "turn_end_stop_gate",
-        blockingMessage: gateDecision.blockingMessage,
-        evidence: gateDecision.evidence,
-        maxAttempts: 1,
-        budgetReason:
-          "Max model recalls exceeded during stop-gate recovery turn",
-        exhaustedDetail:
-          gateDecision.reason === "narrated_future_tool_work"
-            ? "Stop-gate recovery exhausted: the model kept narrating future work instead of calling tools."
-            : "Stop-gate recovery exhausted after the model continued to emit an invalid completion summary.",
+      const validation = await validator.execute();
+      if (validation.probeRuns) {
+        for (const run of validation.probeRuns) {
+          callbacks.appendToolRecord(ctx, run);
+        }
+      }
+      if (validation.verifier) {
+        ctx.verifierSnapshot = {
+          performed: validation.verifier.attempted,
+          overall: validation.verifier.overall,
+        };
+        ctx.runtimeContractSnapshot = updateRuntimeContractVerifierVerdict({
+          snapshot: ctx.runtimeContractSnapshot,
+          verifier: validation.verifier,
+        });
+      }
+      ctx.runtimeContractSnapshot = updateRuntimeContractValidatorSnapshot({
+        snapshot: ctx.runtimeContractSnapshot,
+        id: validator.id,
+        enabled: true,
+        executed: validation.outcome !== "skipped",
+        outcome: validation.outcome,
+        reason: validation.reason,
+        validationCode: validation.validationCode,
       });
-      if (shouldContinueAfterStopGate) {
+
+      if (
+        validation.outcome === "pass" ||
+        validation.outcome === "skipped"
+      ) {
         continue;
       }
+
+      if (validation.outcome === "fail_closed") {
+        completionValidationStatus = "fail_closed";
+        callbacks.setStopReason(
+          ctx,
+          "validation_error",
+          validation.exhaustedDetail ?? "Completion validation failed closed.",
+        );
+        if (validation.validationCode) {
+          ctx.validationCode = validation.validationCode;
+        }
+        if (ctx.response) {
+          ctx.response = {
+            ...ctx.response,
+            content: "",
+          };
+        }
+        break;
+      }
+
+      const budgetReason =
+        validator.id === "artifact_evidence"
+          ? "Max model recalls exceeded during artifact-evidence recovery turn"
+          : validator.id === "turn_end_stop_gate"
+            ? "Max model recalls exceeded during stop-gate recovery turn"
+            : validator.id === "filesystem_artifact_verification"
+              ? "Max model recalls exceeded during filesystem artifact recovery turn"
+              : validator.id === "deterministic_acceptance_probes"
+                ? "Max model recalls exceeded during deterministic acceptance-probe recovery turn"
+                : "Max model recalls exceeded during top-level verifier recovery turn";
+
+      await attemptCompletionRecovery({
+        attemptKey: validator.id,
+        reason: validation.reason ?? validator.id,
+        blockingMessage: validation.blockingMessage,
+        evidence: validation.evidence,
+        maxAttempts: validation.maxAttempts ?? 1,
+        budgetReason,
+        exhaustedDetail:
+          validation.exhaustedDetail ??
+          `${validator.id} recovery exhausted.`,
+        validationCode: validation.validationCode,
+      });
+      completionValidationStatus = shouldContinueAfterStopGate
+        ? "recovery_requested"
+        : "recovery_exhausted";
+      break;
     }
 
-    // Filesystem artifact verification: after all text-based gates have
-    // run and NOT intervened, check whether files the model wrote during
-    // this turn actually exist and are non-empty on disk. Only runs when
-    // the model claims terminal completion (TERMINAL_COMPLETION_RE match
-    // in the final content). This catches the fabrication case where the
-    // model says "all files implemented" but 8 of 14 are 0 bytes.
-    //
-    // Runs as a SEPARATE check from the stop gate so it fires even when
-    // the stop gate already fired once (stopGateFired=true). The stop
-    // gate's one-shot limit prevents infinite loops on text-based
-    // recovery, but the filesystem check is a different dimension — it
-    // verifies artifacts, not text patterns.
-    if (
-      ctx.response &&
-      ctx.stopReason === "completed" &&
-      ctx.allToolCalls.length > 0 &&
-      !ctx.signal?.aborted
-    ) {
-      const fsCheck = await checkFilesystemArtifacts({
-        finalContent: ctx.response.content ?? "",
-        allToolCalls: ctx.allToolCalls,
-      });
-      if (fsCheck.shouldIntervene) {
-        await attemptCompletionRecovery({
-          reason: "filesystem_artifact_verification",
-          blockingMessage: fsCheck.blockingMessage,
-          evidence: {
-            emptyFiles: fsCheck.emptyFiles,
-            missingFiles: fsCheck.missingFiles,
-            checkedFiles: fsCheck.checkedFiles,
-          },
-          maxAttempts: 1,
-          budgetReason:
-            "Max model recalls exceeded during filesystem artifact recovery turn",
-          exhaustedDetail:
-            "Filesystem artifact verification failed after recovery; missing or empty artifacts remain on disk.",
-        });
-        if (shouldContinueAfterStopGate) {
-          continue;
-        }
-      }
-    }
-
-    if (
-      ctx.response &&
-      ctx.stopReason === "completed" &&
-      !ctx.signal?.aborted
-    ) {
-      const probeDecision = await runDeterministicAcceptanceProbes({
-        workspaceRoot: ctx.runtimeWorkspaceRoot,
-        targetArtifacts: ctx.turnExecutionContract.targetArtifacts,
-        allToolCalls: ctx.allToolCalls,
-        activeToolHandler: ctx.activeToolHandler,
-      });
-      for (const run of probeDecision.probeRuns) {
-        callbacks.appendToolRecord(ctx, run);
-      }
-      if (probeDecision.shouldIntervene) {
-        await attemptCompletionRecovery({
-          reason:
-            probeDecision.validationCode ??
-            "deterministic_acceptance_probe_failed",
-          blockingMessage: probeDecision.blockingMessage,
-          evidence: probeDecision.evidence,
-          maxAttempts: 1,
-          budgetReason:
-            "Max model recalls exceeded during deterministic acceptance-probe recovery turn",
-          exhaustedDetail:
-            probeDecision.stopReasonDetail ??
-            "Deterministic acceptance-probe recovery exhausted.",
-          validationCode: probeDecision.validationCode,
-        });
-        if (shouldContinueAfterStopGate) {
-          continue;
-        }
-      }
+    callbacks.emitExecutionTrace(ctx, {
+      type: "completion_validation_finished",
+      phase: "tool_followup",
+      callIndex: ctx.callIndex,
+      payload: {
+        status: completionValidationStatus,
+        stopReason: ctx.stopReason,
+        validationCode: ctx.validationCode,
+        runtimeContract: ctx.runtimeContractSnapshot,
+      },
+    });
+    if (shouldContinueAfterStopGate) {
+      continue;
     }
   }
   } while (shouldContinueAfterStopGate);

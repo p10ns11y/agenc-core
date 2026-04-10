@@ -123,6 +123,7 @@ export async function executeRequest(
     completionContract: workflowEvidence.completionContract,
     completedRequestMilestoneIds: ctx.completedRequestMilestoneIds,
     validationCode: ctx.validationCode,
+    verifier: ctx.verifierSnapshot,
   });
 
   const durationMs = Date.now() - ctx.startTime;
@@ -140,6 +141,7 @@ export async function executeRequest(
     completedRequestMilestoneIds: ctx.completedRequestMilestoneIds,
     updatedAt: Date.now(),
     contractFingerprint: ctx.turnExecutionContract.contractFingerprint,
+    verifier: ctx.verifierSnapshot,
   });
 
   // Phase H: dispatch Stop / StopFailure at the terminal path.
@@ -194,6 +196,8 @@ export async function executeRequest(
     ),
     stopReason: ctx.stopReason,
     completionState: ctx.completionState,
+    verifierSnapshot: ctx.verifierSnapshot,
+    runtimeContractSnapshot: ctx.runtimeContractSnapshot,
     completionProgress,
     turnExecutionContract: ctx.turnExecutionContract,
     activeTaskContext: deriveActiveTaskContext(ctx.turnExecutionContract),

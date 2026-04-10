@@ -129,6 +129,34 @@ export interface GatewayLLMConfig extends LLMXaiCapabilitySurface {
   };
   /** Optional sub-agent orchestration controls. */
   subagents?: GatewaySubagentConfig;
+  /** Enable executor-owned completion authority and runtime-contract snapshots. */
+  runtimeContractV2?: boolean;
+  /** Runtime-owned stop-hook chain controls. */
+  stopHooks?: {
+    enabled?: boolean;
+  };
+  /** Async task-handle runtime controls. */
+  asyncTasks?: {
+    enabled?: boolean;
+  };
+  /** Persistent worker runtime controls. */
+  persistentWorkers?: {
+    enabled?: boolean;
+  };
+  /** Structured worker mailbox controls. */
+  mailbox?: {
+    enabled?: boolean;
+  };
+  /** Runtime verifier controls. */
+  verifier?: {
+    runtimeRequired?: boolean;
+    projectBootstrap?: boolean;
+  };
+  /** Worker isolation controls. */
+  workerIsolation?: {
+    worktree?: boolean;
+    remote?: boolean;
+  };
   /** Additional LLM providers for fallback (tried in order after primary fails). */
   fallback?: GatewayLLMConfig[];
 }

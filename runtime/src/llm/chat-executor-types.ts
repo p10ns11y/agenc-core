@@ -60,7 +60,15 @@ import type {
   DelegationOutputValidationCode,
 } from "../utils/delegation-validation.js";
 import type { HostToolingProfile } from "../gateway/host-tooling.js";
+import type { AgentDefinition } from "../gateway/agent-loader.js";
+import type { DelegationVerifierService } from "../gateway/delegation-runtime.js";
+import type { SubAgentManager } from "../gateway/sub-agent.js";
 import type { ActiveTaskContext, TurnExecutionContract } from "./turn-execution-contract-types.js";
+import type {
+  RuntimeContractFlags,
+  RuntimeContractSnapshot,
+} from "../runtime-contract/types.js";
+import { createRuntimeContractSnapshot } from "../runtime-contract/types.js";
 import { RuntimeError, RuntimeErrorCodes } from "../types/errors.js";
 import {
   createPerIterationCompactionState,
@@ -129,6 +137,8 @@ export interface ToolCallRecord {
 }
 
 type ChatExecutionTraceEventType =
+  | "completion_validation_finished"
+  | "completion_validation_started"
   | "compaction_triggered"
   | "context_injected"
   | "model_call_prepared"
@@ -329,6 +339,10 @@ export interface ChatExecutorResult {
   readonly completionState: WorkflowCompletionState;
   /** Structured progress snapshot for long-horizon resume/recovery flows. */
   readonly completionProgress?: WorkflowProgressSnapshot;
+  /** Verifier snapshot observed by the executor-owned completion chain. */
+  readonly verifierSnapshot?: import("../workflow/completion-state.js").PlannerVerificationSnapshot;
+  /** Runtime-contract flags, validator outcomes, and verifier state for this turn. */
+  readonly runtimeContractSnapshot?: RuntimeContractSnapshot;
   /** Single preflight execution contract that governed this turn. */
   readonly turnExecutionContract: TurnExecutionContract;
   /** Typed task carryover emitted for the next compatible turn, when applicable. */
@@ -485,6 +499,17 @@ export interface ChatExecutorConfig {
   readonly modelRoutingPolicy?: ModelRoutingPolicy;
   /** Force all calls in this executor instance into one run class (used for child runs). */
   readonly defaultRunClass?: RuntimeRunClass;
+  /** Resolved runtime-contract flags active for this executor instance. */
+  readonly runtimeContractFlags?: RuntimeContractFlags;
+  /** Optional runtime services for executor-owned completion validation. */
+  readonly completionValidation?: {
+    readonly topLevelVerifier?: {
+      readonly subAgentManager?: Pick<SubAgentManager, "spawn" | "waitForResult"> | null;
+      readonly verifierService?: Pick<DelegationVerifierService, "shouldVerifySubAgentResult"> | null;
+      readonly agentDefinitions?: readonly AgentDefinition[];
+      readonly logger?: import("../utils/logger.js").Logger;
+    };
+  };
 }
 
 // ============================================================================
@@ -599,6 +624,8 @@ export interface ExecutionContext {
   };
   readonly trace?: ChatExecuteParams["trace"];
   readonly defaultRunClass?: RuntimeRunClass;
+  readonly runtimeContractFlags: RuntimeContractFlags;
+  readonly completionValidation?: ChatExecutorConfig["completionValidation"];
 
   // --- Mutable accumulator state ---
   history: readonly LLMMessage[];
@@ -623,6 +650,8 @@ export interface ExecutionContext {
   compactedArtifactContext?: ArtifactCompactionState;
   stopReason: LLMPipelineStopReason;
   completionState: WorkflowCompletionState;
+  verifierSnapshot?: import("../workflow/completion-state.js").PlannerVerificationSnapshot;
+  runtimeContractSnapshot: RuntimeContractSnapshot;
   stopReasonDetail?: string;
   validationCode?: DelegationOutputValidationCode;
   activeRoutedToolNames: readonly string[];
@@ -682,6 +711,8 @@ interface BuildExecutionContextConfig {
   readonly plannerEnabled: boolean;
   readonly defaultRunClass?: RuntimeRunClass;
   readonly economicsPolicy: RuntimeEconomicsPolicy;
+  readonly runtimeContractFlags: RuntimeContractFlags;
+  readonly completionValidation?: ChatExecutorConfig["completionValidation"];
 }
 
 /** Build the default ExecutionContext object with all mutable state initialized. */
@@ -740,6 +771,8 @@ export function buildDefaultExecutionContext(
         executionEnvelope: params.requiredToolEvidence.executionEnvelope,
       }
       : undefined,
+    runtimeContractFlags: config.runtimeContractFlags,
+    completionValidation: config.completionValidation,
 
     // --- Mutable accumulator state ---
     history: params.history,
@@ -768,6 +801,10 @@ export function buildDefaultExecutionContext(
     compactedArtifactContext: params.stateful?.artifactContext,
     stopReason: "completed",
     completionState: "completed",
+    verifierSnapshot: undefined,
+    runtimeContractSnapshot: createRuntimeContractSnapshot(
+      config.runtimeContractFlags,
+    ),
     stopReasonDetail: undefined,
     validationCode: undefined,
     activeRoutedToolNames: params.initialRoutedToolNames,

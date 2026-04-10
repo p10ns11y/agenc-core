@@ -2716,6 +2716,88 @@ function validateLlmSection(llm: unknown, errors: string[]): void {
   if (llm.parallelToolCalls !== undefined && typeof llm.parallelToolCalls !== "boolean") {
     errors.push("llm.parallelToolCalls must be a boolean");
   }
+  if (
+    llm.runtimeContractV2 !== undefined &&
+    typeof llm.runtimeContractV2 !== "boolean"
+  ) {
+    errors.push("llm.runtimeContractV2 must be a boolean");
+  }
+  if (llm.stopHooks !== undefined) {
+    if (!isRecord(llm.stopHooks)) {
+      errors.push("llm.stopHooks must be an object");
+    } else if (
+      llm.stopHooks.enabled !== undefined &&
+      typeof llm.stopHooks.enabled !== "boolean"
+    ) {
+      errors.push("llm.stopHooks.enabled must be a boolean");
+    }
+  }
+  if (llm.asyncTasks !== undefined) {
+    if (!isRecord(llm.asyncTasks)) {
+      errors.push("llm.asyncTasks must be an object");
+    } else if (
+      llm.asyncTasks.enabled !== undefined &&
+      typeof llm.asyncTasks.enabled !== "boolean"
+    ) {
+      errors.push("llm.asyncTasks.enabled must be a boolean");
+    }
+  }
+  if (llm.persistentWorkers !== undefined) {
+    if (!isRecord(llm.persistentWorkers)) {
+      errors.push("llm.persistentWorkers must be an object");
+    } else if (
+      llm.persistentWorkers.enabled !== undefined &&
+      typeof llm.persistentWorkers.enabled !== "boolean"
+    ) {
+      errors.push("llm.persistentWorkers.enabled must be a boolean");
+    }
+  }
+  if (llm.mailbox !== undefined) {
+    if (!isRecord(llm.mailbox)) {
+      errors.push("llm.mailbox must be an object");
+    } else if (
+      llm.mailbox.enabled !== undefined &&
+      typeof llm.mailbox.enabled !== "boolean"
+    ) {
+      errors.push("llm.mailbox.enabled must be a boolean");
+    }
+  }
+  if (llm.verifier !== undefined) {
+    if (!isRecord(llm.verifier)) {
+      errors.push("llm.verifier must be an object");
+    } else {
+      if (
+        llm.verifier.runtimeRequired !== undefined &&
+        typeof llm.verifier.runtimeRequired !== "boolean"
+      ) {
+        errors.push("llm.verifier.runtimeRequired must be a boolean");
+      }
+      if (
+        llm.verifier.projectBootstrap !== undefined &&
+        typeof llm.verifier.projectBootstrap !== "boolean"
+      ) {
+        errors.push("llm.verifier.projectBootstrap must be a boolean");
+      }
+    }
+  }
+  if (llm.workerIsolation !== undefined) {
+    if (!isRecord(llm.workerIsolation)) {
+      errors.push("llm.workerIsolation must be an object");
+    } else {
+      if (
+        llm.workerIsolation.worktree !== undefined &&
+        typeof llm.workerIsolation.worktree !== "boolean"
+      ) {
+        errors.push("llm.workerIsolation.worktree must be a boolean");
+      }
+      if (
+        llm.workerIsolation.remote !== undefined &&
+        typeof llm.workerIsolation.remote !== "boolean"
+      ) {
+        errors.push("llm.workerIsolation.remote must be a boolean");
+      }
+    }
+  }
 
   const llmProvider =
     typeof llm.provider === "string" && VALID_LLM_PROVIDERS.has(llm.provider)
