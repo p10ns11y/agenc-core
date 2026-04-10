@@ -40,7 +40,6 @@ import {
   MAX_TOOL_IMAGE_CHARS_BUDGET,
 } from "./chat-executor-constants.js";
 import {
-  hasRuntimeLimit,
   isRuntimeLimitExceeded,
   isRuntimeLimitReached,
 } from "./runtime-limit-policy.js";
@@ -112,8 +111,20 @@ import {
 import type { DelegationOutputValidationCode } from "../utils/delegation-validation.js";
 import {
   updateRuntimeContractValidatorSnapshot,
+  updateRuntimeContractToolProtocolSnapshot,
   updateRuntimeContractVerifierVerdict,
 } from "../runtime-contract/types.js";
+import {
+  getPendingToolProtocolCalls,
+  hasPendingToolProtocol,
+  noteToolProtocolRepair,
+  noteToolProtocolViolation,
+  openToolProtocolTurn,
+  recordToolProtocolResult,
+  responseHasMalformedToolFinish,
+  responseHasToolCalls,
+  type ToolProtocolRepairReason,
+} from "./tool-protocol-state.js";
 
 // ============================================================================
 // Callback interfaces
@@ -162,6 +173,213 @@ export interface ToolLoopCallbacks {
     },
   ): Promise<LLMResponse | undefined>;
   serializeRemainingRequestMs(remainingRequestMs: number): number | null;
+}
+
+const TOOL_PROTOCOL_REPAIR_ERROR = "tool_protocol_repair";
+
+function syncToolProtocolSnapshot(ctx: ExecutionContext): void {
+  ctx.runtimeContractSnapshot = updateRuntimeContractToolProtocolSnapshot({
+    snapshot: ctx.runtimeContractSnapshot,
+    open: hasPendingToolProtocol(ctx.toolProtocolState),
+    pendingToolCallIds: getPendingToolProtocolCalls(ctx.toolProtocolState).map(
+      (toolCall) => toolCall.id,
+    ),
+    repairCount: ctx.toolProtocolState.repairCount,
+    lastRepairReason: ctx.toolProtocolState.lastRepairReason,
+    violationCount: ctx.toolProtocolState.violationCount,
+    lastViolation: ctx.toolProtocolState.lastViolation,
+  });
+}
+
+function emitToolProtocolViolation(
+  ctx: ExecutionContext,
+  callbacks: ToolLoopCallbacks,
+  reason: string,
+  payload: Record<string, unknown> = {},
+): void {
+  noteToolProtocolViolation(ctx.toolProtocolState, reason);
+  syncToolProtocolSnapshot(ctx);
+  callbacks.emitExecutionTrace(ctx, {
+    type: "tool_protocol_violation",
+    phase: "tool_followup",
+    callIndex: ctx.callIndex,
+    payload: {
+      reason,
+      ...payload,
+    },
+  });
+}
+
+function pushToolResultMessage(params: {
+  readonly ctx: ExecutionContext;
+  readonly callbacks: ToolLoopCallbacks;
+  readonly toolCallId: string;
+  readonly toolName: string;
+  readonly content: string;
+  readonly args: Record<string, unknown>;
+  readonly isError: boolean;
+  readonly durationMs: number;
+  readonly synthetic?: boolean;
+  readonly protocolRepairReason?: ToolProtocolRepairReason;
+}): void {
+  const {
+    ctx,
+    callbacks,
+    toolCallId,
+    toolName,
+    content,
+    args,
+    isError,
+    durationMs,
+    synthetic,
+    protocolRepairReason,
+  } = params;
+  callbacks.pushMessage(
+    ctx,
+    {
+      role: "tool",
+      content,
+      toolCallId,
+      toolName,
+    },
+    "tools",
+  );
+  callbacks.appendToolRecord(ctx, {
+    name: toolName,
+    args,
+    result: content,
+    isError,
+    durationMs,
+    toolCallId,
+    ...(synthetic ? { synthetic: true } : {}),
+    ...(protocolRepairReason ? { protocolRepairReason } : {}),
+  });
+  recordToolProtocolResult(ctx.toolProtocolState, toolCallId);
+  syncToolProtocolSnapshot(ctx);
+  callbacks.emitExecutionTrace(ctx, {
+    type: "tool_protocol_result_recorded",
+    phase: "tool_followup",
+    callIndex: ctx.callIndex,
+    payload: {
+      toolCallId,
+      tool: toolName,
+      synthetic: synthetic === true,
+      pendingToolCallIds: getPendingToolProtocolCalls(ctx.toolProtocolState).map(
+        (toolCall) => toolCall.id,
+      ),
+      ...(protocolRepairReason ? { protocolRepairReason } : {}),
+    },
+  });
+}
+
+function materializeResponseToolCalls(
+  ctx: ExecutionContext,
+  callbacks: ToolLoopCallbacks,
+): readonly LLMToolCall[] {
+  if (!ctx.response || !responseHasToolCalls(ctx.response)) {
+    return [];
+  }
+  if (hasPendingToolProtocol(ctx.toolProtocolState)) {
+    return ctx.response.toolCalls;
+  }
+
+  callbacks.pushMessage(
+    ctx,
+    {
+      role: "assistant",
+      content: ctx.response.content,
+      phase: "commentary",
+      toolCalls: sanitizeToolCallsForReplay(ctx.response.toolCalls),
+    },
+    "assistant_runtime",
+  );
+  openToolProtocolTurn(ctx.toolProtocolState, ctx.response.toolCalls);
+  syncToolProtocolSnapshot(ctx);
+  callbacks.emitExecutionTrace(ctx, {
+    type: "tool_protocol_opened",
+    phase: "tool_followup",
+    callIndex: ctx.callIndex,
+    payload: {
+      toolCallIds: ctx.response.toolCalls.map((toolCall) => toolCall.id),
+      toolNames: ctx.response.toolCalls.map((toolCall) => toolCall.name),
+      finishReason: ctx.response.finishReason,
+    },
+  });
+  return ctx.response.toolCalls;
+}
+
+function sealPendingToolProtocol(
+  ctx: ExecutionContext,
+  callbacks: ToolLoopCallbacks,
+  reason: ToolProtocolRepairReason,
+): boolean {
+  const pendingToolCalls = getPendingToolProtocolCalls(ctx.toolProtocolState);
+  if (pendingToolCalls.length === 0) {
+    return false;
+  }
+
+  for (const toolCall of pendingToolCalls) {
+    pushToolResultMessage({
+      ctx,
+      callbacks,
+      toolCallId: toolCall.id,
+      toolName: toolCall.name,
+      content: JSON.stringify({
+        error: "Runtime closed unresolved tool call before continuation",
+        code: TOOL_PROTOCOL_REPAIR_ERROR,
+        reason,
+      }),
+      args: {},
+      isError: true,
+      durationMs: 0,
+      synthetic: true,
+      protocolRepairReason: reason,
+    });
+  }
+
+  noteToolProtocolRepair(ctx.toolProtocolState, reason);
+  if (ctx.response && responseHasToolCalls(ctx.response)) {
+    ctx.response = {
+      ...ctx.response,
+      content: "",
+    };
+  }
+  syncToolProtocolSnapshot(ctx);
+  callbacks.emitExecutionTrace(ctx, {
+    type: "tool_protocol_repaired",
+    phase: "tool_followup",
+    callIndex: ctx.callIndex,
+    payload: {
+      reason,
+      repairedToolCallIds: pendingToolCalls.map((toolCall) => toolCall.id),
+      repairedToolNames: pendingToolCalls.map((toolCall) => toolCall.name),
+    },
+  });
+  return true;
+}
+
+function failClosedOnMalformedToolContinuation(
+  ctx: ExecutionContext,
+  callbacks: ToolLoopCallbacks,
+): boolean {
+  if (!responseHasMalformedToolFinish(ctx.response)) {
+    return false;
+  }
+
+  const detail =
+    "Provider returned finishReason \"tool_calls\" without any tool calls; refusing to continue with an invalid tool-turn state.";
+  emitToolProtocolViolation(ctx, callbacks, "missing_tool_calls_for_finish_reason", {
+    finishReason: ctx.response?.finishReason,
+    contentPreview: (ctx.response?.content ?? "").slice(0, 240),
+  });
+  callbacks.setStopReason(ctx, "validation_error", detail);
+  if (ctx.response) {
+    ctx.response = {
+      ...ctx.response,
+      content: "",
+    };
+  }
+  return true;
 }
 
 export interface ToolLoopConfig {
@@ -422,20 +640,13 @@ export async function executeSingleToolCall(
       },
     });
     if (permission.routingMiss) ctx.routedToolMisses++;
-    callbacks.pushMessage(
+    pushToolResultMessage({
       ctx,
-      {
-        role: "tool",
-        content: permission.errorResult,
-        toolCallId: toolCall.id,
-        toolName: toolCall.name,
-      },
-      "tools",
-    );
-    callbacks.appendToolRecord(ctx, {
-      name: toolCall.name,
+      callbacks,
+      toolCallId: toolCall.id,
+      toolName: toolCall.name,
+      content: permission.errorResult,
       args: {},
-      result: permission.errorResult,
       isError: true,
       durationMs: 0,
     });
@@ -455,20 +666,13 @@ export async function executeSingleToolCall(
         rawArguments: toolCall.arguments,
       },
     });
-    callbacks.pushMessage(
+    pushToolResultMessage({
       ctx,
-      {
-        role: "tool",
-        content: parseResult.error,
-        toolCallId: toolCall.id,
-        toolName: toolCall.name,
-      },
-      "tools",
-    );
-    callbacks.appendToolRecord(ctx, {
-      name: toolCall.name,
+      callbacks,
+      toolCallId: toolCall.id,
+      toolName: toolCall.name,
+      content: parseResult.error,
       args: {},
-      result: parseResult.error,
       isError: true,
       durationMs: 0,
     });
@@ -545,20 +749,13 @@ export async function executeSingleToolCall(
         error: contractPolicyError,
       },
     });
-    callbacks.pushMessage(
+    pushToolResultMessage({
       ctx,
-      {
-        role: "tool",
-        content: contractPolicyError,
-        toolCallId: toolCall.id,
-        toolName: toolCall.name,
-      },
-      "tools",
-    );
-    callbacks.appendToolRecord(ctx, {
-      name: toolCall.name,
+      callbacks,
+      toolCallId: toolCall.id,
+      toolName: toolCall.name,
+      content: contractPolicyError,
       args,
-      result: contractPolicyError,
       isError: true,
       durationMs: 0,
     });
@@ -583,20 +780,13 @@ export async function executeSingleToolCall(
         error: executionEnvelopeError,
       },
     });
-    callbacks.pushMessage(
+    pushToolResultMessage({
       ctx,
-      {
-        role: "tool",
-        content: executionEnvelopeError,
-        toolCallId: toolCall.id,
-        toolName: toolCall.name,
-      },
-      "tools",
-    );
-    callbacks.appendToolRecord(ctx, {
-      name: toolCall.name,
+      callbacks,
+      toolCallId: toolCall.id,
+      toolName: toolCall.name,
+      content: executionEnvelopeError,
       args,
-      result: executionEnvelopeError,
       isError: true,
       durationMs: 0,
     });
@@ -615,20 +805,13 @@ export async function executeSingleToolCall(
         error: staleHarnessPreflight.rejectionError,
       },
     });
-    callbacks.pushMessage(
+    pushToolResultMessage({
       ctx,
-      {
-        role: "tool",
-        content: staleHarnessPreflight.rejectionError,
-        toolCallId: toolCall.id,
-        toolName: toolCall.name,
-      },
-      "tools",
-    );
-    callbacks.appendToolRecord(ctx, {
-      name: toolCall.name,
+      callbacks,
+      toolCallId: toolCall.id,
+      toolName: toolCall.name,
+      content: staleHarnessPreflight.rejectionError,
       args,
-      result: staleHarnessPreflight.rejectionError,
       isError: true,
       durationMs: 0,
     });
@@ -658,20 +841,13 @@ export async function executeSingleToolCall(
         error: rejectionMessage,
       },
     });
-    callbacks.pushMessage(
+    pushToolResultMessage({
       ctx,
-      {
-        role: "tool",
-        content: rejectionMessage,
-        toolCallId: toolCall.id,
-        toolName: toolCall.name,
-      },
-      "tools",
-    );
-    callbacks.appendToolRecord(ctx, {
-      name: toolCall.name,
+      callbacks,
+      toolCallId: toolCall.id,
+      toolName: toolCall.name,
+      content: rejectionMessage,
       args,
-      result: rejectionMessage,
       isError: true,
       durationMs: 0,
     });
@@ -709,20 +885,13 @@ export async function executeSingleToolCall(
           : {}),
       },
     });
-    callbacks.pushMessage(
+    pushToolResultMessage({
       ctx,
-      {
-        role: "tool",
-        content: refusalMessage,
-        toolCallId: toolCall.id,
-        toolName: toolCall.name,
-      },
-      "tools",
-    );
-    callbacks.appendToolRecord(ctx, {
-      name: toolCall.name,
+      callbacks,
+      toolCallId: toolCall.id,
+      toolName: toolCall.name,
+      content: refusalMessage,
       args,
-      result: refusalMessage,
       isError: true,
       durationMs: 0,
     });
@@ -754,20 +923,13 @@ export async function executeSingleToolCall(
         decision.behavior === "deny"
           ? decision.message
           : `Tool "${toolCall.name}" requires interactive approval: ${decision.message}`;
-      callbacks.pushMessage(
+      pushToolResultMessage({
         ctx,
-        {
-          role: "tool",
-          content: denyMessage,
-          toolCallId: toolCall.id,
-          toolName: toolCall.name,
-        },
-        "tools",
-      );
-      callbacks.appendToolRecord(ctx, {
-        name: toolCall.name,
+        callbacks,
+        toolCallId: toolCall.id,
+        toolName: toolCall.name,
+        content: denyMessage,
         args,
-        result: denyMessage,
         isError: true,
         durationMs: 0,
       });
@@ -798,20 +960,13 @@ export async function executeSingleToolCall(
       const denyMessage =
         preDispatch.message ??
         `Tool "${toolCall.name}" blocked by PreToolUse hook`;
-      callbacks.pushMessage(
+      pushToolResultMessage({
         ctx,
-        {
-          role: "tool",
-          content: denyMessage,
-          toolCallId: toolCall.id,
-          toolName: toolCall.name,
-        },
-        "tools",
-      );
-      callbacks.appendToolRecord(ctx, {
-        name: toolCall.name,
+        callbacks,
+        toolCallId: toolCall.id,
+        toolName: toolCall.name,
+        content: denyMessage,
         args,
-        result: denyMessage,
         isError: true,
         durationMs: 0,
       });
@@ -912,6 +1067,7 @@ export async function executeSingleToolCall(
     result,
     isError: exec.toolFailed,
     durationMs: exec.durationMs,
+    toolCallId: toolCall.id,
   });
   callbacks.emitExecutionTrace(ctx, {
     type: "tool_dispatch_finished",
@@ -990,6 +1146,21 @@ export async function executeSingleToolCall(
     },
     "tools",
   );
+  recordToolProtocolResult(ctx.toolProtocolState, toolCall.id);
+  syncToolProtocolSnapshot(ctx);
+  callbacks.emitExecutionTrace(ctx, {
+    type: "tool_protocol_result_recorded",
+    phase: "tool_followup",
+    callIndex: ctx.callIndex,
+    payload: {
+      toolCallId: toolCall.id,
+      tool: toolCall.name,
+      synthetic: false,
+      pendingToolCallIds: getPendingToolProtocolCalls(ctx.toolProtocolState).map(
+        (pendingToolCall) => pendingToolCall.id,
+      ),
+    },
+  });
 
   if (abortRound) return "abort_round";
   return "processed";
@@ -1151,6 +1322,7 @@ async function callModelWithReactiveCompact(
       if (!(err instanceof LLMContextWindowExceededError)) {
         throw err;
       }
+      sealPendingToolProtocol(ctx, callbacks, "reactive_compact_retry");
       const reactiveState =
         ctx.perIterationCompaction.reactiveCompact ?? {
           attemptIndex: 0,
@@ -1228,6 +1400,7 @@ export async function executeToolCallLoop(
         "Initial completion blocked by max model recalls per request budget",
     }),
   );
+  failClosedOnMalformedToolContinuation(ctx, callbacks);
 
   let rounds = 0;
   let effectiveMaxToolRounds = ctx.effectiveMaxToolRounds;
@@ -1281,6 +1454,7 @@ export async function executeToolCallLoop(
     }
 
     completionValidationAttempts.set(attemptKey, attempts + 1);
+    sealPendingToolProtocol(ctx, callbacks, "validation_recovery");
     callbacks.emitExecutionTrace(ctx, {
       type: "stop_gate_intervention",
       phase: "tool_followup",
@@ -1334,6 +1508,7 @@ export async function executeToolCallLoop(
       return false;
     }
     ctx.response = recoveryResponse;
+    failClosedOnMalformedToolContinuation(ctx, callbacks);
     shouldContinueAfterStopGate = true;
     return true;
   };
@@ -1341,22 +1516,34 @@ export async function executeToolCallLoop(
     shouldContinueAfterStopGate = false;
   while (
     ctx.response &&
-    ctx.response.finishReason === "tool_calls" &&
-    ctx.response.toolCalls.length > 0 &&
-    ctx.activeToolHandler &&
-    (
-      !hasRuntimeLimit(effectiveMaxToolRounds) ||
-      rounds < effectiveMaxToolRounds
-    )
+    responseHasToolCalls(ctx.response)
   ) {
     if (ctx.signal?.aborted) {
+      materializeResponseToolCalls(ctx, callbacks);
+      sealPendingToolProtocol(ctx, callbacks, "request_cancelled");
       callbacks.setStopReason(ctx, "cancelled", "Execution cancelled by caller");
       break;
     }
-    if (callbacks.checkRequestTimeout(ctx, "tool loop")) break;
+    if (callbacks.checkRequestTimeout(ctx, "tool loop")) {
+      materializeResponseToolCalls(ctx, callbacks);
+      sealPendingToolProtocol(ctx, callbacks, "request_timeout");
+      break;
+    }
     const activeCircuit = config.toolFailureBreaker.getActiveCircuit(ctx.sessionId);
     if (activeCircuit) {
+      materializeResponseToolCalls(ctx, callbacks);
+      sealPendingToolProtocol(ctx, callbacks, "circuit_breaker");
       callbacks.setStopReason(ctx, "no_progress", activeCircuit.reason);
+      break;
+    }
+    if (isRuntimeLimitReached(rounds, effectiveMaxToolRounds)) {
+      materializeResponseToolCalls(ctx, callbacks);
+      sealPendingToolProtocol(ctx, callbacks, "max_tool_rounds");
+      callbacks.setStopReason(
+        ctx,
+        "tool_calls",
+        `Reached max tool rounds (${effectiveMaxToolRounds})`,
+      );
       break;
     }
 
@@ -1369,17 +1556,16 @@ export async function executeToolCallLoop(
     );
     ctx.transientRoutedToolNames = undefined;
     loopState.expandAfterRound = false;
-
-    callbacks.pushMessage(
-      ctx,
-      {
-        role: "assistant",
-        content: ctx.response.content,
-        phase: "commentary",
-        toolCalls: sanitizeToolCallsForReplay(ctx.response.toolCalls),
-      },
-      "assistant_runtime",
-    );
+    const roundToolCalls = materializeResponseToolCalls(ctx, callbacks);
+    if (!ctx.activeToolHandler) {
+      sealPendingToolProtocol(ctx, callbacks, "missing_tool_handler");
+      callbacks.setStopReason(
+        ctx,
+        "tool_error",
+        "Model requested tools but no tool handler is available for this turn.",
+      );
+      break;
+    }
 
     // Phase B (U2): partition this round's tool calls into
     // concurrency-safe batches. A run of consecutive read-only tool
@@ -1389,7 +1575,7 @@ export async function executeToolCallLoop(
     // call falls into its own serial batch (identical to the old
     // for-loop).
     const dispatchBatches = partitionToolCalls(
-      ctx.response.toolCalls,
+      roundToolCalls,
       config.isConcurrencySafe ?? (() => false),
     );
     const parallelBatchCount = dispatchBatches.filter(
@@ -1471,13 +1657,20 @@ export async function executeToolCallLoop(
     }
 
     if (ctx.signal?.aborted) {
+      sealPendingToolProtocol(ctx, callbacks, "request_cancelled");
       callbacks.setStopReason(ctx, "cancelled", "Execution cancelled by caller");
       break;
     }
-    if (callbacks.checkRequestTimeout(ctx, "tool follow-up")) break;
+    if (callbacks.checkRequestTimeout(ctx, "tool follow-up")) {
+      sealPendingToolProtocol(ctx, callbacks, "request_timeout");
+      break;
+    }
 
     const roundCalls = ctx.allToolCalls.slice(roundToolCallStart);
-    if (abortRound) break;
+    if (abortRound) {
+      sealPendingToolProtocol(ctx, callbacks, "round_aborted");
+      break;
+    }
 
     // Stuck-loop detection (consecutive failures, semantic duplicates).
     const stuckResult = checkToolLoopStuckDetection(roundCalls, loopState, stuckState);
@@ -1499,6 +1692,12 @@ export async function executeToolCallLoop(
             stuckState.consecutiveSemanticDuplicateRounds,
         },
       });
+      if (ctx.response) {
+        ctx.response = {
+          ...ctx.response,
+          content: "",
+        };
+      }
       callbacks.setStopReason(ctx, "no_progress", stuckResult.reason);
       break;
     }
@@ -1596,6 +1795,7 @@ export async function executeToolCallLoop(
     );
     if (!nextResponse) break;
     ctx.response = nextResponse;
+    failClosedOnMalformedToolContinuation(ctx, callbacks);
   }
 
   // Turn-end stop gate evaluation. Runs only when the inner tool loop
@@ -1604,7 +1804,8 @@ export async function executeToolCallLoop(
   if (
     !ctx.signal?.aborted &&
     ctx.response &&
-    ctx.response.finishReason !== "tool_calls" &&
+    !responseHasToolCalls(ctx.response) &&
+    !hasPendingToolProtocol(ctx.toolProtocolState) &&
     ctx.stopReason === "completed"
   ) {
     const validators = buildCompletionValidators({
@@ -1753,18 +1954,33 @@ export async function executeToolCallLoop(
   }
   } while (shouldContinueAfterStopGate);
 
-  if (ctx.signal?.aborted) {
-    callbacks.setStopReason(ctx, "cancelled", "Execution cancelled by caller");
-  } else if (
-    ctx.response &&
-    ctx.response.finishReason === "tool_calls" &&
-    isRuntimeLimitReached(rounds, effectiveMaxToolRounds)
-  ) {
+  if (hasPendingToolProtocol(ctx.toolProtocolState)) {
+    emitToolProtocolViolation(
+      ctx,
+      callbacks,
+      "finalization_with_unresolved_tool_calls",
+      {
+        pendingToolCallIds: getPendingToolProtocolCalls(ctx.toolProtocolState).map(
+          (toolCall) => toolCall.id,
+        ),
+      },
+    );
+    sealPendingToolProtocol(ctx, callbacks, "finalization_guard");
     callbacks.setStopReason(
       ctx,
-      "tool_calls",
-      `Reached max tool rounds (${effectiveMaxToolRounds})`,
+      "validation_error",
+      "Runtime detected unresolved tool calls at finalization and closed the turn instead of surfacing a clean completion.",
     );
+    if (ctx.response) {
+      ctx.response = {
+        ...ctx.response,
+        content: "",
+      };
+    }
+  }
+
+  if (ctx.signal?.aborted) {
+    callbacks.setStopReason(ctx, "cancelled", "Execution cancelled by caller");
   }
 
   ctx.finalContent = ctx.response?.content ?? "";
@@ -1791,7 +2007,8 @@ export async function executeToolCallLoop(
     !missingFinalToolFollowupAnswer &&
     !ctx.finalContent &&
     ctx.allToolCalls.length > 0 &&
-    ctx.stopReason === "tool_calls";
+    ctx.stopReason === "tool_calls" &&
+    ctx.toolProtocolState.repairCount === 0;
   if (shouldSummarizeToolFallback) {
     ctx.finalContent =
       generateFallbackContent(ctx.allToolCalls) ?? ctx.finalContent;

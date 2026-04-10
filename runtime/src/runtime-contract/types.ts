@@ -40,12 +40,22 @@ export interface RuntimeContractValidatorSnapshot {
   readonly validationCode?: DelegationOutputValidationCode;
 }
 
+export interface RuntimeToolProtocolSnapshot {
+  readonly open: boolean;
+  readonly pendingToolCallIds: readonly string[];
+  readonly repairCount: number;
+  readonly lastRepairReason?: string;
+  readonly violationCount: number;
+  readonly lastViolation?: string;
+}
+
 export interface RuntimeContractSnapshot {
   readonly flags: RuntimeContractFlags;
   readonly validatorOrder: readonly CompletionValidatorId[];
   readonly validators: readonly RuntimeContractValidatorSnapshot[];
   readonly verifier: RuntimeVerifierVerdict;
   readonly legacyTopLevelVerifierMode: "none" | "pending" | "applied" | "skipped";
+  readonly toolProtocol: RuntimeToolProtocolSnapshot;
 }
 
 export interface CompletionValidatorResult {
@@ -112,6 +122,12 @@ export function createRuntimeContractSnapshot(
       overall: "skipped",
     },
     legacyTopLevelVerifierMode: flags.runtimeContractV2 ? "none" : "pending",
+    toolProtocol: {
+      open: false,
+      pendingToolCallIds: [],
+      repairCount: 0,
+      violationCount: 0,
+    },
   };
 }
 
@@ -158,5 +174,29 @@ export function updateRuntimeContractLegacyVerifierMode(params: {
   return {
     ...params.snapshot,
     legacyTopLevelVerifierMode: params.legacyTopLevelVerifierMode,
+  };
+}
+
+export function updateRuntimeContractToolProtocolSnapshot(params: {
+  readonly snapshot: RuntimeContractSnapshot;
+  readonly open: boolean;
+  readonly pendingToolCallIds: readonly string[];
+  readonly repairCount: number;
+  readonly lastRepairReason?: string;
+  readonly violationCount: number;
+  readonly lastViolation?: string;
+}): RuntimeContractSnapshot {
+  return {
+    ...params.snapshot,
+    toolProtocol: {
+      open: params.open,
+      pendingToolCallIds: [...params.pendingToolCallIds],
+      repairCount: params.repairCount,
+      ...(params.lastRepairReason
+        ? { lastRepairReason: params.lastRepairReason }
+        : {}),
+      violationCount: params.violationCount,
+      ...(params.lastViolation ? { lastViolation: params.lastViolation } : {}),
+    },
   };
 }

@@ -72,6 +72,10 @@ import type { StopHookRuntime } from "./hooks/stop-hooks.js";
 import { createRuntimeContractSnapshot } from "../runtime-contract/types.js";
 import { RuntimeError, RuntimeErrorCodes } from "../types/errors.js";
 import {
+  createToolProtocolState,
+  type ToolProtocolState,
+} from "./tool-protocol-state.js";
+import {
   createPerIterationCompactionState,
   type PerIterationCompactionState,
 } from "./compact/index.js";
@@ -135,6 +139,9 @@ export interface ToolCallRecord {
   readonly result: string;
   readonly isError: boolean;
   readonly durationMs: number;
+  readonly toolCallId?: string;
+  readonly synthetic?: boolean;
+  readonly protocolRepairReason?: string;
 }
 
 type ChatExecutionTraceEventType =
@@ -151,6 +158,10 @@ type ChatExecutionTraceEventType =
   | "tool_loop_stuck_detected"
   | "tool_dispatch_finished"
   | "tool_dispatch_started"
+  | "tool_protocol_opened"
+  | "tool_protocol_repaired"
+  | "tool_protocol_result_recorded"
+  | "tool_protocol_violation"
   | "tool_rejected";
 
 export interface ChatExecutionTraceEvent {
@@ -544,6 +555,7 @@ export interface FallbackResult {
   afterBudget: ChatPromptShape;
   budgetDiagnostics: PromptBudgetDiagnostics;
   durationMs: number;
+  streamedContent: string;
 }
 
 export interface RecoveryHint {
@@ -656,6 +668,7 @@ export interface ExecutionContext {
   completionState: WorkflowCompletionState;
   verifierSnapshot?: import("../workflow/completion-state.js").PlannerVerificationSnapshot;
   runtimeContractSnapshot: RuntimeContractSnapshot;
+  toolProtocolState: ToolProtocolState;
   stopReasonDetail?: string;
   validationCode?: DelegationOutputValidationCode;
   activeRoutedToolNames: readonly string[];
@@ -809,6 +822,7 @@ export function buildDefaultExecutionContext(
     runtimeContractSnapshot: createRuntimeContractSnapshot(
       config.runtimeContractFlags,
     ),
+    toolProtocolState: createToolProtocolState(),
     stopReasonDetail: undefined,
     validationCode: undefined,
     activeRoutedToolNames: params.initialRoutedToolNames,
