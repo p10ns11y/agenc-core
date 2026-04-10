@@ -40,6 +40,7 @@ import {
   createTaskTrackerTools,
   TaskStore,
 } from "../tools/system/task-tracker.js";
+import { runStopHookPhase, type StopHookRuntime } from "../llm/hooks/stop-hooks.js";
 import { resolveBrowserToolMode } from "./browser-tool-mode.js";
 import { createExecuteWithAgentTool } from "./delegation-tool.js";
 import { createCoordinatorModeTool } from "./coordinator-tool.js";
@@ -117,6 +118,7 @@ interface ToolRegistryDeps {
   getAgentMessaging(): unknown;
   getAgentFeed(): unknown;
   getCollaborationProtocol(): unknown;
+  resolveStopHookRuntime?(): StopHookRuntime | undefined;
 }
 
 // ============================================================================
@@ -314,7 +316,38 @@ export async function createDaemonToolRegistry(
     ),
   );
   const taskTrackerStore = new TaskStore();
-  registry.registerAll(createTaskTrackerTools(taskTrackerStore));
+  registry.registerAll(
+    createTaskTrackerTools(taskTrackerStore, {
+      onBeforeTaskComplete: async ({ listId, taskId, task, patch }) => {
+        const hookResult = await runStopHookPhase({
+          runtime: deps.resolveStopHookRuntime?.(),
+          phase: "TaskCompleted",
+          matchKey: taskId,
+          context: {
+            phase: "TaskCompleted",
+            sessionId: listId,
+            taskCompleted: {
+              listId,
+              taskId,
+              task,
+              patch: patch as Record<string, unknown>,
+            },
+          },
+        });
+        if (hookResult.outcome === "pass") {
+          return { outcome: "allow" as const };
+        }
+        return {
+          outcome: "block" as const,
+          message:
+            hookResult.outcome === "prevent_continuation"
+              ? hookResult.stopReason ??
+                "Task completion was blocked by the runtime stop-hook chain."
+              : hookResult.blockingMessage,
+        };
+      },
+    }),
+  );
   registry.register(createExecuteWithAgentTool());
   registry.register(createCoordinatorModeTool());
   const walletResult = await loadWallet(config);

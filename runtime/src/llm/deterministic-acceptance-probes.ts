@@ -226,44 +226,20 @@ export async function runDeterministicAcceptanceProbes(params: {
   readonly allToolCalls: readonly ToolCallRecord[];
   readonly activeToolHandler?: ToolHandler;
 }): Promise<DeterministicAcceptanceProbeDecision> {
-  const workspaceRoot = params.workspaceRoot?.trim();
-  if (!workspaceRoot || !params.activeToolHandler) {
+  if (!shouldRunDeterministicAcceptanceProbes(params)) {
     return {
       shouldIntervene: false,
       probeRuns: [],
     };
   }
-  if (
-    params.targetArtifacts &&
-    params.targetArtifacts.length > 0 &&
-    areDocumentationOnlyArtifacts(params.targetArtifacts)
-  ) {
-    return {
-      shouldIntervene: false,
-      probeRuns: [],
-    };
-  }
-  if (!hasSuccessfulStructuredMutation(params.allToolCalls)) {
-    return {
-      shouldIntervene: false,
-      probeRuns: [],
-    };
-  }
-
+  const workspaceRoot = params.workspaceRoot!.trim();
   const plans = buildAcceptanceProbePlans(workspaceRoot);
-  if (plans.length === 0) {
-    return {
-      shouldIntervene: false,
-      probeRuns: [],
-    };
-  }
-
   const probeRuns: ToolCallRecord[] = [];
   for (const plan of plans) {
     const startedAt = Date.now();
     let result: string;
     try {
-      result = await params.activeToolHandler(plan.toolName, plan.args);
+      result = await params.activeToolHandler!(plan.toolName, plan.args);
     } catch (error) {
       result = JSON.stringify({
         error: error instanceof Error ? error.message : String(error),
@@ -323,4 +299,28 @@ export async function runDeterministicAcceptanceProbes(params: {
     evidence,
     probeRuns,
   };
+}
+
+export function shouldRunDeterministicAcceptanceProbes(params: {
+  readonly workspaceRoot?: string;
+  readonly targetArtifacts?: readonly string[];
+  readonly allToolCalls: readonly ToolCallRecord[];
+  readonly activeToolHandler?: ToolHandler;
+}): boolean {
+  const workspaceRoot = params.workspaceRoot?.trim();
+  if (!workspaceRoot || !params.activeToolHandler) {
+    return false;
+  }
+  if (
+    params.targetArtifacts &&
+    params.targetArtifacts.length > 0 &&
+    areDocumentationOnlyArtifacts(params.targetArtifacts)
+  ) {
+    return false;
+  }
+  if (!hasSuccessfulStructuredMutation(params.allToolCalls)) {
+    return false;
+  }
+  const plans = buildAcceptanceProbePlans(workspaceRoot);
+  return plans.length > 0;
 }

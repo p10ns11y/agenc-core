@@ -2,9 +2,8 @@
  * Task tracker tools for @tetsuo-ai/runtime
  *
  * In-conversation task tracking. Mirrors the behavior of the upstream
- * Claude Code TaskCreate / TaskList / TaskGet / TaskUpdate tool family
- * (`tools/TaskCreateTool/`, `tools/TaskListTool/`, etc. in the reference
- * implementation), giving AgenC agents a structured way to track
+ * task.create / task.list / task.get / task.update tool family in the
+ * reference implementation, giving AgenC agents a structured way to track
  * multi-step work within a session.
  *
  * Tasks are scoped per session via the magic `__agencTaskListId` arg key
@@ -87,10 +86,28 @@ export interface TaskUpdatePatch {
   addBlockedBy?: readonly string[];
 }
 
+interface StoredTask extends Task {
+  revision: number;
+}
+
 interface TaskListEntry {
   readonly id: string;
-  tasks: Task[];
+  tasks: StoredTask[];
   nextTaskId: number;
+}
+
+export interface TaskCompletionGuardResult {
+  readonly outcome: "allow" | "block";
+  readonly message?: string;
+}
+
+export interface TaskTrackerToolOptions {
+  readonly onBeforeTaskComplete?: (params: {
+    readonly listId: string;
+    readonly taskId: string;
+    readonly task: Task;
+    readonly patch: TaskUpdatePatch;
+  }) => Promise<TaskCompletionGuardResult | void>;
 }
 
 /**
@@ -123,7 +140,7 @@ export class TaskStore {
     const id = String(list.nextTaskId);
     list.nextTaskId += 1;
     const now = this.now();
-    const task: Task = {
+    const task: StoredTask = {
       id,
       subject: input.subject,
       description: input.description,
@@ -134,6 +151,7 @@ export class TaskStore {
       ...(input.metadata !== undefined ? { metadata: { ...input.metadata } } : {}),
       createdAt: now,
       updatedAt: now,
+      revision: 1,
     };
     list.tasks.push(task);
     return cloneTask(task);
@@ -159,16 +177,39 @@ export class TaskStore {
     return task ? cloneTask(task) : undefined;
   }
 
+  readState(
+    listId: string,
+    taskId: string,
+  ): { readonly task: Task; readonly revision: number } | undefined {
+    const list = this.lists.get(listId);
+    if (!list) return undefined;
+    const task = list.tasks.find(
+      (entry) => entry.id === taskId && entry.status !== "deleted",
+    );
+    if (!task) return undefined;
+    return {
+      task: cloneTask(task),
+      revision: task.revision,
+    };
+  }
+
   update(
     listId: string,
     taskId: string,
     patch: TaskUpdatePatch,
+    expectedRevision?: number,
   ): Task | undefined {
     const list = this.lists.get(listId);
     if (!list) return undefined;
     const task = list.tasks.find((t) => t.id === taskId);
     if (!task) return undefined;
     if (task.status === "deleted") return undefined;
+    if (
+      expectedRevision !== undefined &&
+      task.revision !== expectedRevision
+    ) {
+      return undefined;
+    }
 
     if (patch.status !== undefined) task.status = patch.status;
     if (patch.subject !== undefined) task.subject = patch.subject;
@@ -198,6 +239,7 @@ export class TaskStore {
     }
 
     task.updatedAt = this.now();
+    task.revision += 1;
     return cloneTask(task);
   }
 
@@ -212,7 +254,7 @@ export class TaskStore {
   }
 }
 
-function cloneTask(task: Task): Task {
+function cloneTask(task: Task | StoredTask): Task {
   return {
     id: task.id,
     subject: task.subject,
@@ -327,7 +369,10 @@ const TASK_UPDATE_DESCRIPTION =
  * @param store - Optional pre-existing TaskStore (handy for tests).
  *                When omitted, a fresh in-memory store is created.
  */
-export function createTaskTrackerTools(store?: TaskStore): Tool[] {
+export function createTaskTrackerTools(
+  store?: TaskStore,
+  options: TaskTrackerToolOptions = {},
+): Tool[] {
   const taskStore = store ?? new TaskStore();
 
   const taskCreate: Tool = {
@@ -464,6 +509,7 @@ export function createTaskTrackerTools(store?: TaskStore): Tool[] {
     async execute(args) {
       const taskId = asNonEmptyString(args.taskId);
       if (!taskId) return errorResult("taskId must be a non-empty string");
+      const listId = resolveListId(args);
 
       const patch: TaskUpdatePatch = {};
 
@@ -523,7 +569,44 @@ export function createTaskTrackerTools(store?: TaskStore): Tool[] {
         patch.addBlockedBy = args.addBlockedBy as string[];
       }
 
-      const task = taskStore.update(resolveListId(args), taskId, patch);
+      const current = taskStore.readState(listId, taskId);
+      if (!current) return errorResult(`task ${taskId} not found`);
+
+      const isTransitioningToCompleted =
+        patch.status === "completed" && current.task.status !== "completed";
+      if (isTransitioningToCompleted && options.onBeforeTaskComplete) {
+        const guardResult = await options.onBeforeTaskComplete({
+          listId,
+          taskId,
+          task: current.task,
+          patch,
+        });
+        if (guardResult?.outcome === "block") {
+          return errorResult(
+            guardResult.message ??
+              "Task completion was blocked by the runtime stop-hook chain.",
+          );
+        }
+        const refreshed = taskStore.readState(listId, taskId);
+        if (!refreshed) {
+          return errorResult(`task ${taskId} not found`);
+        }
+        if (
+          refreshed.revision !== current.revision ||
+          refreshed.task.status === "completed"
+        ) {
+          return errorResult(
+            `task ${taskId} changed while completion hook was running; reread and retry`,
+          );
+        }
+      }
+
+      const task = taskStore.update(
+        listId,
+        taskId,
+        patch,
+        isTransitioningToCompleted ? current.revision : undefined,
+      );
       if (!task) return errorResult(`task ${taskId} not found`);
       return okResult({
         message: `Task #${task.id} updated`,

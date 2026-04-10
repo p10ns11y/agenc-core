@@ -5,12 +5,18 @@ import {
 } from "./chat-executor-stop-gate.js";
 import {
   runDeterministicAcceptanceProbes,
+  shouldRunDeterministicAcceptanceProbes,
 } from "./deterministic-acceptance-probes.js";
 import type {
   ChatExecutorConfig,
   ExecutionContext,
   ToolCallRecord,
 } from "./chat-executor-types.js";
+import {
+  runStopHookPhase,
+  type StopHookPhaseResult,
+  type StopHookRuntime,
+} from "./hooks/stop-hooks.js";
 import type {
   CompletionValidatorResult,
   CompletionValidatorId,
@@ -21,6 +27,7 @@ import { runTopLevelVerifierValidation } from "../gateway/top-level-verifier.js"
 export interface CompletionValidatorExecutionResult
   extends CompletionValidatorResult {
   readonly probeRuns?: readonly ToolCallRecord[];
+  readonly stopHookResult?: StopHookPhaseResult;
 }
 
 export interface CompletionValidator {
@@ -32,8 +39,83 @@ export interface CompletionValidator {
 export function buildCompletionValidators(params: {
   readonly ctx: ExecutionContext;
   readonly runtimeContractFlags: RuntimeContractFlags;
+  readonly stopHookRuntime?: StopHookRuntime;
   readonly completionValidation?: ChatExecutorConfig["completionValidation"];
 }): readonly CompletionValidator[] {
+  const topLevelVerifierEnabled =
+    params.runtimeContractFlags.runtimeContractV2 &&
+    params.runtimeContractFlags.verifierRuntimeRequired;
+  const deterministicAcceptanceProbesEnabled =
+    shouldRunDeterministicAcceptanceProbes({
+      workspaceRoot: params.ctx.runtimeWorkspaceRoot,
+      targetArtifacts: params.ctx.turnExecutionContract.targetArtifacts,
+      allToolCalls: params.ctx.allToolCalls,
+      activeToolHandler: params.ctx.activeToolHandler,
+    });
+  let verificationReadyGate:
+    | CompletionValidatorExecutionResult
+    | undefined;
+
+  const ensureVerificationReadyGate =
+    async (): Promise<CompletionValidatorExecutionResult> => {
+      if (verificationReadyGate) {
+        return verificationReadyGate;
+      }
+      if (!deterministicAcceptanceProbesEnabled && !topLevelVerifierEnabled) {
+        verificationReadyGate = {
+          id: "deterministic_acceptance_probes",
+          outcome: "pass",
+        };
+        return verificationReadyGate;
+      }
+      const hookResult = await runStopHookPhase({
+        runtime: params.stopHookRuntime,
+        phase: "VerificationReady",
+        matchKey: params.ctx.sessionId,
+        context: {
+          phase: "VerificationReady",
+          sessionId: params.ctx.sessionId,
+          runtimeWorkspaceRoot: params.ctx.runtimeWorkspaceRoot,
+          allToolCalls: params.ctx.allToolCalls,
+          verificationReady: {
+            deterministicAcceptanceProbesEnabled,
+            topLevelVerifierEnabled,
+            targetArtifacts: params.ctx.turnExecutionContract.targetArtifacts,
+          },
+        },
+      });
+      verificationReadyGate =
+        hookResult.outcome === "retry_with_blocking_message"
+          ? {
+              id: "deterministic_acceptance_probes",
+              outcome: "retry_with_blocking_message",
+              reason: hookResult.reason ?? "verification_ready",
+              blockingMessage: hookResult.blockingMessage,
+              evidence: hookResult.evidence,
+              maxAttempts: params.stopHookRuntime?.maxAttempts ?? 1,
+              exhaustedDetail:
+                "Verification-ready recovery exhausted after stop-hook intervention.",
+              stopHookResult: hookResult,
+            }
+          : hookResult.outcome === "prevent_continuation"
+            ? {
+                id: "deterministic_acceptance_probes",
+                outcome: "fail_closed",
+                reason: hookResult.reason ?? "verification_ready",
+                exhaustedDetail:
+                  hookResult.stopReason ??
+                  "Verification-ready stop hook prevented continuation.",
+                stopHookResult: hookResult,
+              }
+            : {
+                id: "deterministic_acceptance_probes",
+                outcome: "pass",
+                evidence: hookResult.evidence,
+                stopHookResult: hookResult,
+              };
+      return verificationReadyGate;
+    };
+
   return [
     {
       id: "artifact_evidence",
@@ -67,6 +149,55 @@ export function buildCompletionValidators(params: {
       id: "turn_end_stop_gate",
       enabled: true,
       async execute(): Promise<CompletionValidatorExecutionResult> {
+        if (
+          params.runtimeContractFlags.stopHooksEnabled &&
+          params.stopHookRuntime
+        ) {
+          const hookResult = await runStopHookPhase({
+            runtime: params.stopHookRuntime,
+            phase: "Stop",
+            matchKey: params.ctx.sessionId,
+            context: {
+              phase: "Stop",
+              sessionId: params.ctx.sessionId,
+              runtimeWorkspaceRoot: params.ctx.runtimeWorkspaceRoot,
+              finalContent: params.ctx.response?.content ?? "",
+              allToolCalls: params.ctx.allToolCalls,
+            },
+          });
+          if (hookResult.outcome === "pass") {
+            return {
+              id: "turn_end_stop_gate",
+              outcome: "pass",
+              evidence: hookResult.evidence,
+              stopHookResult: hookResult,
+            };
+          }
+          if (hookResult.outcome === "prevent_continuation") {
+            return {
+              id: "turn_end_stop_gate",
+              outcome: "fail_closed",
+              reason: hookResult.reason ?? "turn_end_stop_gate",
+              exhaustedDetail:
+                hookResult.stopReason ??
+                "Stop-hook chain prevented completion.",
+              stopHookResult: hookResult,
+            };
+          }
+          return {
+            id: "turn_end_stop_gate",
+            outcome: "retry_with_blocking_message",
+            reason: hookResult.reason ?? "turn_end_stop_gate",
+            blockingMessage: hookResult.blockingMessage,
+            evidence: hookResult.evidence,
+            maxAttempts: params.stopHookRuntime.maxAttempts,
+            exhaustedDetail:
+              hookResult.reason === "narrated_future_tool_work"
+                ? "Stop-gate recovery exhausted: the model kept narrating future work instead of calling tools."
+                : "Stop-gate recovery exhausted after the model continued to emit an invalid completion summary.",
+            stopHookResult: hookResult,
+          };
+        }
         const decision = evaluateTurnEndStopGate({
           finalContent: params.ctx.response?.content ?? "",
           allToolCalls: params.ctx.allToolCalls,
@@ -119,6 +250,10 @@ export function buildCompletionValidators(params: {
       id: "deterministic_acceptance_probes",
       enabled: true,
       async execute(): Promise<CompletionValidatorExecutionResult> {
+        const gate = await ensureVerificationReadyGate();
+        if (gate.outcome !== "pass") {
+          return gate;
+        }
         const decision = await runDeterministicAcceptanceProbes({
           workspaceRoot: params.ctx.runtimeWorkspaceRoot,
           targetArtifacts: params.ctx.turnExecutionContract.targetArtifacts,
@@ -151,15 +286,17 @@ export function buildCompletionValidators(params: {
     },
     {
       id: "top_level_verifier",
-      enabled:
-        params.runtimeContractFlags.runtimeContractV2 &&
-        params.runtimeContractFlags.verifierRuntimeRequired,
+      enabled: topLevelVerifierEnabled,
       async execute(): Promise<CompletionValidatorExecutionResult> {
-        if (
-          !params.runtimeContractFlags.runtimeContractV2 ||
-          !params.runtimeContractFlags.verifierRuntimeRequired
-        ) {
+        if (!topLevelVerifierEnabled) {
           return { id: "top_level_verifier", outcome: "skipped" };
+        }
+        const gate = await ensureVerificationReadyGate();
+        if (gate.outcome !== "pass") {
+          return {
+            ...gate,
+            id: "top_level_verifier",
+          };
         }
         const validation = await runTopLevelVerifierValidation({
           sessionId: params.ctx.sessionId,

@@ -99,6 +99,7 @@ import {
 import {
   normalizeToolCallArguments,
 } from "../llm/chat-executor-tool-utils.js";
+import { buildStopHookRuntime } from "../llm/hooks/stop-hooks.js";
 import {
   getProviderNativeAdvertisedToolNames,
 } from "../llm/provider-native-search.js";
@@ -1444,13 +1445,12 @@ export class DaemonManager {
 
     // Cut 5.6: load declarative agent definitions from the built-in
     // runtime/src/gateway/agent-definitions/ directory and from the
-    // user-level ~/.agenc/agents/ directory. This is the claude_code
-    // shape for AgentDefinition — each .md file declares an agent
-    // with a name, description, allowed tools, and a system prompt in
-    // the markdown body. The definitions are logged for visibility
-    // so operators can confirm which agents are loaded. Future work
-    // will wire them into the sub-agent orchestrator as a replacement
-    // for the economics-based spawn decision path.
+    // user-level ~/.agenc/agents/ directory. Each .md file declares
+    // an agent with a name, description, allowed tools, and a system
+    // prompt in the markdown body. The definitions are logged for
+    // visibility so operators can confirm which agents are loaded.
+    // Future work will wire them into the sub-agent orchestrator as a
+    // replacement for the economics-based spawn decision path.
     try {
       this._agentDefinitions = loadAgentDefinitions();
       if (this._agentDefinitions.length > 0) {
@@ -2214,6 +2214,8 @@ export class DaemonManager {
         logger: this.logger,
         notifier,
         traceProviderPayloads,
+        resolveStopHookRuntime: () =>
+          buildStopHookRuntime(gateway.config.llm?.stopHooks),
       });
       this._durableSubrunOrchestrator = new DurableSubrunOrchestrator({
         supervisor: this._backgroundRunSupervisor,
@@ -3609,6 +3611,8 @@ export class DaemonManager {
       getAgentMessaging: () => this._agentMessaging,
       getAgentFeed: () => this._agentFeed,
       getCollaborationProtocol: () => this._collaborationProtocol,
+      resolveStopHookRuntime: () =>
+        buildStopHookRuntime(this.gateway?.config.llm?.stopHooks),
     }, metrics);
     this._remoteJobManager = result.remoteJobManager;
     this._remoteSessionManager = result.remoteSessionManager;

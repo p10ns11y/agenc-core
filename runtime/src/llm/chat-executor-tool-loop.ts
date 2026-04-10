@@ -224,6 +224,7 @@ export interface ToolLoopConfig {
     readonly summaryMessage?: import("./types.js").LLMMessage;
   };
   readonly runtimeContractFlags: import("../runtime-contract/types.js").RuntimeContractFlags;
+  readonly stopHookRuntime?: import("./hooks/stop-hooks.js").StopHookRuntime;
   readonly completionValidation?: import("./chat-executor-types.js").ChatExecutorConfig["completionValidation"];
 }
 
@@ -679,9 +680,9 @@ export async function executeSingleToolCall(
   // Anti-fabrication gate: structurally refuse writeFile/appendFile/
   // text_editor over a verification harness when a prior `system.bash` /
   // `desktop.bash` call in the same turn failed while referencing that
-  // harness by basename. Modeled on Claude Code's layered verification
-  // contract, this removes the affordance for the model to silently
-  // rewrite a failing test into a fake-pass stub.
+  // harness by basename. This follows the runtime's layered verification
+  // contract and removes the affordance for the model to silently rewrite
+  // a failing test into a fake-pass stub.
   const antiFabricationDecision = evaluateWriteOverFailedVerification({
     toolName: toolCall.name,
     args,
@@ -1035,8 +1036,7 @@ async function runPerIterationCompactionBeforeModelCall(
   if (result.action === "noop") return;
 
   // Phase H: dispatch PreCompact for each layer that fired, with the
-  // registry-supplied matcher allowed to veto. Mirrors
-  // `claude_code/services/compact/compact.ts:executePreCompactHooks`.
+  // registry-supplied matcher allowed to veto.
   if (config.hookRegistry) {
     for (const boundary of result.boundaries) {
       const content =
@@ -1135,7 +1135,7 @@ function extractCompactionLayerTag(content: string): string {
  * reactive-compact layer's internal limit (3 attempts by default;
  * `applyReactiveCompact` returns `"exhausted"` after that).
  *
- * Mirrors `claude_code/query.ts` reactive compaction recovery.
+ * Mirrors the runtime's reactive compaction recovery path.
  */
 async function callModelWithReactiveCompact(
   ctx: ExecutionContext,
@@ -1196,7 +1196,7 @@ export async function executeToolCallLoop(
 ): Promise<void> {
   // Phase A wire-up: run the layered compaction chain before the
   // initial provider call. This is the top-of-iteration insertion
-  // point mirrored from claude_code/query.ts:395-426. Phase H added
+  // point for the layered compaction runtime. Phase H added
   // PreCompact / PostCompact hook dispatch inside the helper.
   await runPerIterationCompactionBeforeModelCall(
     ctx,
@@ -1610,6 +1610,7 @@ export async function executeToolCallLoop(
     const validators = buildCompletionValidators({
       ctx,
       runtimeContractFlags: config.runtimeContractFlags,
+      stopHookRuntime: config.stopHookRuntime,
       completionValidation: config.completionValidation,
     });
     callbacks.emitExecutionTrace(ctx, {
@@ -1636,6 +1637,25 @@ export async function executeToolCallLoop(
       }
 
       const validation = await validator.execute();
+      if (validation.stopHookResult) {
+        callbacks.emitExecutionTrace(ctx, {
+          type: "stop_hook_execution_finished",
+          phase: "tool_followup",
+          callIndex: ctx.callIndex,
+          payload: {
+            validatorId: validator.id,
+            stopHookPhase: validation.stopHookResult.phase,
+            outcome: validation.stopHookResult.outcome,
+            reason: validation.stopHookResult.reason,
+            stopReason: validation.stopHookResult.stopReason,
+            hookIds: validation.stopHookResult.hookOutcomes.map(
+              (outcome) => outcome.hookId,
+            ),
+            progressMessages: validation.stopHookResult.progressMessages,
+            evidence: validation.stopHookResult.evidence,
+          },
+        });
+      }
       if (validation.probeRuns) {
         for (const run of validation.probeRuns) {
           callbacks.appendToolRecord(ctx, run);

@@ -27,6 +27,7 @@ import {
   type ModelRoutingPolicy,
 } from "./model-routing-policy.js";
 import type { HookRegistry } from "./hooks/index.js";
+import type { StopHookRuntime } from "./hooks/stop-hooks.js";
 import type { CanUseToolFn } from "./can-use-tool.js";
 import type { IsConcurrencySafeFn } from "./tool-orchestration.js";
 import type {
@@ -154,6 +155,7 @@ export class ChatExecutor {
   private readonly modelRoutingPolicy: ModelRoutingPolicy;
   private readonly defaultRunClass?: RuntimeRunClass;
   private readonly runtimeContractFlags: RuntimeContractFlags;
+  private readonly stopHookRuntime?: StopHookRuntime;
   private readonly completionValidation: ChatExecutorConfig["completionValidation"];
   /**
    * Cut 5.2: optional hook registry. When set, the chat-executor fires
@@ -319,6 +321,7 @@ export class ChatExecutor {
       workerIsolationWorktree: false,
       workerIsolationRemote: false,
     };
+    this.stopHookRuntime = config.stopHookRuntime;
     this.completionValidation = config.completionValidation;
     this.hookRegistry = config.hookRegistry;
     this.canUseTool = config.canUseTool;
@@ -476,6 +479,7 @@ export class ChatExecutor {
       toolFailureBreaker: this.toolFailureBreaker,
       contextWindowTokens: this.promptBudget.contextWindowTokens,
       runtimeContractFlags: this.runtimeContractFlags,
+      ...(this.stopHookRuntime ? { stopHookRuntime: this.stopHookRuntime } : {}),
       completionValidation: this.completionValidation,
       ...(this.hookRegistry ? { hookRegistry: this.hookRegistry } : {}),
       ...(this.canUseTool ? { canUseTool: this.canUseTool } : {}),

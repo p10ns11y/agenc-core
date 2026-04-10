@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import {
   createTaskTrackerTools,
   TaskStore,
+  type TaskTrackerToolOptions,
   TASK_LIST_ARG,
   DEFAULT_TASK_LIST_ID,
   TASK_TRACKER_TOOL_NAMES,
@@ -37,11 +38,13 @@ describe("task-tracker", () => {
   let list: Tool;
   let get: Tool;
   let update: Tool;
+  let toolOptions: TaskTrackerToolOptions;
 
   beforeEach(() => {
     let now = 1_000;
     store = new TaskStore({ now: () => now++ });
-    tools = createTaskTrackerTools(store);
+    toolOptions = {};
+    tools = createTaskTrackerTools(store, toolOptions);
     create = findTool(tools, "task.create");
     list = findTool(tools, "task.list");
     get = findTool(tools, "task.get");
@@ -265,6 +268,47 @@ describe("task-tracker", () => {
     it("rejects metadata that is not a plain object", async () => {
       const result = await callTool(update, { taskId: "1", metadata: "wat" });
       expect(result.raw.isError).toBe(true);
+    });
+
+    it("blocks completion when the runtime completion guard rejects it", async () => {
+      tools = createTaskTrackerTools(store, {
+        onBeforeTaskComplete: async () => ({
+          outcome: "block",
+          message: "completion blocked",
+        }),
+      });
+      update = findTool(tools, "task.update");
+
+      const result = await callTool(update, { taskId: "1", status: "completed" });
+
+      expect(result.raw.isError).toBe(true);
+      expect(result.body.error).toContain("completion blocked");
+      expect(store.get(DEFAULT_TASK_LIST_ID, "1")?.status).toBe("pending");
+    });
+
+    it("rejects stale completion when the task changes during the guard", async () => {
+      tools = createTaskTrackerTools(store, {
+        onBeforeTaskComplete: async () => {
+          store.update(DEFAULT_TASK_LIST_ID, "1", {
+            metadata: { changedBy: "guard" },
+          });
+          return { outcome: "allow" };
+        },
+      });
+      update = findTool(tools, "task.update");
+
+      const result = await callTool(update, {
+        taskId: "1",
+        status: "completed",
+        metadata: { ready: true },
+      });
+
+      expect(result.raw.isError).toBe(true);
+      expect(result.body.error).toContain("changed while completion hook was running");
+      const stored = store.get(DEFAULT_TASK_LIST_ID, "1");
+      expect(stored?.status).toBe("pending");
+      expect(stored?.metadata).toEqual({ changedBy: "guard" });
+      expect((result.body.task as Record<string, unknown> | undefined)?.revision).toBeUndefined();
     });
   });
 

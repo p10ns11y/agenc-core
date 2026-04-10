@@ -68,6 +68,7 @@ import type {
   RuntimeContractFlags,
   RuntimeContractSnapshot,
 } from "../runtime-contract/types.js";
+import type { StopHookRuntime } from "./hooks/stop-hooks.js";
 import { createRuntimeContractSnapshot } from "../runtime-contract/types.js";
 import { RuntimeError, RuntimeErrorCodes } from "../types/errors.js";
 import {
@@ -144,6 +145,7 @@ type ChatExecutionTraceEventType =
   | "model_call_prepared"
   | "recovery_hints_injected"
   | "route_expanded"
+  | "stop_hook_execution_finished"
   | "stop_gate_intervention"
   | "tool_arguments_invalid"
   | "tool_loop_stuck_detected"
@@ -501,6 +503,8 @@ export interface ChatExecutorConfig {
   readonly defaultRunClass?: RuntimeRunClass;
   /** Resolved runtime-contract flags active for this executor instance. */
   readonly runtimeContractFlags?: RuntimeContractFlags;
+  /** Optional runtime-owned stop-hook chain used by validators and task/worker gates. */
+  readonly stopHookRuntime?: StopHookRuntime;
   /** Optional runtime services for executor-owned completion validation. */
   readonly completionValidation?: {
     readonly topLevelVerifier?: {

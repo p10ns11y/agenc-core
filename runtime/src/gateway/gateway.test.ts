@@ -1819,7 +1819,19 @@ describe("config loading", () => {
           provider: "grok",
           apiKey: "test",
           runtimeContractV2: true,
-          stopHooks: { enabled: true },
+          stopHooks: {
+            enabled: true,
+            maxAttempts: 2,
+            handlers: [
+              {
+                id: "verification-ready-hook",
+                phase: "VerificationReady",
+                kind: "command",
+                target: "scripts/verify-ready.sh",
+                timeoutMs: 5_000,
+              },
+            ],
+          },
           asyncTasks: { enabled: true },
           persistentWorkers: { enabled: true },
           mailbox: { enabled: true },
@@ -1881,6 +1893,33 @@ describe("config loading", () => {
     );
     expect(result.errors).toContain(
       "llm.workerIsolation.remote must be a boolean",
+    );
+  });
+
+  it("validateGatewayConfig rejects reserved stop-hook ids", () => {
+    const result = validateGatewayConfig(
+      makeConfig({
+        llm: {
+          provider: "grok",
+          apiKey: "test",
+          stopHooks: {
+            enabled: true,
+            handlers: [
+              {
+                id: "builtin:turn_end_stop_gate",
+                phase: "Stop",
+                kind: "command",
+                target: "echo blocked",
+              },
+            ],
+          },
+        },
+      }),
+    );
+
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain(
+      'llm.stopHooks.handlers[0].id must not start with "builtin:"',
     );
   });
 

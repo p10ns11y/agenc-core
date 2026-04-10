@@ -27,6 +27,7 @@ import {
 } from "../policy/tool-permission-evaluator.js";
 import { BudgetStateService } from "../policy/budget-state.js";
 import { resolveRuntimeContractFlags } from "../runtime-contract/flags.js";
+import { buildStopHookRuntime } from "../llm/hooks/stop-hooks.js";
 
 /**
  * Cut 7: convert a gateway config tool allow/deny list into the
@@ -160,6 +161,7 @@ export function createChatExecutor(
     return evaluatorToCanUseTool(evaluator);
   })();
   const runtimeContractFlags = resolveRuntimeContractFlags(llmConfig);
+  const stopHookRuntime = buildStopHookRuntime(llmConfig?.stopHooks);
 
   return new ChatExecutor({
     providers: params.providers,
@@ -191,6 +193,7 @@ export function createChatExecutor(
     economicsPolicy,
     modelRoutingPolicy,
     runtimeContractFlags,
+    ...(stopHookRuntime ? { stopHookRuntime } : {}),
     completionValidation: params.completionValidation,
     ...(canUseTool ? { canUseTool } : {}),
   });
