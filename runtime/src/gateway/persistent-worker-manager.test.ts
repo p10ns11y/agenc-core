@@ -369,4 +369,62 @@ describe("PersistentWorkerManager", () => {
       }),
     );
   });
+
+  it("persists remote-session execution metadata when remote isolation is enabled", async () => {
+    const memoryBackend = createMemoryBackendStub();
+    const taskStore = new TaskStore({ memoryBackend });
+    const subAgentManager = new SubAgentManager(makeManagerConfig());
+    const remoteSessionManager = {
+      start: vi.fn(async () => ({
+        content: JSON.stringify({
+          sessionHandleId: "rsess_123",
+          remoteSessionId: "session-a:worker-1",
+          serverName: "runtime",
+          callback: {
+            authToken: "remote-token",
+          },
+        }),
+      })),
+      handleWebhook: vi.fn(async () => ({
+        status: 202,
+        body: { accepted: true },
+      })),
+    };
+    const workerManager = new PersistentWorkerManager({
+      memoryBackend,
+      taskStore,
+      subAgentManager,
+      remoteIsolationEnabled: true,
+      remoteSessionManager,
+    });
+
+    const worker = await workerManager.createWorker({
+      parentSessionId: "session-a",
+      workerName: "isolated",
+    });
+    const queued = await workerManager.assignToWorker({
+      parentSessionId: "session-a",
+      workerId: worker.workerId,
+      assignment: buildPreparedAssignment("Run isolated task"),
+    });
+
+    await waitForTaskTerminal(taskStore, "session-a", queued.task.id);
+
+    const task = await taskStore.getTask("session-a", queued.task.id);
+    const workers = await workerManager.listWorkers("session-a");
+    expect(task?.externalRef).toEqual({
+      kind: "remote_session",
+      id: "rsess_123",
+    });
+    expect(task?.executionLocation).toMatchObject({
+      mode: "remote_session",
+      handleId: "rsess_123",
+      remoteSessionId: "session-a:worker-1",
+    });
+    expect(workers[0]?.executionLocation).toMatchObject({
+      mode: "remote_session",
+      handleId: "rsess_123",
+    });
+    expect(remoteSessionManager.handleWebhook).toHaveBeenCalled();
+  });
 });

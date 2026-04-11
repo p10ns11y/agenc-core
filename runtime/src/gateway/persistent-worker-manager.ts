@@ -3,11 +3,13 @@ import type {
   RuntimeMailboxLayerSnapshot,
   RuntimeMailboxMessage,
   RuntimePermissionRequestMessage,
+  RuntimeExecutionLocation,
   RuntimeWorkerHandle,
   RuntimeWorkerLayerSnapshot,
   RuntimeVerifierVerdict,
 } from "../runtime-contract/types.js";
 import type { Task, TaskStore } from "../tools/system/task-tracker.js";
+import type { SystemRemoteSessionManager } from "../tools/system/remote-session.js";
 import { KeyedAsyncQueue } from "../utils/keyed-async-queue.js";
 import { silentLogger, type Logger } from "../utils/logger.js";
 import type {
@@ -22,9 +24,14 @@ import {
 } from "./delegated-runtime-result.js";
 import type { SubAgentManager } from "./sub-agent.js";
 import { PersistentWorkerMailbox } from "./persistent-worker-mailbox.js";
+import {
+  reportManagedRemoteSession,
+  startManagedRemoteSession,
+} from "./remote-execution-handles.js";
 import { buildDelegatedChildPrompt } from "./tool-handler-factory-delegation.js";
 import type { VerifierRequirement } from "./verifier-probes.js";
 import { specRequiresSuccessfulToolEvidence } from "../utils/delegation-validation.js";
+import { WorktreeIsolationManager } from "./worktree-isolation.js";
 
 const PERSISTENT_WORKER_KEY_PREFIX = "persistent-worker:session:";
 const PERSISTENT_WORKER_SCHEMA_VERSION = 1;
@@ -77,6 +84,9 @@ interface PersistentWorkerRecord {
   executionContextFingerprint?: string;
   executionEnvelopeFingerprint?: string;
   verifierRequirement?: VerifierRequirement;
+  executionLocation?: RuntimeExecutionLocation;
+  remoteSessionHandleId?: string;
+  remoteSessionCallbackToken?: string;
   queuedCoordinatorNotes?: readonly string[];
   summary?: string;
   createdAt: number;
@@ -96,6 +106,13 @@ interface PersistentWorkerManagerOptions {
   readonly subAgentManager: SubAgentManager;
   readonly approvalEngine?: ApprovalEngine | null;
   readonly mailbox?: PersistentWorkerMailbox | null;
+  readonly worktreeIsolation?: WorktreeIsolationManager | null;
+  readonly worktreeIsolationEnabled?: boolean;
+  readonly remoteIsolationEnabled?: boolean;
+  readonly remoteSessionManager?: Pick<
+    SystemRemoteSessionManager,
+    "start" | "handleWebhook"
+  > | null;
   readonly logger?: Logger;
   readonly now?: () => number;
 }
@@ -147,6 +164,22 @@ function stableSerialize(value: unknown): string {
 
 function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function cloneExecutionLocation(
+  location: RuntimeExecutionLocation | undefined,
+): RuntimeExecutionLocation | undefined {
+  return location ? cloneJson(location) : undefined;
+}
+
+function isMutationLikeAssignment(
+  assignment: PreparedPersistentWorkerAssignment,
+): boolean {
+  if ((assignment.ownedArtifacts?.length ?? 0) > 0) {
+    return true;
+  }
+  const effectClass = assignment.admittedInput.executionContext?.effectClass;
+  return effectClass !== undefined && effectClass !== "read_only";
 }
 
 function cloneVerifierRequirement(
@@ -217,6 +250,15 @@ function cloneWorkerRecord(record: PersistentWorkerRecord): PersistentWorkerReco
       : {}),
     ...(record.verifierRequirement
       ? { verifierRequirement: cloneVerifierRequirement(record.verifierRequirement) }
+      : {}),
+    ...(record.executionLocation
+      ? { executionLocation: cloneExecutionLocation(record.executionLocation) }
+      : {}),
+    ...(record.remoteSessionHandleId
+      ? { remoteSessionHandleId: record.remoteSessionHandleId }
+      : {}),
+    ...(record.remoteSessionCallbackToken
+      ? { remoteSessionCallbackToken: record.remoteSessionCallbackToken }
       : {}),
     ...(record.queuedCoordinatorNotes
       ? { queuedCoordinatorNotes: [...record.queuedCoordinatorNotes] }
@@ -422,6 +464,25 @@ function coerceWorkerRecord(value: unknown, parentSessionId: string): Persistent
     ...(coerceVerifierRequirement(raw.verifierRequirement)
       ? { verifierRequirement: coerceVerifierRequirement(raw.verifierRequirement) }
       : {}),
+    ...(raw.executionLocation &&
+      typeof raw.executionLocation === "object" &&
+      raw.executionLocation !== null
+      ? {
+          executionLocation: cloneJson(
+            raw.executionLocation as RuntimeExecutionLocation,
+          ),
+        }
+      : {}),
+    ...(asNonEmptyString(raw.remoteSessionHandleId)
+      ? { remoteSessionHandleId: asNonEmptyString(raw.remoteSessionHandleId) }
+      : {}),
+    ...(asNonEmptyString(raw.remoteSessionCallbackToken)
+      ? {
+          remoteSessionCallbackToken: asNonEmptyString(
+            raw.remoteSessionCallbackToken,
+          ),
+        }
+      : {}),
     ...(Array.isArray(raw.queuedCoordinatorNotes)
       ? {
           queuedCoordinatorNotes: raw.queuedCoordinatorNotes.filter(
@@ -507,6 +568,9 @@ function buildRuntimeWorkerHandle(params: {
     ...(params.worker.workingDirectory
       ? { workingDirectory: params.worker.workingDirectory }
       : {}),
+    ...(params.worker.executionLocation
+      ? { executionLocation: params.worker.executionLocation }
+      : {}),
     ...(params.worker.verifierRequirement
       ? { verifierRequirement: params.worker.verifierRequirement }
       : {}),
@@ -565,6 +629,13 @@ export class PersistentWorkerManager {
   private subAgentManager: SubAgentManager;
   private readonly approvalEngine?: ApprovalEngine | null;
   private readonly mailbox?: PersistentWorkerMailbox | null;
+  private readonly worktreeIsolation?: WorktreeIsolationManager | null;
+  private readonly worktreeIsolationEnabled: boolean;
+  private readonly remoteIsolationEnabled: boolean;
+  private readonly remoteSessionManager?: Pick<
+    SystemRemoteSessionManager,
+    "start" | "handleWebhook"
+  > | null;
   private readonly logger: Logger;
   private readonly now: () => number;
   private readonly queue: KeyedAsyncQueue;
@@ -575,6 +646,10 @@ export class PersistentWorkerManager {
     this.subAgentManager = options.subAgentManager;
     this.approvalEngine = options.approvalEngine;
     this.mailbox = options.mailbox;
+    this.worktreeIsolation = options.worktreeIsolation;
+    this.worktreeIsolationEnabled = options.worktreeIsolationEnabled === true;
+    this.remoteIsolationEnabled = options.remoteIsolationEnabled === true;
+    this.remoteSessionManager = options.remoteSessionManager;
     this.logger = options.logger ?? silentLogger;
     this.now = options.now ?? (() => Date.now());
     this.queue = new KeyedAsyncQueue({
@@ -720,7 +795,180 @@ export class PersistentWorkerManager {
     ) {
       return false;
     }
+    const desiredMode =
+      this.worktreeIsolationEnabled && isMutationLikeAssignment(assignment)
+        ? "worktree"
+        : this.remoteIsolationEnabled
+          ? "remote_session"
+          : "local";
+    const currentMode = worker.executionLocation?.mode ?? "local";
+    if (currentMode !== desiredMode) {
+      if (
+        desiredMode === "worktree" &&
+        currentMode === "local" &&
+        worker.executionLocation?.fallbackReason === "workspace_not_git_backed"
+      ) {
+        return true;
+      }
+      return false;
+    }
     return true;
+  }
+
+  private buildLocalExecutionLocation(params: {
+    readonly workspaceRoot?: string;
+    readonly workingDirectory?: string;
+    readonly fallbackReason?: string;
+  }): RuntimeExecutionLocation {
+    return {
+      mode: "local",
+      ...(params.workspaceRoot ? { workspaceRoot: params.workspaceRoot } : {}),
+      ...(params.workingDirectory
+        ? { workingDirectory: params.workingDirectory }
+        : {}),
+      ...(params.fallbackReason ? { fallbackReason: params.fallbackReason } : {}),
+    };
+  }
+
+  private async selectInitialExecutionLocation(params: {
+    readonly parentSessionId: string;
+    readonly workerId: string;
+    readonly assignment: PreparedPersistentWorkerAssignment;
+  }): Promise<{
+    readonly executionLocation: RuntimeExecutionLocation;
+    readonly remoteSessionHandleId?: string;
+    readonly remoteSessionCallbackToken?: string;
+  }> {
+    const workspaceRoot =
+      params.assignment.admittedInput.executionContext?.workspaceRoot ??
+      params.assignment.workingDirectory;
+    const workingDirectory = params.assignment.workingDirectory;
+    if (this.worktreeIsolationEnabled && isMutationLikeAssignment(params.assignment)) {
+      if (!this.worktreeIsolation) {
+        throw new Error("Worktree isolation is enabled but unavailable");
+      }
+      const executionLocation = await this.worktreeIsolation.prepareWorktree({
+        workerId: params.workerId,
+        workspaceRoot,
+        workingDirectory,
+      });
+      return { executionLocation };
+    }
+    if (this.remoteIsolationEnabled) {
+      if (!this.remoteSessionManager) {
+        throw new Error("Remote session isolation is enabled but unavailable");
+      }
+      const remoteHandle = await startManagedRemoteSession({
+        manager: this.remoteSessionManager,
+        parentSessionId: params.parentSessionId,
+        workerId: params.workerId,
+        workspaceRoot,
+        workingDirectory,
+      });
+      return {
+        executionLocation: remoteHandle.executionLocation,
+        remoteSessionHandleId: remoteHandle.handleId,
+        remoteSessionCallbackToken: remoteHandle.callbackToken,
+      };
+    }
+    return {
+      executionLocation: this.buildLocalExecutionLocation({
+        workspaceRoot,
+        workingDirectory,
+      }),
+    };
+  }
+
+  private translateAssignmentForExecution(
+    assignment: PreparedPersistentWorkerAssignment,
+    executionLocation: RuntimeExecutionLocation | undefined,
+  ): PreparedPersistentWorkerAssignment {
+    if (
+      !executionLocation ||
+      executionLocation.mode !== "worktree" ||
+      !this.worktreeIsolation
+    ) {
+      return assignment;
+    }
+    const translatedExecutionContext = this.worktreeIsolation.translateExecutionContext(
+      assignment.admittedInput.executionContext,
+      executionLocation,
+    );
+    const translatedWorkingDirectory =
+      this.worktreeIsolation.translatePath(
+        assignment.workingDirectory,
+        executionLocation,
+      ) ?? executionLocation.workingDirectory;
+    return {
+      ...clonePreparedAssignment(assignment),
+      ...(translatedWorkingDirectory
+        ? { workingDirectory: translatedWorkingDirectory }
+        : {}),
+      admittedInput: {
+        ...cloneJson(assignment.admittedInput),
+        ...(translatedExecutionContext
+          ? { executionContext: translatedExecutionContext }
+          : {}),
+      },
+    };
+  }
+
+  private async reportRemoteSessionProgress(params: {
+    readonly worker: PersistentWorkerRecord | undefined;
+    readonly state: "running" | "completed" | "failed" | "cancelled";
+    readonly summary: string;
+    readonly artifacts?: readonly string[];
+  }): Promise<void> {
+    if (
+      !params.worker ||
+      params.worker.executionLocation?.mode !== "remote_session" ||
+      !this.remoteSessionManager ||
+      !params.worker.remoteSessionHandleId ||
+      !params.worker.remoteSessionCallbackToken
+    ) {
+      return;
+    }
+    await reportManagedRemoteSession({
+      manager: this.remoteSessionManager,
+      handleId: params.worker.remoteSessionHandleId,
+      callbackToken: params.worker.remoteSessionCallbackToken,
+      state: params.state,
+      summary: params.summary,
+      artifacts: params.artifacts,
+      events: [{ summary: params.summary }],
+    });
+  }
+
+  private async finalizeWorkerExecutionLocation(params: {
+    readonly parentSessionId: string;
+    readonly workerId: string;
+  }): Promise<PersistentWorkerRecord | undefined> {
+    const currentWorker = await this.getWorkerRecord(
+      params.parentSessionId,
+      params.workerId,
+    );
+    if (!currentWorker || !isTerminalWorkerState(currentWorker.state)) {
+      return currentWorker;
+    }
+    const nextLocation =
+      currentWorker.executionLocation?.mode === "worktree" && this.worktreeIsolation
+        ? await this.worktreeIsolation.cleanupLocation(currentWorker.executionLocation)
+        : currentWorker.executionLocation;
+    if (currentWorker.executionLocation?.mode === "remote_session") {
+      await this.reportRemoteSessionProgress({
+        worker: currentWorker,
+        state:
+          currentWorker.state === "failed"
+            ? "failed"
+            : currentWorker.state === "cancelled"
+              ? "cancelled"
+              : "completed",
+        summary: currentWorker.summary ?? "Worker stopped.",
+      });
+    }
+    return this.updateWorker(params.parentSessionId, params.workerId, (worker) => {
+      worker.executionLocation = cloneExecutionLocation(nextLocation);
+    });
   }
 
   private findReusableWorker(
@@ -813,6 +1061,11 @@ export class PersistentWorkerManager {
           throw new Error(`Worker "${params.workerId}" is not available`);
         }
         if (record.workingDirectory === undefined) {
+          const initialExecution = await this.selectInitialExecutionLocation({
+            parentSessionId: params.parentSessionId,
+            workerId: params.workerId,
+            assignment: params.assignment,
+          });
           record.workingDirectory = params.assignment.workingDirectory;
           record.allowedTools = [...params.assignment.allowedTools];
           record.executionContextFingerprint =
@@ -822,6 +1075,16 @@ export class PersistentWorkerManager {
           record.verifierRequirement = cloneVerifierRequirement(
             params.assignment.verifierRequirement,
           );
+          record.executionLocation = cloneExecutionLocation(
+            initialExecution.executionLocation,
+          );
+          if (initialExecution.remoteSessionHandleId) {
+            record.remoteSessionHandleId = initialExecution.remoteSessionHandleId;
+          }
+          if (initialExecution.remoteSessionCallbackToken) {
+            record.remoteSessionCallbackToken =
+              initialExecution.remoteSessionCallbackToken;
+          }
         } else if (!this.isWorkerCompatible(record, params.assignment)) {
           throw new Error(
             `Worker "${params.workerId}" cannot widen its delegated scope or verifier contract`,
@@ -865,6 +1128,7 @@ export class PersistentWorkerManager {
       workingDirectory: params.assignment.workingDirectory,
       isolation:
         params.assignment.admittedInput.delegationAdmission?.isolationReason,
+      executionLocation: worker.executionLocation,
     });
 
     if (this.mailbox) {
@@ -1076,8 +1340,13 @@ export class PersistentWorkerManager {
       this.subAgentManager.cancel(worker.activeSubagentSessionId);
     }
 
+    const finalizedWorker = await this.finalizeWorkerExecutionLocation({
+      parentSessionId: params.parentSessionId,
+      workerId: worker.workerId,
+    });
+
     return buildRuntimeWorkerHandle({
-      worker,
+      worker: finalizedWorker ?? worker,
       pendingTaskCount: await this.countPendingAssignments(
         params.parentSessionId,
         worker.workerId,
@@ -1374,12 +1643,19 @@ export class PersistentWorkerManager {
           messageId: params.message.messageId,
         });
         if (worker && !worker.currentTaskId) {
+          const finalizedWorker = await this.finalizeWorkerExecutionLocation({
+            parentSessionId: params.parentSessionId,
+            workerId: params.workerId,
+          });
           await this.emitMailboxMessage({
             type: "worker_summary",
             parentSessionId: params.parentSessionId,
             workerId: params.workerId,
             state: "cancelled",
-            summary: "Worker stopped.",
+            summary:
+              finalizedWorker?.summary ??
+              worker.summary ??
+              "Worker stopped.",
           });
         }
         return;
@@ -1474,6 +1750,8 @@ export class PersistentWorkerManager {
     readonly taskId: string;
     readonly childSessionId: string;
     readonly assignment: PreparedPersistentWorkerAssignment;
+    readonly executionLocation?: RuntimeExecutionLocation;
+    readonly remoteSessionHandleId?: string;
     readonly childResult: import("./sub-agent.js").SubAgentResult;
   }): Promise<{
     readonly terminalStatus: "completed" | "failed" | "cancelled" | "timed_out";
@@ -1495,6 +1773,7 @@ export class PersistentWorkerManager {
       reportedStatus: this.subAgentManager.getInfo(params.childSessionId)?.status,
       verifierRequirement: params.assignment.verifierRequirement,
       verifierVerdict,
+      executionLocation: params.executionLocation,
       executionEnvelopeFingerprint:
         params.childResult.contractFingerprint ??
         params.assignment.executionEnvelopeFingerprint,
@@ -1517,14 +1796,21 @@ export class PersistentWorkerManager {
         workingDirectory: params.assignment.workingDirectory,
         isolation:
           params.assignment.admittedInput.delegationAdmission?.isolationReason,
+        executionLocation: params.executionLocation,
         externalRef: {
-          kind: "subagent",
-          id: params.childSessionId,
-          sessionId: params.childSessionId,
+          kind:
+            params.executionLocation?.mode === "remote_session"
+              ? "remote_session"
+              : "subagent",
+          id: params.remoteSessionHandleId ?? params.childSessionId,
+          ...(params.executionLocation?.mode === "remote_session"
+            ? {}
+            : { sessionId: params.childSessionId }),
         },
         eventData: {
           durationMs: params.childResult.durationMs,
           toolCalls: params.childResult.toolCalls.length,
+          childSessionId: params.childSessionId,
           runtimeResult: terminalOutcome.runtimeResult,
         },
       });
@@ -1553,14 +1839,21 @@ export class PersistentWorkerManager {
       workingDirectory: params.assignment.workingDirectory,
       isolation:
         params.assignment.admittedInput.delegationAdmission?.isolationReason,
+      executionLocation: params.executionLocation,
       externalRef: {
-        kind: "subagent",
-        id: params.childSessionId,
-        sessionId: params.childSessionId,
+        kind:
+          params.executionLocation?.mode === "remote_session"
+            ? "remote_session"
+            : "subagent",
+        id: params.remoteSessionHandleId ?? params.childSessionId,
+        ...(params.executionLocation?.mode === "remote_session"
+          ? {}
+          : { sessionId: params.childSessionId }),
       },
       eventData: {
         durationMs: params.childResult.durationMs,
         toolCalls: params.childResult.toolCalls.length,
+        childSessionId: params.childSessionId,
         runtimeResult: terminalOutcome.runtimeResult,
       },
     });
@@ -1579,6 +1872,15 @@ export class PersistentWorkerManager {
     readonly assignmentMessageId?: string;
   }): Promise<void> {
     const assignment = params.metadata.assignment;
+    const currentWorker = await this.getWorkerRecord(
+      params.parentSessionId,
+      params.workerId,
+    );
+    const executionLocation = currentWorker?.executionLocation;
+    const translatedAssignment = this.translateAssignmentForExecution(
+      assignment,
+      executionLocation,
+    );
     await this.updateWorker(params.parentSessionId, params.workerId, (worker) => {
       worker.currentTaskId = params.task.id;
       worker.state = assignment.verifierRequirement?.required === true
@@ -1588,14 +1890,11 @@ export class PersistentWorkerManager {
     });
 
     let childSessionId: string;
-    const currentWorker = await this.getWorkerRecord(
-      params.parentSessionId,
-      params.workerId,
-    );
     try {
       const basePrompt = buildDelegatedChildPrompt(assignment.admittedInput, {
         continuationAuthorized: Boolean(currentWorker?.continuationSessionId),
-        workingDirectory: assignment.workingDirectory,
+        workingDirectory:
+          translatedAssignment.workingDirectory ?? assignment.workingDirectory,
       });
       const coordinatorNotes = (currentWorker?.queuedCoordinatorNotes ?? [])
         .map((note) => note.trim())
@@ -1610,17 +1909,17 @@ export class PersistentWorkerManager {
         ...(currentWorker?.continuationSessionId
           ? { continuationSessionId: currentWorker.continuationSessionId }
           : {}),
-        ...(assignment.workingDirectory
-          ? { workingDirectory: assignment.workingDirectory }
+        ...(translatedAssignment.workingDirectory
+          ? { workingDirectory: translatedAssignment.workingDirectory }
           : {}),
-        ...(assignment.admittedInput.executionContext?.workspaceRoot
+        ...(translatedAssignment.admittedInput.executionContext?.workspaceRoot
           ? { workingDirectorySource: "execution_envelope" as const }
           : {}),
         tools: assignment.allowedTools,
         ...(assignment.request.requiredToolCapabilities
           ? { requiredCapabilities: assignment.request.requiredToolCapabilities }
           : {}),
-        delegationSpec: assignment.admittedInput,
+        delegationSpec: translatedAssignment.admittedInput,
         requireToolCall: specRequiresSuccessfulToolEvidence(
           assignment.admittedInput,
         ),
@@ -1643,6 +1942,16 @@ export class PersistentWorkerManager {
         workingDirectory: assignment.workingDirectory,
         isolation:
           assignment.admittedInput.delegationAdmission?.isolationReason,
+        executionLocation,
+        ...(currentWorker?.executionLocation?.mode === "remote_session" &&
+          currentWorker.remoteSessionHandleId
+          ? {
+              externalRef: {
+                kind: "remote_session" as const,
+                id: currentWorker.remoteSessionHandleId,
+              },
+            }
+          : {}),
         eventData: { stage: "spawn" },
       });
       await this.updateWorker(params.parentSessionId, params.workerId, (worker) => {
@@ -1668,13 +1977,27 @@ export class PersistentWorkerManager {
       return;
     }
 
+    await this.reportRemoteSessionProgress({
+      worker: currentWorker,
+      state: "running",
+      summary: `Running ${assignment.objective}.`,
+      artifacts: assignment.ownedArtifacts,
+    });
+
     await this.taskStore.attachExternalRef(
       params.parentSessionId,
       params.task.id,
       {
-        kind: "subagent",
-        id: childSessionId,
-        sessionId: childSessionId,
+        kind:
+          currentWorker?.executionLocation?.mode === "remote_session"
+            ? "remote_session"
+            : "subagent",
+        id:
+          currentWorker?.remoteSessionHandleId ??
+          childSessionId,
+        ...(currentWorker?.executionLocation?.mode === "remote_session"
+          ? {}
+          : { sessionId: childSessionId }),
       },
       "Worker assignment started.",
     );
@@ -1696,6 +2019,8 @@ export class PersistentWorkerManager {
           taskId: params.task.id,
           childSessionId,
           assignment,
+          executionLocation,
+          remoteSessionHandleId: currentWorker?.remoteSessionHandleId,
           childResult,
         });
         await this.markAssignmentMessageHandled({
@@ -1737,10 +2062,23 @@ export class PersistentWorkerManager {
           params.parentSessionId,
           params.workerId,
         ))?.state ?? "idle";
-        const finalSummary = (await this.getWorkerRecord(
+        let finalSummary = (await this.getWorkerRecord(
           params.parentSessionId,
           params.workerId,
         ))?.summary ?? `Completed ${assignment.objective}.`;
+        if (
+          finalState === "completed" ||
+          finalState === "failed" ||
+          finalState === "cancelled"
+        ) {
+          const finalizedWorker = await this.finalizeWorkerExecutionLocation({
+            parentSessionId: params.parentSessionId,
+            workerId: params.workerId,
+          });
+          if (finalizedWorker?.summary) {
+            finalSummary = finalizedWorker.summary;
+          }
+        }
         await this.emitMailboxMessage({
           type: "worker_summary",
           parentSessionId: params.parentSessionId,
@@ -1750,6 +2088,15 @@ export class PersistentWorkerManager {
           taskId: params.task.id,
         });
         if (finalState === "idle") {
+          await this.reportRemoteSessionProgress({
+            worker: await this.getWorkerRecord(
+              params.parentSessionId,
+              params.workerId,
+            ),
+            state: "running",
+            summary: finalSummary,
+            artifacts: assignment.ownedArtifacts,
+          });
           await this.emitMailboxMessage({
             type: "idle_notification",
             parentSessionId: params.parentSessionId,
@@ -1818,12 +2165,16 @@ export class PersistentWorkerManager {
           record.state = "cancelled";
           record.summary = "Worker stopped.";
         });
+        const finalizedWorker = await this.finalizeWorkerExecutionLocation({
+          parentSessionId,
+          workerId,
+        });
         await this.emitMailboxMessage({
           type: "worker_summary",
           parentSessionId,
           workerId,
           state: "cancelled",
-          summary: "Worker stopped.",
+          summary: finalizedWorker?.summary ?? "Worker stopped.",
         });
         return;
       }
@@ -1941,6 +2292,12 @@ export class PersistentWorkerManager {
           }
         }
       });
+      for (const workerId of affectedWorkerIds) {
+        await this.finalizeWorkerExecutionLocation({
+          parentSessionId,
+          workerId,
+        });
+      }
       const tasks = await this.taskStore.listTasks(parentSessionId);
       for (const task of tasks) {
         if (task.kind !== "worker_assignment") continue;
@@ -2011,8 +2368,15 @@ export class PersistentWorkerManager {
     }
     const workers = await this.listWorkerRecords(parentSessionId);
     const stateCounts: Partial<Record<PersistentWorkerState, number>> = {};
+    const executionLocationCounts: Partial<
+      Record<NonNullable<RuntimeExecutionLocation["mode"]>, number>
+    > = {};
     for (const worker of workers) {
       stateCounts[worker.state] = (stateCounts[worker.state] ?? 0) + 1;
+      if (worker.executionLocation?.mode) {
+        executionLocationCounts[worker.executionLocation.mode] =
+          (executionLocationCounts[worker.executionLocation.mode] ?? 0) + 1;
+      }
     }
     return {
       configured: true,
@@ -2020,6 +2384,7 @@ export class PersistentWorkerManager {
       launchMode: "persistent_worker_pool",
       activePublicWorkers: workers.filter((worker) => !isTerminalWorkerState(worker.state)).length,
       stateCounts,
+      executionLocationCounts,
       ...(await this.getLatestReusableWorkerId(parentSessionId)
         ? { latestReusableWorkerId: await this.getLatestReusableWorkerId(parentSessionId) }
         : {}),

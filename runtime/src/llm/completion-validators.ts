@@ -439,6 +439,8 @@ export function buildCompletionValidators(params: {
             null,
           taskStore:
             params.completionValidation?.topLevelVerifier?.taskStore ?? null,
+          remoteJobManager:
+            params.completionValidation?.topLevelVerifier?.remoteJobManager ?? null,
           agentDefinitions:
             params.completionValidation?.topLevelVerifier?.agentDefinitions,
           logger: params.completionValidation?.topLevelVerifier?.logger,
@@ -453,6 +455,7 @@ export function buildCompletionValidators(params: {
           verifier: validation.runtimeVerifier,
           verifierTaskId: validation.taskId,
           verifierRequirement: validation.verifierRequirement,
+          verifierLauncherKind: validation.launcherKind,
         };
       },
     },

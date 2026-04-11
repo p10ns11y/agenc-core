@@ -283,6 +283,7 @@ import {
 } from "./durable-subrun-orchestrator.js";
 import { PersistentWorkerManager } from "./persistent-worker-manager.js";
 import { PersistentWorkerMailbox } from "./persistent-worker-mailbox.js";
+import { WorktreeIsolationManager } from "./worktree-isolation.js";
 import { evaluateAutonomyCanaryAdmission } from "./autonomy-rollout.js";
 import {
   formatBackgroundRunAdmissionDenied,
@@ -1292,6 +1293,12 @@ export class DaemonManager {
       subAgentManager: this._subAgentManager,
       approvalEngine: this._approvalEngine,
       mailbox,
+      worktreeIsolation: flags.workerIsolationWorktree
+        ? new WorktreeIsolationManager({ logger: this.logger })
+        : null,
+      worktreeIsolationEnabled: flags.workerIsolationWorktree,
+      remoteIsolationEnabled: flags.workerIsolationRemote,
+      remoteSessionManager: this._remoteSessionManager,
       logger: this.logger,
     });
     await manager.repairRuntimeState();
@@ -2018,6 +2025,7 @@ export class DaemonManager {
           agentDefinitions: this._agentDefinitions,
           logger: this.logger,
           taskStore: this._taskTrackerStore,
+          remoteJobManager: this._remoteJobManager,
         },
       },
     });
@@ -3558,6 +3566,7 @@ export class DaemonManager {
             agentDefinitions: this._agentDefinitions,
             logger: this.logger,
             taskStore: this._taskTrackerStore,
+            remoteJobManager: this._remoteJobManager,
           },
         },
       });

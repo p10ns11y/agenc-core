@@ -30,7 +30,10 @@ import {
   preflightDelegatedLocalFileScope,
   toolScopeRequiresStructuredExecutionContext,
 } from "./delegated-scope-preflight.js";
-import type { RuntimeContractFlags } from "../runtime-contract/types.js";
+import type {
+  RuntimeContractFlags,
+  RuntimeExecutionLocation,
+} from "../runtime-contract/types.js";
 import type { TaskStore } from "../tools/system/task-tracker.js";
 import {
   buildDelegatedRuntimeResult,
@@ -369,6 +372,7 @@ async function finalizeDelegationTask(params: {
   readonly verifierRequirement?: VerifierRequirement;
   readonly executionEnvelopeFingerprint?: string;
   readonly ownedArtifacts?: readonly string[];
+  readonly executionLocation?: RuntimeExecutionLocation;
 }): Promise<void> {
   const childResult = params.result;
   const failedChildToolCalls = countFailedChildToolCalls(childResult?.toolCalls);
@@ -392,6 +396,7 @@ async function finalizeDelegationTask(params: {
           : undefined,
     verifierRequirement: params.verifierRequirement,
     verifierVerdict,
+    executionLocation: params.executionLocation,
     executionEnvelopeFingerprint:
       childResult?.contractFingerprint ?? params.executionEnvelopeFingerprint,
     continuationSessionId: params.childSessionId,
@@ -431,6 +436,7 @@ async function finalizeDelegationTask(params: {
         childResult?.tokenUsage as unknown as Record<string, unknown> | undefined,
       verifierVerdict,
       ownedArtifacts: params.ownedArtifacts,
+      executionLocation: params.executionLocation,
       externalRef: {
         kind: "subagent",
         id: params.childSessionId,
@@ -481,6 +487,7 @@ async function finalizeDelegationTask(params: {
     usage: childResult?.tokenUsage as unknown as Record<string, unknown> | undefined,
     verifierVerdict,
     ownedArtifacts: params.ownedArtifacts,
+    executionLocation: params.executionLocation,
     externalRef: {
       kind: "subagent",
       id: params.childSessionId,
@@ -724,6 +731,15 @@ export async function executeDelegationTool(
       workspaceRoot: workingDirectory,
     }),
   });
+  const localExecutionLocation = {
+    mode: "local" as const,
+    ...(effectiveExecutionContext?.workspaceRoot
+      ? { workspaceRoot: effectiveExecutionContext.workspaceRoot }
+      : workingDirectory
+        ? { workspaceRoot: workingDirectory }
+        : {}),
+    ...(workingDirectory ? { workingDirectory } : {}),
+  };
   let runtimeTaskId: string | undefined;
   if (taskStore) {
     try {
@@ -758,6 +774,7 @@ export async function executeDelegationTool(
         ownedArtifacts: admittedInput.delegationAdmission?.ownedArtifacts,
         workingDirectory,
         isolation: admittedInput.delegationAdmission?.isolationReason,
+        executionLocation: localExecutionLocation,
       });
       runtimeTaskId = task.id;
     } catch (error) {
@@ -966,6 +983,7 @@ export async function executeDelegationTool(
           verifierRequirement,
           executionEnvelopeFingerprint,
           ownedArtifacts: admittedInput.delegationAdmission?.ownedArtifacts,
+          executionLocation: localExecutionLocation,
         }),
       )
       .catch(async (error) => {
@@ -991,6 +1009,7 @@ export async function executeDelegationTool(
           summary: `Delegated worker wait failed: ${message}`,
           workingDirectory,
           isolation: admittedInput.delegationAdmission?.isolationReason,
+          executionLocation: localExecutionLocation,
           externalRef: {
             kind: "subagent",
             id: childSessionId,
@@ -1017,6 +1036,7 @@ export async function executeDelegationTool(
         continuationSessionId: childSessionId,
         outputReady: false,
         ownedArtifacts: admittedInput.delegationAdmission?.ownedArtifacts,
+        executionLocation: localExecutionLocation,
       }),
       task: {
         id: runtimeTaskId,
@@ -1028,6 +1048,7 @@ export async function executeDelegationTool(
           id: childSessionId,
           sessionId: childSessionId,
         },
+        executionLocation: localExecutionLocation,
         outputReady: false,
         waitTool: "task.wait",
         outputTool: "task.output",
@@ -1081,6 +1102,7 @@ export async function executeDelegationTool(
       reportedStatus: childInfo?.status,
       verifierRequirement,
       verifierVerdict,
+      executionLocation: localExecutionLocation,
       executionEnvelopeFingerprint:
         childResult.contractFingerprint ?? executionEnvelopeFingerprint,
       continuationSessionId: childSessionId,
@@ -1124,6 +1146,7 @@ export async function executeDelegationTool(
           ownedArtifacts: admittedInput.delegationAdmission?.ownedArtifacts,
           workingDirectory,
           isolation: admittedInput.delegationAdmission?.isolationReason,
+          executionLocation: localExecutionLocation,
           externalRef: {
             kind: "subagent",
             id: childSessionId,
@@ -1198,6 +1221,7 @@ export async function executeDelegationTool(
         ownedArtifacts: admittedInput.delegationAdmission?.ownedArtifacts,
         workingDirectory,
         isolation: admittedInput.delegationAdmission?.isolationReason,
+        executionLocation: localExecutionLocation,
         externalRef: {
           kind: "subagent",
           id: childSessionId,

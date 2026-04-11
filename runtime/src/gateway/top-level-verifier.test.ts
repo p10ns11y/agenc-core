@@ -277,6 +277,80 @@ describe("runTopLevelVerifierValidation", () => {
     expect(decision.outcome).toBe("retry_with_blocking_message");
     expect(decision.summary).toContain("required probe categories");
   });
+
+  it("records remote-job verifier handles when remote isolation is enabled", async () => {
+    const spawn = vi.fn(async () => "subagent:verify-remote");
+    const waitForResult = vi.fn(async () => ({
+      sessionId: "subagent:verify-remote",
+      output: "Verifier passed.\nVERDICT: PASS",
+      success: true,
+      durationMs: 20,
+      toolCalls: [
+        {
+          name: "verification.runProbe",
+          args: { probeId: "build" },
+          result:
+            '{"ok":true,"__agencVerification":{"probeId":"build","category":"build","profile":"generic"}}',
+          isError: false,
+          durationMs: 2,
+        },
+      ],
+      structuredOutput: {
+        type: "json_schema",
+        name: "agenc_top_level_verifier_decision",
+        parsed: {
+          verdict: "pass",
+          summary: "Verifier passed with probe-backed evidence.",
+        },
+      },
+      completionState: "completed",
+      stopReason: "completed",
+    }));
+    const remoteJobManager = {
+      start: vi.fn(async () => ({
+        content: JSON.stringify({
+          jobHandleId: "rjob_123",
+          remoteJobId: "verifier:session:test:abcd1234",
+          serverName: "runtime",
+          callback: { authToken: "job-token" },
+        }),
+      })),
+      handleWebhook: vi.fn(async () => ({
+        status: 202,
+        body: { accepted: true },
+      })),
+    };
+
+    const decision = await runTopLevelVerifierValidation({
+      sessionId: "session:test",
+      userRequest: "Implement every phase from PLAN.md",
+      result: createResult({
+        runtimeContractSnapshot: createRuntimeContractSnapshot({
+          runtimeContractV2: true,
+          stopHooksEnabled: false,
+          asyncTasksEnabled: true,
+          persistentWorkersEnabled: true,
+          mailboxEnabled: true,
+          verifierRuntimeRequired: true,
+          verifierProjectBootstrap: false,
+          workerIsolationWorktree: false,
+          workerIsolationRemote: true,
+        }),
+      }),
+      subAgentManager: { spawn, waitForResult },
+      verifierService: createVerifierService(
+        createVerifierRequirement({
+          probeCategories: ["build"],
+        }),
+      ),
+      remoteJobManager,
+    });
+
+    expect(decision.outcome).toBe("pass");
+    expect(decision.launcherKind).toBe("remote_job");
+    expect(remoteJobManager.start).toHaveBeenCalled();
+    expect(remoteJobManager.handleWebhook).toHaveBeenCalled();
+  });
 });
 
 describe("applyLegacyTopLevelVerifier", () => {

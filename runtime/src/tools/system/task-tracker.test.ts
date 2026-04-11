@@ -570,6 +570,14 @@ describe("task-tracker", () => {
           id: "subagent:1",
           sessionId: "subagent:1",
         },
+        executionLocation: {
+          mode: "worktree",
+          workspaceRoot: "/workspace",
+          workingDirectory: "/tmp/worktree-1",
+          gitRoot: "/workspace",
+          worktreePath: "/tmp/worktree-1",
+          lifecycle: "active",
+        },
       });
 
       const waited = await callTool(wait, {
@@ -581,6 +589,10 @@ describe("task-tracker", () => {
         id: runtimeTask.id,
         status: "completed",
         outputReady: true,
+        executionLocation: {
+          mode: "worktree",
+          worktreePath: "/tmp/worktree-1",
+        },
       });
 
       const persistedOutput = await callTool(output, {
@@ -597,6 +609,10 @@ describe("task-tracker", () => {
       expect(persistedOutput.body.externalRef).toMatchObject({
         kind: "subagent",
         id: "subagent:1",
+      });
+      expect(persistedOutput.body.executionLocation).toMatchObject({
+        mode: "worktree",
+        worktreePath: "/tmp/worktree-1",
       });
       expect(persistedOutput.body.events).toBeInstanceOf(Array);
     });

@@ -39,6 +39,27 @@ export interface RuntimeVerifierVerdict {
   readonly summary?: string;
 }
 
+export type RuntimeExecutionLocationMode =
+  | "local"
+  | "worktree"
+  | "remote_session"
+  | "remote_job";
+
+export interface RuntimeExecutionLocation {
+  readonly mode: RuntimeExecutionLocationMode;
+  readonly workspaceRoot?: string;
+  readonly workingDirectory?: string;
+  readonly fallbackReason?: string;
+  readonly gitRoot?: string;
+  readonly worktreePath?: string;
+  readonly worktreeRef?: string;
+  readonly lifecycle?: "active" | "removed" | "retained_dirty";
+  readonly handleId?: string;
+  readonly serverName?: string;
+  readonly remoteSessionId?: string;
+  readonly remoteJobId?: string;
+}
+
 export interface RuntimeContractValidatorSnapshot {
   readonly id: CompletionValidatorId;
   readonly enabled: boolean;
@@ -90,6 +111,9 @@ export interface RuntimeWorkerLayerSnapshot {
       number
     >
   >;
+  readonly executionLocationCounts?: Partial<
+    Record<RuntimeExecutionLocationMode, number>
+  >;
   readonly latestReusableWorkerId?: string;
   readonly inactiveReason?: string;
 }
@@ -108,7 +132,7 @@ export interface RuntimeVerifierStageSnapshot {
   readonly bootstrapAttempted: boolean;
   readonly bootstrapSource?: VerifierBootstrapSource;
   readonly runtimeRequired: boolean;
-  readonly launcherKind: "none" | "subagent";
+  readonly launcherKind: "none" | "subagent" | "remote_job";
   readonly taskId?: string;
   readonly profiles?: readonly VerifierProfileKind[];
   readonly probeCategories?: readonly AcceptanceProbeCategory[];
@@ -148,6 +172,7 @@ export interface CompletionValidatorResult {
   readonly verifier?: RuntimeVerifierVerdict;
   readonly verifierTaskId?: string;
   readonly verifierRequirement?: VerifierRequirement;
+  readonly verifierLauncherKind?: "subagent" | "remote_job";
 }
 
 export interface CompletionValidatorContext {
@@ -181,6 +206,7 @@ export interface RuntimeWorkerHandle {
   readonly lastMailboxActivityAt?: number;
   readonly continuationSessionId?: string;
   readonly workingDirectory?: string;
+  readonly executionLocation?: RuntimeExecutionLocation;
   readonly verifierRequirement?: VerifierRequirement;
   readonly stopRequested: boolean;
   readonly summary?: string;
@@ -197,6 +223,7 @@ export interface RuntimeTaskHandle {
     readonly sessionId?: string;
     readonly runId?: string;
   };
+  readonly executionLocation?: RuntimeExecutionLocation;
   readonly outputReady?: boolean;
   readonly outputPath?: string;
   readonly waitTool?: "task.wait";
@@ -322,6 +349,7 @@ export interface DelegatedRuntimeResult {
   readonly taskId?: string;
   readonly verifierRequirement?: VerifierRequirement;
   readonly verifierVerdict?: RuntimeVerifierVerdict;
+  readonly executionLocation?: RuntimeExecutionLocation;
   readonly executionEnvelopeFingerprint?: string;
   readonly continuationSessionId?: string;
   readonly outputReady?: boolean;

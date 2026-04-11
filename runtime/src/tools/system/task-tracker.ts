@@ -17,6 +17,7 @@ import { safeStringify } from "../types.js";
 import type { MemoryBackend, DurabilityLevel } from "../../memory/types.js";
 import type {
   DelegatedRuntimeResult,
+  RuntimeExecutionLocation,
   RuntimeVerifierVerdict,
 } from "../../runtime-contract/types.js";
 import { silentLogger, type Logger } from "../../utils/logger.js";
@@ -129,6 +130,7 @@ export interface Task {
   ownedArtifacts?: string[];
   workingDirectory?: string;
   isolation?: string;
+  executionLocation?: RuntimeExecutionLocation;
   events: TaskEventRecord[];
   readonly createdAt: number;
   updatedAt: number;
@@ -165,6 +167,7 @@ export interface RuntimeTaskCreateParams extends TaskCreateInput {
   readonly ownedArtifacts?: readonly string[];
   readonly workingDirectory?: string;
   readonly isolation?: string;
+  readonly executionLocation?: RuntimeExecutionLocation;
 }
 
 export interface RuntimeTaskFinalizeParams {
@@ -181,6 +184,7 @@ export interface RuntimeTaskFinalizeParams {
   readonly workingDirectory?: string;
   readonly isolation?: string;
   readonly externalRef?: TaskExternalRef;
+  readonly executionLocation?: RuntimeExecutionLocation;
   readonly eventData?: Record<string, unknown>;
 }
 
@@ -202,6 +206,7 @@ export interface TaskOutputResult {
   readonly workingDirectory?: string;
   readonly isolation?: string;
   readonly externalRef?: TaskExternalRef;
+  readonly executionLocation?: RuntimeExecutionLocation;
   readonly outputRef?: TaskOutputRef;
   readonly events?: readonly TaskEventRecord[];
 }
@@ -221,6 +226,7 @@ interface TaskOutputEnvelope {
   readonly workingDirectory?: string;
   readonly isolation?: string;
   readonly externalRef?: TaskExternalRef;
+  readonly executionLocation?: RuntimeExecutionLocation;
   readonly createdAt: number;
 }
 
@@ -300,6 +306,43 @@ function cloneTaskEvent(event: TaskEventRecord): TaskEventRecord {
   };
 }
 
+function cloneExecutionLocation(
+  location: RuntimeExecutionLocation,
+): RuntimeExecutionLocation {
+  return {
+    mode: location.mode,
+    ...(location.workspaceRoot !== undefined
+      ? { workspaceRoot: location.workspaceRoot }
+      : {}),
+    ...(location.workingDirectory !== undefined
+      ? { workingDirectory: location.workingDirectory }
+      : {}),
+    ...(location.fallbackReason !== undefined
+      ? { fallbackReason: location.fallbackReason }
+      : {}),
+    ...(location.gitRoot !== undefined ? { gitRoot: location.gitRoot } : {}),
+    ...(location.worktreePath !== undefined
+      ? { worktreePath: location.worktreePath }
+      : {}),
+    ...(location.worktreeRef !== undefined
+      ? { worktreeRef: location.worktreeRef }
+      : {}),
+    ...(location.lifecycle !== undefined
+      ? { lifecycle: location.lifecycle }
+      : {}),
+    ...(location.handleId !== undefined ? { handleId: location.handleId } : {}),
+    ...(location.serverName !== undefined
+      ? { serverName: location.serverName }
+      : {}),
+    ...(location.remoteSessionId !== undefined
+      ? { remoteSessionId: location.remoteSessionId }
+      : {}),
+    ...(location.remoteJobId !== undefined
+      ? { remoteJobId: location.remoteJobId }
+      : {}),
+  };
+}
+
 function cloneTask(task: Task | StoredTask): Task {
   return {
     id: task.id,
@@ -333,6 +376,9 @@ function cloneTask(task: Task | StoredTask): Task {
       ? { workingDirectory: task.workingDirectory }
       : {}),
     ...(task.isolation !== undefined ? { isolation: task.isolation } : {}),
+    ...(task.executionLocation !== undefined
+      ? { executionLocation: cloneExecutionLocation(task.executionLocation) }
+      : {}),
     events: task.events.map(cloneTaskEvent),
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
@@ -464,6 +510,9 @@ function fullTask(task: Task): Record<string, unknown> {
       ? { workingDirectory: task.workingDirectory }
       : {}),
     ...(task.isolation !== undefined ? { isolation: task.isolation } : {}),
+    ...(task.executionLocation !== undefined
+      ? { executionLocation: task.executionLocation }
+      : {}),
     events: task.events,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
@@ -535,6 +584,58 @@ function coerceOutputRef(value: unknown): TaskOutputRef | undefined {
     return undefined;
   }
   return { path, sizeBytes, updatedAt };
+}
+
+function coerceExecutionLocation(
+  value: unknown,
+): RuntimeExecutionLocation | undefined {
+  const raw = asPlainObject(value);
+  const mode =
+    raw?.mode === "local" ||
+      raw?.mode === "worktree" ||
+      raw?.mode === "remote_session" ||
+      raw?.mode === "remote_job"
+      ? raw.mode
+      : undefined;
+  if (!raw || !mode) {
+    return undefined;
+  }
+  const lifecycle =
+    raw.lifecycle === "active" ||
+      raw.lifecycle === "removed" ||
+      raw.lifecycle === "retained_dirty"
+      ? raw.lifecycle
+      : undefined;
+  return {
+    mode,
+    ...(typeof raw.workspaceRoot === "string"
+      ? { workspaceRoot: raw.workspaceRoot }
+      : {}),
+    ...(typeof raw.workingDirectory === "string"
+      ? { workingDirectory: raw.workingDirectory }
+      : {}),
+    ...(typeof raw.fallbackReason === "string"
+      ? { fallbackReason: raw.fallbackReason }
+      : {}),
+    ...(typeof raw.gitRoot === "string" ? { gitRoot: raw.gitRoot } : {}),
+    ...(typeof raw.worktreePath === "string"
+      ? { worktreePath: raw.worktreePath }
+      : {}),
+    ...(typeof raw.worktreeRef === "string"
+      ? { worktreeRef: raw.worktreeRef }
+      : {}),
+    ...(lifecycle ? { lifecycle } : {}),
+    ...(typeof raw.handleId === "string" ? { handleId: raw.handleId } : {}),
+    ...(typeof raw.serverName === "string"
+      ? { serverName: raw.serverName }
+      : {}),
+    ...(typeof raw.remoteSessionId === "string"
+      ? { remoteSessionId: raw.remoteSessionId }
+      : {}),
+    ...(typeof raw.remoteJobId === "string"
+      ? { remoteJobId: raw.remoteJobId }
+      : {}),
+  };
 }
 
 function coerceStoredTask(value: unknown, ownerSessionId: string): StoredTask | undefined {
@@ -616,6 +717,9 @@ function coerceStoredTask(value: unknown, ownerSessionId: string): StoredTask | 
       ? { workingDirectory: raw.workingDirectory }
       : {}),
     ...(typeof raw.isolation === "string" ? { isolation: raw.isolation } : {}),
+    ...(coerceExecutionLocation(raw.executionLocation)
+      ? { executionLocation: coerceExecutionLocation(raw.executionLocation) }
+      : {}),
     events: Array.isArray(raw.events)
       ? raw.events
           .map(coerceTaskEvent)
@@ -724,6 +828,9 @@ function coerceTaskOutputEnvelope(value: unknown): TaskOutputEnvelope | undefine
     ...(typeof raw.isolation === "string" ? { isolation: raw.isolation } : {}),
     ...(coerceExternalRef(raw.externalRef)
       ? { externalRef: coerceExternalRef(raw.externalRef) }
+      : {}),
+    ...(coerceExecutionLocation(raw.executionLocation)
+      ? { executionLocation: coerceExecutionLocation(raw.executionLocation) }
       : {}),
     createdAt,
   };
@@ -1126,6 +1233,9 @@ export class TaskStore {
           ? { workingDirectory: params.workingDirectory }
           : {}),
         ...(params.isolation !== undefined ? { isolation: params.isolation } : {}),
+        ...(params.executionLocation !== undefined
+          ? { executionLocation: cloneExecutionLocation(params.executionLocation) }
+          : {}),
         outputReady: false,
         events: [
           this.buildEvent("created", `Task created: ${params.subject}`, {
@@ -1326,6 +1436,9 @@ export class TaskStore {
           ...(params.externalRef !== undefined
             ? { externalRef: { ...params.externalRef } }
             : {}),
+          ...(params.executionLocation !== undefined
+            ? { executionLocation: cloneExecutionLocation(params.executionLocation) }
+            : {}),
           createdAt: this.now(),
         })
       : undefined;
@@ -1359,6 +1472,9 @@ export class TaskStore {
         }
         if (params.isolation !== undefined) {
           entry.isolation = params.isolation;
+        }
+        if (params.executionLocation !== undefined) {
+          entry.executionLocation = cloneExecutionLocation(params.executionLocation);
         }
         entry.events.push(
           this.buildEvent(
@@ -1476,6 +1592,9 @@ export class TaskStore {
         : {}),
       ...(outputEnvelope?.externalRef
         ? { externalRef: outputEnvelope.externalRef }
+        : {}),
+      ...(outputEnvelope?.executionLocation
+        ? { executionLocation: outputEnvelope.executionLocation }
         : {}),
       ...(outputRef ? { outputRef } : {}),
       ...(options?.includeEvents ? { events: task.events } : {}),

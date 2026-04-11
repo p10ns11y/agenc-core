@@ -64,6 +64,7 @@ import type { AgentDefinition } from "../gateway/agent-loader.js";
 import type { DelegationVerifierService } from "../gateway/delegation-runtime.js";
 import type { SubAgentManager } from "../gateway/sub-agent.js";
 import type { TaskStore } from "../tools/system/task-tracker.js";
+import type { SystemRemoteJobManager } from "../tools/system/remote-job.js";
 import type { ActiveTaskContext, TurnExecutionContract } from "./turn-execution-contract-types.js";
 import type {
   RuntimeContractFlags,
@@ -533,6 +534,10 @@ export interface ChatExecutorConfig {
       readonly agentDefinitions?: readonly AgentDefinition[];
       readonly logger?: import("../utils/logger.js").Logger;
       readonly taskStore?: TaskStore | null;
+      readonly remoteJobManager?: Pick<
+        SystemRemoteJobManager,
+        "start" | "handleWebhook"
+      > | null;
     };
   };
 }

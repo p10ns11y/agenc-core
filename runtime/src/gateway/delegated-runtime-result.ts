@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type {
   RuntimeVerifierVerdict,
   DelegatedRuntimeResult,
+  RuntimeExecutionLocation,
 } from "../runtime-contract/types.js";
 import type { VerifierRequirement } from "./verifier-probes.js";
 import type { WorkflowCompletionState } from "../workflow/completion-state.js";
@@ -20,6 +21,7 @@ interface DelegatedRuntimeResultParams {
   readonly taskId?: string;
   readonly verifierRequirement?: VerifierRequirement;
   readonly verifierVerdict?: RuntimeVerifierVerdict;
+  readonly executionLocation?: RuntimeExecutionLocation;
   readonly executionEnvelopeFingerprint?: string;
   readonly continuationSessionId?: string;
   readonly outputReady?: boolean;
@@ -184,6 +186,9 @@ export function buildDelegatedRuntimeResult(
       ? { verifierRequirement: params.verifierRequirement }
       : {}),
     ...(params.verifierVerdict ? { verifierVerdict: params.verifierVerdict } : {}),
+    ...(params.executionLocation
+      ? { executionLocation: params.executionLocation }
+      : {}),
     ...(params.executionEnvelopeFingerprint
       ? { executionEnvelopeFingerprint: params.executionEnvelopeFingerprint }
       : {}),
@@ -207,6 +212,7 @@ export function resolveDelegatedTerminalOutcome(params: {
   readonly taskId?: string;
   readonly verifierRequirement?: VerifierRequirement;
   readonly verifierVerdict?: RuntimeVerifierVerdict;
+  readonly executionLocation?: RuntimeExecutionLocation;
   readonly executionEnvelopeFingerprint?: string;
   readonly continuationSessionId?: string;
   readonly ownedArtifacts?: readonly string[];
@@ -233,6 +239,7 @@ export function resolveDelegatedTerminalOutcome(params: {
     taskId: params.taskId,
     verifierRequirement: params.verifierRequirement,
     verifierVerdict: params.verifierVerdict,
+    executionLocation: params.executionLocation,
     executionEnvelopeFingerprint: params.executionEnvelopeFingerprint,
     continuationSessionId: params.continuationSessionId,
     outputReady: true,
